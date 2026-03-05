@@ -1,0 +1,756 @@
+---
+description: Backend development standards, best practices, and conventions for the Voice AI Runtime — an Event-Driven Voice Runtime built with Python 3.12, asyncio, FastAPI, asyncpg, and Redis.
+globs: ["backend/**/*.py", "backend/pyproject.toml", "backend/alembic/**/*.py", "backend/tests/**/*.py", "backend/Dockerfile", "backend/docker-compose.yml"]
+alwaysApply: true
+---
+
+# Backend Project Standards and Best Practices
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Technology Stack](#technology-stack)
+- [Architecture Overview](#architecture-overview)
+- [Project Structure](#project-structure)
+- [Event-Driven Voice Runtime](#event-driven-voice-runtime)
+- [Coding Standards](#coding-standards)
+- [API Design Standards](#api-design-standards)
+- [Database Patterns](#database-patterns)
+- [Testing Standards](#testing-standards)
+- [Performance Best Practices](#performance-best-practices)
+- [Security Best Practices](#security-best-practices)
+- [Observability](#observability)
+- [Development Workflow](#development-workflow)
+- [Deployment](#deployment)
+
+---
+
+## Overview
+
+This document defines the standards for the Voice AI Runtime backend. The system follows an **Event-Driven Voice Runtime** architecture (Pattern A: Controlled Routing + Realtime Speech) where a Coordinator orchestrates all voice interactions through an in-process async event bus. The MVP prioritizes **stability and latency**.
+
+## Technology Stack
+
+### Core Technologies
+- **Python 3.12**: Runtime with modern typing features (`type`, `|` unions, `TypedDict`)
+- **asyncio**: Async runtime for all I/O-bound operations
+- **uvloop**: Drop-in asyncio event loop replacement for lower latency (Linux/macOS)
+- **FastAPI**: HTTP framework for admin endpoints, health checks, webhooks (Starlette/uvicorn)
+- **msgspec**: High-performance struct definitions and serialization
+- **orjson**: Fast JSON serialization for external interfaces
+
+### Database & Storage
+- **PostgreSQL**: Core persistence (call sessions, turns, agent generations, tool executions)
+- **asyncpg**: Direct async PostgreSQL driver for hot-path queries (voice runtime)
+- **SQLAlchemy 2.0 (async)**: ORM for admin/CRUD operations only
+- **Alembic**: Database migrations
+- **Redis**: TTL caches, rate limiting, session registry, idempotency sets
+
+### Voice & AI
+- **asyncio.Queue**: In-process event bus
+- **FSM**: Enum + dict handlers (no external library)
+- **sentence-transformers / onnxruntime**: Embedding models for intent classification
+- **hnswlib**: Approximate nearest neighbor search for routing
+- **fasttext**: Language detection
+- **httpx**: Async HTTP client for 3rd-party LLM fallback classification
+
+### Observability
+- **OpenTelemetry**: Distributed tracing and metrics
+- **Prometheus**: Metrics exposition
+- **Grafana**: Dashboards and alerting
+- **Sentry**: Error tracking and performance monitoring
+
+### Testing
+- **pytest**: Test framework
+- **pytest-asyncio**: Async test support
+- **pytest-cov**: Coverage reporting
+- **testcontainers**: PostgreSQL/Redis containers for integration tests
+
+### Development Tools
+- **ruff**: Linter + formatter (replaces black, flake8, isort)
+- **mypy**: Static type checking (strict mode)
+- **uv**: Package manager and virtual environment management
+- **pre-commit**: Git hooks for quality checks
+
+## Architecture Overview
+
+### Event-Driven Voice Runtime (Pattern A)
+
+The system is built around four actors communicating through an async event bus:
+
+**Realtime/Transport** — Receives audio, emits VAD/transcript events, produces audio output. No business logic.
+
+**TurnManager** — Detects human turns from speech events. Emits `human_turn_*` events. No knowledge of tools or agents.
+
+**Agent FSM** — Classifies intent (Route A: simple/disallowed/out_of_scope/domain). Routes domain intents to specialists (Route B: sales/billing/support/retention). Never executes tools or speaks directly.
+
+**Coordinator (CallSession)** — Single point of tool execution, speech output, cancellation, and idempotency. Maintains active runtime state per call.
+
+### Core Identifiers
+
+```python
+call_id: UUID          # Internal call identifier
+turn_id: UUID          # Human turn identifier
+agent_generation_id: UUID  # Logical plan per turn
+voice_generation_id: UUID  # Each speech output (filler or response)
+tool_request_id: UUID  # Deterministic tool execution ID
+event_id: UUID         # Unique event identifier
+```
+
+### Data Model Relationships
+
+```
+CallSessionContext (call_id)
+  +-- 1:N Turn (turn_id)
+        +-- 1:1 AgentGeneration (agent_generation_id)
+              +-- 1:N VoiceGeneration (voice_generation_id)
+              +-- 1:N ToolExecution (tool_request_id)
+```
+
+## Project Structure
+
+```
+backend/
++-- src/
+|   +-- voice_runtime/
+|   |   +-- coordinator.py       # CallSession / Coordinator actor
+|   |   +-- turn_manager.py      # TurnManager actor
+|   |   +-- agent_fsm.py         # Agent FSM actor
+|   |   +-- tool_executor.py     # Tool execution with idempotency
+|   |   +-- realtime_client.py   # Realtime/Transport adapter
+|   |   +-- events.py            # Event definitions (msgspec.Struct)
+|   |   +-- state.py             # CoordinatorRuntimeState
+|   |   +-- bus.py               # asyncio.Queue event bus
+|   |   +-- types.py             # Enums, Literals, type aliases
+|   +-- routing/
+|   |   +-- router.py            # Route A + Route B logic
+|   |   +-- embeddings.py        # Embedding model loader + inference
+|   |   +-- language.py          # Language detection (fasttext)
+|   |   +-- lexicon.py           # Hard rules (disallowed lexicon)
+|   |   +-- llm_fallback.py       # 3rd-party LLM fallback classifier (async HTTP)
+|   +-- domain/
+|   |   +-- models/              # Domain entities (msgspec.Struct)
+|   |   +-- repositories/        # Repository interfaces (Protocol)
+|   +-- infrastructure/
+|   |   +-- db.py                # asyncpg pool + SQLAlchemy engine
+|   |   +-- redis_client.py      # Redis connection + helpers
+|   |   +-- repositories/       # Repository implementations
+|   |   +-- telemetry.py         # OpenTelemetry setup
+|   +-- api/
+|   |   +-- app.py               # FastAPI application factory
+|   |   +-- routes/              # API route modules
+|   |   +-- deps.py              # Dependency injection
+|   |   +-- middleware.py        # CORS, error handling, request ID
+|   +-- config.py                # Settings via pydantic-settings
+|   +-- main.py                  # Application entry point
++-- router_registry/
+|   +-- v1/
+|       +-- thresholds.yaml
+|       +-- route_a/             # base.yaml, es.yaml, en.yaml
+|       +-- route_b/             # base.yaml, es.yaml, en.yaml
+|       +-- policies.yaml
+|       +-- lexicon_disallowed/  # es.txt, en.txt
+|       +-- short_utterances/    # es.yaml, en.yaml
++-- alembic/
+|   +-- versions/                # Migration files
+|   +-- env.py
++-- tests/
+|   +-- unit/
+|   +-- integration/
+|   +-- conftest.py
++-- pyproject.toml
++-- Dockerfile
++-- docker-compose.yml
+```
+
+## Event-Driven Voice Runtime
+
+### Event Envelope
+
+All events travel wrapped in an `EventEnvelope`:
+
+```python
+import msgspec
+from uuid import UUID
+from typing import Literal
+
+class EventEnvelope(msgspec.Struct, frozen=True):
+    event_id: UUID
+    call_id: UUID
+    ts: int  # ms epoch or monotonic
+    type: str
+    payload: dict
+    source: Literal["realtime", "turn_manager", "agent", "coordinator", "tool_exec", "timer"]
+    correlation_id: UUID | None = None  # usually agent_generation_id
+    causation_id: UUID | None = None    # event_id of the originating event
+```
+
+### Event Bus
+
+Use `asyncio.Queue` as the in-process event bus. Each actor is an `asyncio.Task` consuming from shared or dedicated queues.
+
+```python
+# Bus pattern
+event_bus: asyncio.Queue[EventEnvelope] = asyncio.Queue()
+
+async def coordinator_loop(bus: asyncio.Queue[EventEnvelope]) -> None:
+    while True:
+        event = await bus.get()
+        handler = HANDLERS.get(event.type)
+        if handler:
+            await handler(event)
+```
+
+### FSM Implementation
+
+Implement FSMs as `Enum` state + `dict` of handlers. No external FSM library.
+
+```python
+from enum import Enum
+
+class AgentState(Enum):
+    IDLE = "idle"
+    THINKING = "thinking"
+    WAITING_TOOLS = "waiting_tools"
+    WAITING_VOICE = "waiting_voice"
+    DONE = "done"
+    CANCELLED = "cancelled"
+
+# State transitions as dict
+TRANSITIONS: dict[AgentState, dict[str, AgentState]] = {
+    AgentState.IDLE: {"handle_turn": AgentState.THINKING},
+    AgentState.THINKING: {
+        "request_guided_response": AgentState.WAITING_VOICE,
+        "request_agent_action": AgentState.WAITING_TOOLS,
+        "cancel": AgentState.CANCELLED,
+    },
+    # ...
+}
+```
+
+### Cancellation & Barge-In
+
+On `speech_started` with an active `voice_generation_id`:
+1. `realtime_voice_cancel(active_voice_generation_id)`
+2. `cancel_agent_generation(active_agent_generation_id)`
+3. Mark both as cancelled in runtime state
+4. Forward event to TurnManager
+
+### Idempotency
+
+- `idempotency_seen_event_ids: TTLSet` — dedupe events (TTL 100-300s, stored in Redis)
+- `idempotency_tool_results: TTLMap` — cache tool results by `tool_request_id`
+- `tool_request_id` must be deterministic (derived from `agent_generation_id` + `tool_name` + `args_hash`)
+
+### Policy Keys
+
+`policy_key` is a closed enum referencing prompt construction rules:
+
+```python
+class PolicyKey(str, Enum):
+    GREETING = "greeting"
+    GUARDRAIL_DISALLOWED = "guardrail_disallowed"
+    GUARDRAIL_OUT_OF_SCOPE = "guardrail_out_of_scope"
+    HANDOFF_OFFER = "handoff_offer"
+    CLARIFY_DEPARTMENT = "clarify_department"
+```
+
+Never use free-form text for policy keys.
+
+## Coding Standards
+
+### Naming Conventions
+
+- **Variables/functions**: `snake_case` (`call_id`, `handle_turn`, `find_by_id`)
+- **Classes**: `PascalCase` (`CallSession`, `TurnManager`, `AgentGeneration`)
+- **Constants**: `UPPER_SNAKE_CASE` (`MAX_FILLER_DURATION_MS`, `DEFAULT_TTL_SECONDS`)
+- **Type aliases**: `PascalCase` (`EventHandler`, `RouteLabel`)
+- **Files/modules**: `snake_case` (`turn_manager.py`, `coordinator.py`)
+- **Protocols/interfaces**: `PascalCase` with descriptive name (`CallRepository`, `EventPublisher`)
+
+### Type Safety
+
+- **Strict mypy**: Enable `strict = true` in `pyproject.toml`
+- **No `Any`**: Use `object`, `Unknown`, or specific types
+- **Use `msgspec.Struct`** for data structures in hot paths (faster than dataclasses/Pydantic)
+- **Use `Protocol`** for dependency inversion (repository interfaces)
+- **Use `Literal` and `Enum`** for constrained string values
+- **Use `|` union syntax**: `str | None` instead of `Optional[str]`
+- **Use `type` statement** for type aliases: `type EventHandler = Callable[[EventEnvelope], Awaitable[None]]`
+
+```python
+# Good: explicit types, msgspec.Struct
+class Turn(msgspec.Struct, frozen=True):
+    turn_id: UUID
+    call_id: UUID
+    seq: int
+    started_at: int
+    finalized_at: int | None = None
+    text_final: str | None = None
+    language: str | None = None
+    state: Literal["open", "finalized", "cancelled"] = "open"
+
+# Bad: untyped, mutable dict
+turn = {"turn_id": "...", "state": "open"}
+```
+
+### Error Handling
+
+- Define domain-specific exceptions in a dedicated module
+- Use structured error context, not string interpolation
+- Let exceptions propagate naturally; catch only at boundaries
+- Log errors with OpenTelemetry span context
+
+```python
+class VoiceRuntimeError(Exception):
+    """Base error for voice runtime."""
+
+class TurnAlreadyFinalizedError(VoiceRuntimeError):
+    def __init__(self, turn_id: UUID) -> None:
+        self.turn_id = turn_id
+        super().__init__(f"Turn {turn_id} already finalized")
+
+class ToolExecutionTimeoutError(VoiceRuntimeError):
+    def __init__(self, tool_request_id: UUID, timeout_ms: int) -> None:
+        self.tool_request_id = tool_request_id
+        self.timeout_ms = timeout_ms
+        super().__init__(f"Tool {tool_request_id} timed out after {timeout_ms}ms")
+```
+
+### Async Patterns
+
+- **Always use `async/await`** for I/O operations
+- **Use `asyncio.TaskGroup`** (Python 3.11+) for structured concurrency
+- **Use `asyncio.get_running_loop().call_later()`** for timers instead of `asyncio.sleep`
+- **Never block the event loop**: offload CPU-heavy work (embeddings, LLM) to thread/process pools
+- **Use `asyncio.shield()`** sparingly and document why
+
+```python
+# Good: structured concurrency
+async with asyncio.TaskGroup() as tg:
+    tg.create_task(coordinator_loop(bus))
+    tg.create_task(turn_manager_loop(bus))
+    tg.create_task(agent_fsm_loop(bus))
+
+# Good: offload CPU work
+loop = asyncio.get_running_loop()
+embedding = await loop.run_in_executor(
+    thread_pool, compute_embedding, text
+)
+```
+
+### Logging
+
+- Use `structlog` with JSON output for structured logging
+- Include `call_id`, `turn_id`, `agent_generation_id` in log context
+- Use appropriate levels: `debug` for event flow, `info` for state transitions, `warning` for fallbacks, `error` for failures
+
+```python
+import structlog
+
+logger = structlog.get_logger()
+
+logger.info(
+    "turn_finalized",
+    call_id=str(call_id),
+    turn_id=str(turn_id),
+    text_len=len(text),
+    language=detected_language,
+)
+```
+
+## API Design Standards
+
+### FastAPI Endpoints
+
+FastAPI is used only for admin/ops endpoints, not for the voice hot path.
+
+```python
+from fastapi import FastAPI, Depends
+
+app = FastAPI(title="Voice AI Runtime", version="0.1.0")
+
+# Health check
+@app.get("/health")
+async def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+# Admin endpoints
+@app.get("/api/v1/calls/{call_id}")
+async def get_call(call_id: UUID, repo: CallRepository = Depends(get_call_repo)) -> CallDetail:
+    ...
+```
+
+### Request/Response Patterns
+
+- Use `msgspec.Struct` or Pydantic v2 models for request/response schemas
+- Consistent envelope for API responses
+- Use appropriate HTTP status codes
+
+```python
+class ApiResponse[T](msgspec.Struct):
+    success: bool
+    data: T | None = None
+    error: str | None = None
+```
+
+### Versioning
+
+- Prefix all API routes with `/api/v1/`
+- Use header-based versioning for breaking changes in the future
+
+## Database Patterns
+
+### asyncpg (Hot Path)
+
+Use asyncpg directly for voice runtime queries where latency matters:
+
+```python
+async def insert_turn(pool: asyncpg.Pool, turn: Turn) -> None:
+    await pool.execute(
+        """
+        INSERT INTO turns (turn_id, call_id, seq, started_at, state)
+        VALUES ($1, $2, $3, $4, $5)
+        """,
+        turn.turn_id, turn.call_id, turn.seq, turn.started_at, turn.state,
+    )
+```
+
+### SQLAlchemy Async (Admin/CRUD)
+
+Use SQLAlchemy 2.0 async for admin endpoints and complex queries:
+
+```python
+from sqlalchemy.ext.asyncio import AsyncSession
+
+async def list_calls(session: AsyncSession, limit: int = 50) -> list[CallRow]:
+    result = await session.execute(
+        select(CallRow).order_by(CallRow.started_at.desc()).limit(limit)
+    )
+    return list(result.scalars().all())
+```
+
+### Migrations
+
+- Use Alembic for all schema changes
+- Descriptive migration names
+- Always review generated migrations before applying
+- Never modify applied migrations
+
+```bash
+# Create migration
+uv run alembic revision --autogenerate -m "add_voice_generations_table"
+
+# Apply migrations
+uv run alembic upgrade head
+```
+
+### Redis Patterns
+
+```python
+# TTL cache for idempotency
+await redis.set(f"seen:{event_id}", "1", ex=300)
+
+# TTL map for tool results
+await redis.set(f"tool_result:{tool_request_id}", orjson.dumps(result), ex=300)
+
+# Session registry
+await redis.hset(f"session:{call_id}", mapping=session_data)
+await redis.expire(f"session:{call_id}", 3600)
+```
+
+## Testing Standards
+
+### Test Organization
+
+```
+tests/
++-- unit/
+|   +-- test_coordinator.py
+|   +-- test_turn_manager.py
+|   +-- test_agent_fsm.py
+|   +-- test_router.py
++-- integration/
+|   +-- test_db_repositories.py
+|   +-- test_redis_cache.py
+|   +-- test_event_flow.py
++-- conftest.py
+```
+
+### Test Naming Convention
+
+Use descriptive, behavior-driven names:
+
+```python
+class TestCoordinator:
+    async def test_creates_agent_generation_on_turn_finalized(self) -> None: ...
+    async def test_cancels_voice_on_barge_in(self) -> None: ...
+    async def test_ignores_late_tool_result_for_cancelled_generation(self) -> None: ...
+```
+
+### Test Structure (AAA Pattern)
+
+```python
+async def test_routes_domain_intent_to_specialist(self) -> None:
+    # Arrange
+    router = Router(registry=test_registry, embedder=mock_embedder)
+    text = "tengo un problema con mi factura"
+
+    # Act
+    result = await router.classify(text, language="es")
+
+    # Assert
+    assert result.route_a_label == "domain"
+    assert result.route_b_label == "billing"
+    assert result.confidence >= 0.82
+```
+
+### Async Testing
+
+```python
+import pytest
+
+@pytest.fixture
+def event_loop_policy():
+    return asyncio.DefaultEventLoopPolicy()
+
+@pytest.mark.asyncio
+async def test_coordinator_processes_event() -> None:
+    bus: asyncio.Queue[EventEnvelope] = asyncio.Queue()
+    # ...
+```
+
+### Coverage Requirements
+
+- **Threshold**: 85% for lines and branches (MVP phase)
+- **Target**: 90% once core runtime is stable
+- **Coverage reports**: `uv run pytest --cov=src --cov-report=html`
+
+### Mocking Standards
+
+- Mock external dependencies (Redis, PostgreSQL, Realtime API)
+- Use `unittest.mock.AsyncMock` for async interfaces
+- Use `testcontainers` for integration tests with real PostgreSQL/Redis
+- Never mock the event bus in integration tests — use real `asyncio.Queue`
+
+### What to Test
+
+1. **Event flow**: Turn lifecycle from `speech_started` to `voice_generation_completed`
+2. **Barge-in**: Cancellation propagation across actors
+3. **Idempotency**: Duplicate events produce same result
+4. **Routing**: Threshold logic, fallback to MicroLLM, ambiguity detection
+5. **Tool execution**: Timeout, cancellation, result caching
+6. **State transitions**: FSM transitions and invalid transition rejection
+
+## Performance Best Practices
+
+### Latency Budget
+
+Target end-to-end latency (turn finalized to voice start):
+- **Simple turns** (greeting, guardrail): < 50ms
+- **Domain turns** (with routing): < 150ms
+- **Tool turns** (with tool execution): < 500ms + tool latency
+
+### Hot Path Rules
+
+- **No ORM on hot path**: Use asyncpg raw queries
+- **No JSON parsing on hot path**: Use msgspec for serialization
+- **No blocking calls**: Offload CPU work to `loop.run_in_executor()`
+- **Connection pooling**: asyncpg pool (min=5, max=20), Redis connection pool
+- **Batch writes**: Buffer non-critical writes (telemetry, logs) and flush periodically
+
+### Embedding Performance
+
+- Load models once at startup, not per-request
+- Pre-compute centroids at build time, not runtime
+- Use `onnxruntime` for inference (faster than PyTorch for serving)
+- Cache embeddings for repeated short utterances
+
+### asyncio Optimization
+
+- Install `uvloop` as the event loop policy
+- Use `asyncio.Queue` with bounded size to apply backpressure
+- Prefer `asyncio.TaskGroup` over manual task management
+- Use monotonic timestamps (`time.monotonic_ns()`) for latency measurement
+
+## Security Best Practices
+
+### Input Validation
+
+- Validate all external inputs at API boundaries (FastAPI models)
+- Sanitize transcript text before processing
+- Validate `policy_key` against the closed enum
+- Validate `tool_name` against the registered tool whitelist
+
+### Environment Variables
+
+- Use `pydantic-settings` for configuration with validation
+- Never commit `.env` files or secrets
+- Validate required environment variables at startup
+
+```python
+from pydantic_settings import BaseSettings
+
+class Settings(BaseSettings):
+    database_url: str
+    redis_url: str
+    sentry_dsn: str | None = None
+    otel_endpoint: str | None = None
+
+    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+```
+
+### Dependency Injection
+
+- Use FastAPI's `Depends()` for API endpoint dependencies
+- Use constructor injection for actors (Coordinator, TurnManager, Agent)
+- Define dependencies as `Protocol` interfaces for testability
+
+## Observability
+
+### OpenTelemetry Integration
+
+- Trace every event through the pipeline with span context
+- Add `call_id`, `turn_id`, `agent_generation_id` as span attributes
+- Measure latency at each actor boundary
+
+### Key Metrics (Prometheus)
+
+- `voice_turn_latency_ms` — histogram: turn finalized to voice start
+- `voice_route_a_confidence` — histogram: Route A classification confidence
+- `voice_tool_execution_ms` — histogram: tool execution duration
+- `voice_barge_in_total` — counter: barge-in events
+- `voice_fallback_microllm_total` — counter: MicroLLM fallback invocations
+
+### Router Logging (for calibration)
+
+Log per turn for threshold calibration:
+- `router_version`, `language`
+- `route_a_label`, `route_a_score`
+- `route_b_label`, `route_b_score`, `margin` (top1 - top2)
+- `fallback_used: bool`
+- `final_action: guided_response | tool | clarify | handoff`
+
+### Sentry
+
+- Capture unhandled exceptions with full context
+- Set `call_id` as Sentry tag for filtering
+- Use performance monitoring for critical transactions
+
+## Development Workflow
+
+### Git Workflow
+
+- **Feature branches**: Descriptive names with `-backend` suffix (e.g., `feat/coordinator-barge-in-backend`)
+- **Commits**: Conventional Commits in English (`feat:`, `fix:`, `refactor:`, `test:`)
+- **Small PRs**: One feature or fix per PR
+- **Code review**: Required before merge
+
+### Development Scripts
+
+```bash
+# Install dependencies
+uv sync
+
+# Run development server
+uv run uvicorn src.main:app --reload --host 0.0.0.0 --port 8000
+
+# Run tests
+uv run pytest
+
+# Run tests with coverage
+uv run pytest --cov=src --cov-report=html
+
+# Lint and format
+uv run ruff check .
+uv run ruff format .
+
+# Type check
+uv run mypy src/
+
+# Create migration
+uv run alembic revision --autogenerate -m "description"
+
+# Apply migrations
+uv run alembic upgrade head
+```
+
+### Code Quality
+
+- **ruff**: Run on every commit (via pre-commit)
+- **mypy**: Strict mode, run before merge
+- **pytest**: All tests must pass before merge
+- **pre-commit hooks**: ruff + mypy + pytest (fast subset)
+
+### pyproject.toml Configuration
+
+```toml
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "ANN", "ASYNC", "S", "B", "A", "C4", "RET", "SIM", "TCH"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+```
+
+## Deployment
+
+### Docker Compose (MVP)
+
+```yaml
+services:
+  voice-runtime:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+      - redis
+    environment:
+      DATABASE_URL: postgresql://user:pass@postgres:5432/voiceai
+      REDIS_URL: redis://redis:6379/0
+
+  postgres:
+    image: postgres:16-alpine
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+
+volumes:
+  pgdata:
+```
+
+### Dockerfile Best Practices
+
+- Multi-stage build (builder + runtime)
+- Use `uv` for dependency installation in Docker
+- Non-root user
+- Health check endpoint
+
+```dockerfile
+FROM python:3.12-slim AS builder
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+WORKDIR /app
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev
+
+FROM python:3.12-slim
+WORKDIR /app
+COPY --from=builder /app/.venv .venv
+COPY src/ src/
+CMD [".venv/bin/uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+This document serves as the foundation for maintaining code quality, consistency, and low-latency performance across the Voice AI Runtime backend.

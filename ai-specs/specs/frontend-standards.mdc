@@ -1,0 +1,565 @@
+---
+description: Frontend development standards, best practices, and conventions for the Voice AI Operations Panel — built with Next.js 15 (App Router), Tailwind CSS, shadcn/ui, and TypeScript.
+globs: ["frontend/src/**/*.{ts,tsx}", "frontend/app/**/*.{ts,tsx}", "frontend/components/**/*.{ts,tsx}", "frontend/tailwind.config.ts", "frontend/next.config.ts", "frontend/package.json"]
+alwaysApply: true
+---
+
+# Frontend Project Standards and Best Practices
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Technology Stack](#technology-stack)
+- [Project Structure](#project-structure)
+- [Coding Standards](#coding-standards)
+- [Component Conventions](#component-conventions)
+- [State Management & Data Flow](#state-management--data-flow)
+- [UI/UX Standards](#uiux-standards)
+- [Testing Standards](#testing-standards)
+- [Configuration Standards](#configuration-standards)
+- [Performance Best Practices](#performance-best-practices)
+- [Development Workflow](#development-workflow)
+
+---
+
+## Overview
+
+This document defines the standards for the Voice AI Operations Panel frontend. This is an internal ops/admin panel for monitoring and managing the Voice AI Runtime. It is built with Next.js 15 App Router, prioritizing server-side rendering, type safety, and operational efficiency.
+
+## Technology Stack
+
+### Core Technologies
+- **Next.js 15**: App Router with React Server Components
+- **TypeScript 5**: Strict mode, full type safety
+- **React 19**: Server Components, Suspense, use() hook
+
+### UI Framework
+- **Tailwind CSS 4**: Utility-first CSS framework
+- **shadcn/ui**: Accessible, composable component library (not installed as dependency — components are copied into the project)
+- **Lucide Icons**: Icon library (used by shadcn/ui)
+
+### State Management & Data Flow
+- **React Server Components**: Default for data fetching
+- **React Query (TanStack Query)**: Client-side async state for real-time data
+- **nuqs**: Type-safe URL search params state management
+- **Server Actions**: Form mutations and data writes
+
+### Package Manager
+- **pnpm**: Fast, disk-efficient package manager
+
+### Development Tools
+- **ESLint**: With Next.js and TypeScript rules
+- **Prettier**: Code formatting (via eslint-plugin-prettier)
+- **TypeScript**: Strict type checking
+
+## Project Structure
+
+```
+frontend/
++-- app/
+|   +-- layout.tsx              # Root layout
+|   +-- page.tsx                # Dashboard (home)
+|   +-- calls/
+|   |   +-- page.tsx            # Call history list
+|   |   +-- [callId]/
+|   |       +-- page.tsx        # Call detail view
+|   +-- routing/
+|   |   +-- page.tsx            # Router registry management
+|   +-- metrics/
+|   |   +-- page.tsx            # Metrics dashboard
+|   +-- settings/
+|   |   +-- page.tsx            # System settings
+|   +-- api/                    # API route handlers (if needed)
++-- components/
+|   +-- ui/                     # shadcn/ui components
+|   +-- calls/                  # Call-related components
+|   +-- routing/                # Routing-related components
+|   +-- metrics/                # Metrics-related components
+|   +-- layout/                 # Navigation, sidebar, header
++-- lib/
+|   +-- api.ts                  # API client (fetch wrapper)
+|   +-- utils.ts                # Utility functions (cn, formatters)
+|   +-- types.ts                # Shared TypeScript types
+|   +-- constants.ts            # App constants
++-- hooks/
+|   +-- use-calls.ts            # Call data hooks
+|   +-- use-metrics.ts          # Metrics hooks
++-- public/                     # Static assets
++-- tailwind.config.ts
++-- next.config.ts
++-- tsconfig.json
++-- package.json
+```
+
+## Coding Standards
+
+### Naming Conventions
+
+- **Components**: `PascalCase` (`CallDetail`, `MetricsDashboard`, `RoutingEditor`)
+- **Variables/functions**: `camelCase` (`callId`, `handleSubmit`, `formatDuration`)
+- **Constants**: `UPPER_SNAKE_CASE` (`API_BASE_URL`, `MAX_CALLS_PER_PAGE`)
+- **Types/interfaces**: `PascalCase` (`CallSession`, `TurnData`, `RouteConfig`)
+- **Files**: `kebab-case` for non-component files (`api-client.ts`, `use-calls.ts`)
+- **Component files**: `kebab-case` matching the component (`call-detail.tsx`, `metrics-dashboard.tsx`)
+- **CSS classes**: Tailwind utilities; custom classes in `kebab-case`
+- **Hooks**: `camelCase` prefixed with `use` (`useCalls`, `useMetrics`)
+
+### Language
+
+All code, comments, commit messages, and documentation must be in **English**.
+
+```typescript
+// Good
+const fetchCallHistory = async (limit: number): Promise<CallSession[]> => {
+  // Fetch recent call sessions from the API
+};
+
+// Bad
+const obtenerHistorialLlamadas = async (limite: number): Promise<CallSession[]> => {
+  // Obtener sesiones de llamada recientes de la API
+};
+```
+
+### TypeScript Usage
+
+- **Strict mode**: Always enabled in `tsconfig.json`
+- **No `any`**: Use `unknown` or specific types
+- **Prefer `interface`** for object shapes, `type` for unions/intersections
+- **Use `satisfies`** for type-safe object literals
+- **Use `as const`** for literal types
+
+```typescript
+// Good: explicit types
+interface CallSession {
+  callId: string;
+  status: "active" | "ended";
+  startedAt: number;
+  endedAt: number | null;
+  turnCount: number;
+}
+
+// Good: satisfies for type checking without widening
+const DEFAULT_FILTERS = {
+  status: "all",
+  limit: 50,
+  sortBy: "startedAt",
+} satisfies CallFilters;
+```
+
+### Import Order
+
+Enforce consistent import ordering:
+
+```typescript
+// 1. React/Next.js
+import { Suspense } from "react";
+import Link from "next/link";
+
+// 2. Third-party libraries
+import { useQuery } from "@tanstack/react-query";
+
+// 3. Internal components
+import { CallCard } from "@/components/calls/call-card";
+
+// 4. Internal utilities
+import { cn, formatDuration } from "@/lib/utils";
+
+// 5. Types
+import type { CallSession } from "@/lib/types";
+```
+
+## Component Conventions
+
+### Server Components (Default)
+
+All components are Server Components by default. Only add `"use client"` when necessary (event handlers, hooks, browser APIs).
+
+```typescript
+// app/calls/page.tsx — Server Component (default)
+import { CallList } from "@/components/calls/call-list";
+import { getCalls } from "@/lib/api";
+
+export default async function CallsPage() {
+  const calls = await getCalls({ limit: 50 });
+
+  return (
+    <div className="container mx-auto py-6">
+      <h1 className="text-2xl font-bold mb-4">Call History</h1>
+      <CallList calls={calls} />
+    </div>
+  );
+}
+```
+
+### Client Components
+
+Only use `"use client"` for interactive components:
+
+```typescript
+"use client";
+
+import { useState } from "react";
+import { Button } from "@/components/ui/button";
+
+interface CallFilterProps {
+  onFilter: (filters: CallFilters) => void;
+}
+
+export function CallFilter({ onFilter }: CallFilterProps) {
+  const [status, setStatus] = useState<string>("all");
+  // ...
+}
+```
+
+### Component Props
+
+- Define props with `interface` at the top of the file
+- Use destructuring in function signature
+- Avoid prop drilling — use composition or context
+
+```typescript
+interface MetricsCardProps {
+  title: string;
+  value: number;
+  unit: string;
+  trend?: "up" | "down" | "stable";
+}
+
+export function MetricsCard({ title, value, unit, trend }: MetricsCardProps) {
+  return (
+    <div className="rounded-lg border p-4">
+      <p className="text-sm text-muted-foreground">{title}</p>
+      <p className="text-2xl font-bold">
+        {value} <span className="text-sm">{unit}</span>
+      </p>
+    </div>
+  );
+}
+```
+
+### Composition Pattern
+
+Prefer composition over complex props:
+
+```typescript
+// Good: composition
+<Card>
+  <CardHeader>
+    <CardTitle>Call Details</CardTitle>
+  </CardHeader>
+  <CardContent>
+    <CallTimeline turns={turns} />
+  </CardContent>
+</Card>
+
+// Avoid: prop overload
+<Card title="Call Details" content={<CallTimeline turns={turns} />} />
+```
+
+## State Management & Data Flow
+
+### Data Fetching Strategy
+
+| Data Type | Strategy | Example |
+|-----------|----------|---------|
+| Static/rarely changes | Server Component + `fetch` | Call history page |
+| Real-time/polling | React Query + client component | Live metrics dashboard |
+| URL state (filters, pagination) | `nuqs` search params | Call list filters |
+| Form mutations | Server Actions | Settings updates |
+| Ephemeral UI state | `useState` | Modal open/close |
+
+### API Client
+
+Centralize all API calls in `lib/api.ts`:
+
+```typescript
+const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+
+async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, {
+    ...init,
+    headers: {
+      "Content-Type": "application/json",
+      ...init?.headers,
+    },
+  });
+
+  if (!res.ok) {
+    throw new ApiError(res.status, await res.text());
+  }
+
+  return res.json() as Promise<T>;
+}
+
+export const api = {
+  calls: {
+    list: (params?: CallFilters) => apiFetch<CallSession[]>(`/api/v1/calls`, { next: { revalidate: 10 } }),
+    get: (callId: string) => apiFetch<CallDetail>(`/api/v1/calls/${callId}`),
+  },
+  metrics: {
+    summary: () => apiFetch<MetricsSummary>(`/api/v1/metrics/summary`),
+  },
+};
+```
+
+### React Query (Client-Side Real-Time)
+
+```typescript
+"use client";
+
+import { useQuery } from "@tanstack/react-query";
+import { api } from "@/lib/api";
+
+export function useActiveCalls() {
+  return useQuery({
+    queryKey: ["calls", "active"],
+    queryFn: () => api.calls.list({ status: "active" }),
+    refetchInterval: 5_000, // Poll every 5s for live data
+  });
+}
+```
+
+### Server Actions
+
+```typescript
+"use server";
+
+import { revalidatePath } from "next/cache";
+
+export async function updateThresholds(formData: FormData) {
+  const thresholds = Object.fromEntries(formData);
+  await api.routing.updateThresholds(thresholds);
+  revalidatePath("/routing");
+}
+```
+
+## UI/UX Standards
+
+### shadcn/ui Usage
+
+- Install components via CLI: `pnpm dlx shadcn@latest add button card table`
+- Components live in `components/ui/`
+- Customize via Tailwind — never modify shadcn source directly
+- Use the `cn()` utility for conditional classes
+
+```typescript
+import { cn } from "@/lib/utils";
+
+<div className={cn(
+  "rounded-lg border p-4",
+  isActive && "border-green-500 bg-green-50",
+  isError && "border-red-500 bg-red-50",
+)}>
+```
+
+### Layout
+
+- Use the App Router layout system (`layout.tsx`)
+- Sidebar navigation for main sections
+- Responsive design with Tailwind breakpoints
+- Dark mode support via shadcn/ui theme
+
+### Accessibility
+
+- All interactive elements must be keyboard accessible (shadcn/ui handles this)
+- Use semantic HTML elements
+- Include `aria-label` for icon-only buttons
+- Provide alt text for images
+
+### Loading States
+
+Use React Suspense with loading UI:
+
+```typescript
+// app/calls/loading.tsx
+import { Skeleton } from "@/components/ui/skeleton";
+
+export default function Loading() {
+  return (
+    <div className="space-y-4">
+      <Skeleton className="h-8 w-48" />
+      <Skeleton className="h-64 w-full" />
+    </div>
+  );
+}
+```
+
+### Error Handling
+
+Use Next.js error boundaries:
+
+```typescript
+// app/calls/error.tsx
+"use client";
+
+export default function Error({ error, reset }: { error: Error; reset: () => void }) {
+  return (
+    <div className="flex flex-col items-center gap-4 py-12">
+      <p className="text-destructive">Failed to load calls: {error.message}</p>
+      <Button onClick={reset}>Retry</Button>
+    </div>
+  );
+}
+```
+
+## Testing Standards
+
+### Test Organization
+
+```
+frontend/
++-- __tests__/
+|   +-- components/
+|   |   +-- call-detail.test.tsx
+|   +-- lib/
+|   |   +-- api.test.ts
+|   +-- e2e/
+|       +-- calls.spec.ts
+```
+
+### Component Testing
+
+Use React Testing Library with Vitest:
+
+```typescript
+import { render, screen } from "@testing-library/react";
+import { MetricsCard } from "@/components/metrics/metrics-card";
+
+describe("MetricsCard", () => {
+  it("renders title and value", () => {
+    render(<MetricsCard title="Avg Latency" value={42} unit="ms" />);
+
+    expect(screen.getByText("Avg Latency")).toBeInTheDocument();
+    expect(screen.getByText("42")).toBeInTheDocument();
+  });
+});
+```
+
+### E2E Testing
+
+Use Playwright for end-to-end tests:
+
+```typescript
+import { test, expect } from "@playwright/test";
+
+test("call history page loads and displays calls", async ({ page }) => {
+  await page.goto("/calls");
+  await expect(page.getByRole("heading", { name: "Call History" })).toBeVisible();
+  await expect(page.getByRole("table")).toBeVisible();
+});
+```
+
+### Coverage
+
+- **Component tests**: Cover all interactive components
+- **API client tests**: Cover error handling and edge cases
+- **E2E tests**: Cover critical user flows (view calls, check metrics, edit routing)
+
+## Configuration Standards
+
+### TypeScript Configuration
+
+```json
+{
+  "compilerOptions": {
+    "strict": true,
+    "target": "ES2022",
+    "lib": ["dom", "dom.iterable", "esnext"],
+    "jsx": "preserve",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "paths": {
+      "@/*": ["./src/*"]
+    },
+    "plugins": [{ "name": "next" }]
+  }
+}
+```
+
+### ESLint Configuration
+
+- Extend `next/core-web-vitals` and `next/typescript`
+- Enable import sorting rules
+- Enforce consistent component patterns
+
+### Environment Variables
+
+```bash
+# .env.local (never committed)
+NEXT_PUBLIC_API_URL=http://localhost:8000
+```
+
+- Prefix client-side variables with `NEXT_PUBLIC_`
+- Server-only variables (API keys, secrets) must NOT have the prefix
+- Validate environment variables at build time
+
+## Performance Best Practices
+
+### Server Components First
+
+- Default to Server Components for all pages and data display
+- Only add `"use client"` for interactivity
+- Use `Suspense` boundaries for streaming
+
+### Caching
+
+- Use Next.js `fetch` with `revalidate` for ISR
+- Use React Query for client-side cache with polling
+- Set appropriate `Cache-Control` headers via `next.config.ts`
+
+### Bundle Optimization
+
+- Use dynamic imports for heavy components: `const Chart = dynamic(() => import("./chart"))`
+- Avoid importing entire icon libraries — use tree-shakeable imports
+- Monitor bundle size with `@next/bundle-analyzer`
+
+### Images
+
+- Use `next/image` for all images
+- Provide `width` and `height` or use `fill` with proper `sizes`
+
+## Development Workflow
+
+### Git Workflow
+
+- **Feature branches**: Descriptive names with `-frontend` suffix (e.g., `feat/metrics-dashboard-frontend`)
+- **Commits**: Conventional Commits in English
+- **Small PRs**: One feature or fix per PR
+- **Code review**: Required before merge
+
+### Development Scripts
+
+```bash
+# Install dependencies
+pnpm install
+
+# Run development server
+pnpm dev
+
+# Build for production
+pnpm build
+
+# Run linter
+pnpm lint
+
+# Run type check
+pnpm tsc --noEmit
+
+# Run tests
+pnpm test
+
+# Run E2E tests
+pnpm test:e2e
+
+# Add shadcn/ui component
+pnpm dlx shadcn@latest add [component-name]
+```
+
+### Code Quality
+
+- **ESLint**: Run on every commit
+- **TypeScript**: Strict mode, no errors allowed
+- **Prettier**: Consistent formatting
+- **All tests passing**: Before merge
+
+This document serves as the foundation for maintaining code quality and consistency across the Voice AI Operations Panel frontend.
