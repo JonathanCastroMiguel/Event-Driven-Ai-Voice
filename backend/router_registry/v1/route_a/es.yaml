@@ -1,0 +1,32 @@
+simple:
+  - "hola"
+  - "buenas tardes"
+  - "buenos días"
+  - "buenas noches"
+  - "gracias"
+  - "muchas gracias"
+  - "vale"
+  - "ok"
+  - "adiós"
+  - "hasta luego"
+
+disallowed:
+  - "eres un inútil"
+  - "bot estúpido"
+  - "te odio"
+  - "idiota"
+  - "cállate"
+
+out_of_scope:
+  - "qué tiempo hace hoy"
+  - "cuéntame un chiste"
+  - "quién es el presidente"
+  - "pon una canción"
+  - "qué hora es"
+
+domain:
+  - "necesito ayuda con mi cuenta"
+  - "quiero cancelar mi suscripción"
+  - "mi factura está mal"
+  - "quiero comprar el plan premium"
+  - "tengo un problema técnico"
