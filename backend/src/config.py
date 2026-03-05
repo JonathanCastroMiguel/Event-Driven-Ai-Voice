@@ -29,6 +29,14 @@ class Settings(BaseSettings):
     llm_fallback_timeout_s: float = 2.0
     llm_fallback_max_connections: int = 10
 
+    # Conversation history
+    max_history_turns: int = 10
+    max_history_chars: int = 2000
+
+    # Context-aware routing
+    routing_context_window: int = 1
+    routing_short_text_chars: int = 20
+
     # Router registry
     router_registry_path: str = "router_registry/v1"
 

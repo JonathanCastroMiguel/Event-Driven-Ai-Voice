@@ -284,3 +284,78 @@ class TestFullPipeline:
         result = await router.classify("you are an idiot", "en")
         assert result.route_a_label == RouteALabel.DISALLOWED
         assert result.short_circuit == "lexicon"
+
+
+# ---------------------------------------------------------------------------
+# Context-Aware Routing (Enrichment) Tests
+# ---------------------------------------------------------------------------
+
+
+class TestEnrichedTextRouting:
+    """6.1 — Router uses enriched_text for embedding when provided."""
+
+    async def test_enriched_text_used_for_embedding(self) -> None:
+        registry = _make_registry()
+        engine = _mock_engine(
+            ("domain", 0.85, {"simple": 0.1, "disallowed": 0.1, "out_of_scope": 0.1, "domain": 0.85}),
+            ("billing", 0.90, {"sales": 0.2, "billing": 0.90, "support": 0.15, "retention": 0.1}),
+        )
+        router = Router(registry, engine)
+        result = await router.classify(
+            "de este mes", "es",
+            enriched_text="tengo un problema con mi factura. de este mes",
+        )
+        # Verify embedding engine received the enriched text, not the original
+        first_call_text = engine.classify.call_args_list[0][0][0]
+        assert first_call_text == "tengo un problema con mi factura. de este mes"
+        assert result.route_a_label == RouteALabel.DOMAIN
+
+    """6.2 — Router uses original text for lexicon check."""
+
+    async def test_lexicon_uses_original_text(self) -> None:
+        registry = _make_registry()
+        engine = MagicMock(spec=EmbeddingEngine)
+        router = Router(registry, engine)
+        # "idiota" in original text should trigger lexicon, even with enriched text
+        result = await router.classify(
+            "eres un idiota", "es",
+            enriched_text="mi factura. eres un idiota",
+        )
+        assert result.route_a_label == RouteALabel.DISALLOWED
+        assert result.short_circuit == "lexicon"
+        engine.classify.assert_not_called()
+
+    """6.3 — Router uses original text for short utterance check."""
+
+    async def test_short_utterance_uses_original_text(self) -> None:
+        registry = _make_registry()
+        engine = MagicMock(spec=EmbeddingEngine)
+        router = Router(registry, engine)
+        # "hola" should match short utterances even with enriched text
+        result = await router.classify(
+            "hola", "es",
+            enriched_text="something else. hola",
+        )
+        assert result.route_a_label == RouteALabel.SIMPLE
+        assert result.short_circuit == "short_utterance"
+        engine.classify.assert_not_called()
+
+    """6.4 — llm_context passed through to LLM fallback when ambiguous."""
+
+    async def test_llm_context_passed_to_fallback(self) -> None:
+        registry = _make_registry()
+        # Ambiguous Route A: low scores, tight margin
+        engine = _mock_engine(
+            ("domain", 0.72, {"simple": 0.70, "disallowed": 0.1, "out_of_scope": 0.1, "domain": 0.72})
+        )
+        llm = AsyncMock(spec=LLMFallbackClient)
+        llm.classify.return_value = LLMClassificationResult(
+            label="domain", confidence=0.90, raw_response='{"label":"domain","confidence":0.90}'
+        )
+        router = Router(registry, engine, llm_fallback=llm)
+        llm_ctx = "language=es; previous_turn: tengo un problema con mi factura"
+        result = await router.classify("de este mes", "es", llm_context=llm_ctx)
+        # Verify the LLM received the conversation context
+        llm.classify.assert_called_once()
+        call_kwargs = llm.classify.call_args
+        assert call_kwargs[1]["context"] == llm_ctx or call_kwargs[0][2] == llm_ctx

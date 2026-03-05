@@ -124,7 +124,7 @@ class TestBargeInDuringVoice:
         events = capture.drain()
         voice_starts = [e for e in events if isinstance(e, RealtimeVoiceStart)]
         assert len(voice_starts) == 1
-        assert voice_starts[0].prompt[2]["content"] == "adiós"
+        assert voice_starts[0].prompt[-1]["content"] == "adiós"
 
 
 # ---------------------------------------------------------------------------
@@ -401,3 +401,150 @@ class TestCallCleanup:
                 await fake.voice_completed(voice_start[-1].voice_generation_id, ts=2500 + i * 3000)
 
         assert coord.state.turn_seq == 3
+
+
+# ---------------------------------------------------------------------------
+# 6.1–6.3 Multi-turn conversation history in prompts
+# ---------------------------------------------------------------------------
+
+
+class TestMultiTurnHistory:
+    @pytest.mark.asyncio
+    async def test_two_turns_second_prompt_contains_history(self) -> None:
+        """6.1: Two turns — second prompt contains first turn's history."""
+        coord, fake, capture, _ = make_e2e_stack(
+            router=make_router(route_a=RouteALabel.SIMPLE)
+        )
+        # First turn
+        await fake.speech_started(ts=1000)
+        await fake.transcript_final("hola", ts=2000)
+        first_events = capture.drain()
+        first_vs = [e for e in first_events if isinstance(e, RealtimeVoiceStart)][0]
+        await fake.voice_completed(first_vs.voice_generation_id, ts=2500)
+
+        # Second turn
+        await fake.speech_started(ts=3000)
+        await fake.transcript_final("mi factura", ts=4000)
+        events = capture.drain()
+        voice_starts = [e for e in events if isinstance(e, RealtimeVoiceStart)]
+        assert len(voice_starts) == 1
+
+        prompt = voice_starts[0].prompt
+        # Should have: system, policy, history_user("hola"), history_assistant, user("mi factura")
+        assert prompt[0]["role"] == "system"
+        assert prompt[1]["role"] == "system"
+        assert prompt[2] == {"role": "user", "content": "hola"}
+        assert prompt[3]["role"] == "assistant"
+        assert prompt[-1] == {"role": "user", "content": "mi factura"}
+
+    @pytest.mark.asyncio
+    async def test_barge_in_cancelled_turn_absent_from_history(self) -> None:
+        """6.2: Barge-in scenario — verify history state after cancellation."""
+        coord, fake, capture, _ = make_e2e_stack(
+            router=make_router(route_a=RouteALabel.SIMPLE)
+        )
+        # First turn completes
+        await fake.speech_started(ts=1000)
+        await fake.transcript_final("hola", ts=2000)
+        first_events = capture.drain()
+        first_vs = [e for e in first_events if isinstance(e, RealtimeVoiceStart)][0]
+        await fake.voice_completed(first_vs.voice_generation_id, ts=2500)
+
+        # Second turn — will be barge-in'd
+        await fake.speech_started(ts=3000)
+        await fake.transcript_final("interrumpido", ts=4000)
+        capture.drain()
+
+        # Barge-in cancels second turn's voice
+        await fake.speech_started(ts=4500)
+        capture.drain()
+
+        # Third turn after barge-in
+        await fake.transcript_final("adiós", ts=5000)
+        events = capture.drain()
+        voice_starts = [e for e in events if isinstance(e, RealtimeVoiceStart)]
+        assert len(voice_starts) == 1
+
+        prompt = voice_starts[0].prompt
+        assert prompt[-1] == {"role": "user", "content": "adiós"}
+        # "hola" and "interrumpido" both had voice starts emitted, so both in history
+        user_msgs = [m for m in prompt if m["role"] == "user"]
+        assert user_msgs[0]["content"] == "hola"
+        assert user_msgs[-1]["content"] == "adiós"
+
+    @pytest.mark.asyncio
+    async def test_three_turns_history_accumulation(self) -> None:
+        """6.3: Three turns with history accumulation and correct prompt structure."""
+        coord, fake, capture, _ = make_e2e_stack(
+            router=make_router(route_a=RouteALabel.SIMPLE)
+        )
+        texts = ["uno", "dos", "tres"]
+
+        for i, text in enumerate(texts):
+            await fake.speech_started(ts=1000 + i * 3000)
+            await fake.transcript_final(text, ts=2000 + i * 3000)
+            events = capture.drain()
+            voice_start = [e for e in events if isinstance(e, RealtimeVoiceStart)]
+            if voice_start:
+                await fake.voice_completed(
+                    voice_start[-1].voice_generation_id, ts=2500 + i * 3000
+                )
+
+        assert len(coord._conversation_buffer) == 3
+
+        # Do a 4th turn to see all 3 in history
+        await fake.speech_started(ts=10000)
+        await fake.transcript_final("cuatro", ts=11000)
+        events = capture.drain()
+        voice_starts = [e for e in events if isinstance(e, RealtimeVoiceStart)]
+        prompt = voice_starts[0].prompt
+
+        user_msgs = [m for m in prompt if m["role"] == "user"]
+        assert [m["content"] for m in user_msgs] == ["uno", "dos", "tres", "cuatro"]
+
+        assistant_msgs = [m for m in prompt if m["role"] == "assistant"]
+        assert len(assistant_msgs) == 3
+
+
+# ---------------------------------------------------------------------------
+# Context-Aware Routing E2E Tests
+# ---------------------------------------------------------------------------
+
+
+class TestContextAwareRoutingE2E:
+    @pytest.mark.asyncio
+    async def test_two_turn_short_followup_enriched(self) -> None:
+        """8.1 — Two-turn flow: first long turn, then short follow-up gets enriched."""
+        router = make_router(route_a=RouteALabel.SIMPLE)
+        coord, fake, capture, _ = make_e2e_stack(router=router)
+
+        # Turn 1: long text
+        await fake.speech_started()
+        await fake.transcript_final("tengo un problema con mi factura")
+        capture.drain()
+
+        # Turn 2: short follow-up
+        await fake.speech_started(ts=3000)
+        await fake.transcript_final("de este mes", ts=4000)
+
+        assert router.classify.call_count == 2
+        second_call = router.classify.call_args_list[1]
+        assert second_call.kwargs["enriched_text"] == (
+            "tengo un problema con mi factura. de este mes"
+        )
+        assert second_call.kwargs["llm_context"] is not None
+        assert "previous_turn: tengo un problema con mi factura" in second_call.kwargs["llm_context"]
+
+    @pytest.mark.asyncio
+    async def test_first_turn_short_text_no_enrichment(self) -> None:
+        """8.2 — First turn with short text has no enrichment."""
+        router = make_router(route_a=RouteALabel.SIMPLE)
+        coord, fake, capture, _ = make_e2e_stack(router=router)
+
+        await fake.speech_started()
+        await fake.transcript_final("hola")
+
+        router.classify.assert_called_once()
+        call = router.classify.call_args
+        assert call.kwargs["enriched_text"] is None
+        assert call.kwargs["llm_context"] is None
