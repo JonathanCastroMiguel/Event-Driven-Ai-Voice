@@ -17,6 +17,7 @@ from src.infrastructure.telemetry import (
     TURN_LATENCY,
     get_tracer,
 )
+from src.routing.context import RoutingContextBuilder
 from src.routing.policies import PoliciesRegistry
 from src.routing.router import Router
 
@@ -27,6 +28,7 @@ if TYPE_CHECKING:
         VoiceGenerationRepository,
     )
 from src.voice_runtime.agent_fsm import AgentFSM
+from src.voice_runtime.conversation_buffer import ConversationBuffer, TurnEntry
 from src.voice_runtime.events import (
     CancelAgentGeneration,
     EventEnvelope,
@@ -70,6 +72,10 @@ class Coordinator:
         turn_repo: TurnRepository | None = None,
         agent_gen_repo: AgentGenerationRepository | None = None,
         voice_gen_repo: VoiceGenerationRepository | None = None,
+        max_history_turns: int = 10,
+        max_history_chars: int = 2000,
+        routing_context_window: int = 1,
+        routing_short_text_chars: int = 20,
     ) -> None:
         self._call_id = call_id
         self._turn_manager = turn_manager
@@ -83,6 +89,13 @@ class Coordinator:
         self._agent_gen_repo = agent_gen_repo
         self._voice_gen_repo = voice_gen_repo
         self._state = CoordinatorRuntimeState(call_id=call_id)
+        self._conversation_buffer = ConversationBuffer(
+            max_turns=max_history_turns, max_chars=max_history_chars
+        )
+        self._routing_context_builder = RoutingContextBuilder(
+            short_text_chars=routing_short_text_chars,
+            context_window=routing_context_window,
+        )
         self._seen_ids_fallback: set[str] = set()
         self._filler_task: asyncio.Task[None] | None = None
         self._output_events: list[
@@ -288,11 +301,21 @@ class Coordinator:
         agent_generation_id = uuid4()
         s.active_agent_generation_id = agent_generation_id
 
-        # Detect language and classify
+        # Detect language, build routing context, and classify
         from src.routing.language import detect_language
 
         language = detect_language(text)
-        routing_result = await self._router.classify(text, language)
+        routing_ctx = self._routing_context_builder.build(
+            user_text=text,
+            language=language,
+            buffer=self._conversation_buffer,
+        )
+        routing_result = await self._router.classify(
+            text,
+            language,
+            enriched_text=routing_ctx.enriched_text,
+            llm_context=routing_ctx.llm_context,
+        )
 
         # Persist turn insert (10.9)
         if self._turn_repo is not None:
@@ -439,6 +462,7 @@ class Coordinator:
         s.active_voice_generation_id = voice_gen_id
         actual_gen_id = gen_id or uuid4()
 
+        history = self._conversation_buffer.format_messages()
         self._output_events.append(
             RealtimeVoiceStart(
                 call_id=self._call_id,
@@ -447,9 +471,20 @@ class Coordinator:
                 prompt=[
                     {"role": "system", "content": self._policies.base_system},
                     {"role": "system", "content": self._policies.get_instructions(policy_key)},
+                    *history,
                     {"role": "user", "content": user_text},
                 ],
                 ts=envelope.ts,
+            )
+        )
+
+        # Append to conversation buffer
+        self._conversation_buffer.append(
+            TurnEntry(
+                seq=s.turn_seq,
+                user_text=user_text,
+                route_a_label=policy_key_str,
+                policy_key=policy_key_str,
             )
         )
 
@@ -507,6 +542,16 @@ class Coordinator:
                 voice_generation_id=voice_gen_id,
                 prompt=f"Specialist: {specialist}. User said: {user_text}",
                 ts=envelope.ts,
+            )
+        )
+
+        # Append to conversation buffer
+        self._conversation_buffer.append(
+            TurnEntry(
+                seq=s.turn_seq,
+                user_text=user_text,
+                route_a_label="domain",
+                specialist=specialist,
             )
         )
 

@@ -295,7 +295,9 @@ class TestTurnLifecycle:
         with patch("src.routing.language.detect_language", return_value="es"):
             await coord.handle_event(transcript)
 
-        router.classify.assert_called_once_with("hola buenos días", "es")
+        router.classify.assert_called_once_with(
+            "hola buenos días", "es", enriched_text=None, llm_context=None
+        )
 
     @pytest.mark.asyncio
     async def test_simple_turn_emits_voice_start(self) -> None:
@@ -761,6 +763,189 @@ class TestPersistenceWiring:
         assert cancelled.state.value == "cancelled"
         assert cancelled.cancel_reason == "barge_in"
 
+# ---------------------------------------------------------------------------
+# 5.1–5.5 Multi-turn conversation buffer integration
+# ---------------------------------------------------------------------------
+
+
+class TestMultiTurnConversationBuffer:
+    @pytest.mark.asyncio
+    async def test_first_turn_prompt_no_history(self) -> None:
+        """5.1: First turn (empty buffer) produces [system, policy, user]."""
+        router = _make_router(route_a=RouteALabel.SIMPLE)
+        coord = _make_coordinator(router=router)
+
+        speech = _envelope(call_id=coord._call_id, event_type="speech_started")
+        await coord.handle_event(speech)
+        coord.drain_output_events()
+
+        transcript = _envelope(
+            call_id=coord._call_id,
+            event_type="transcript_final",
+            payload={"text": "hola"},
+        )
+        with patch("src.routing.language.detect_language", return_value="es"):
+            await coord.handle_event(transcript)
+
+        events = coord.drain_output_events()
+        voice_starts = [e for e in events if isinstance(e, RealtimeVoiceStart)]
+        assert len(voice_starts) == 1
+        prompt = voice_starts[0].prompt
+        assert len(prompt) == 3  # system, policy, user — no history
+        assert prompt[0]["role"] == "system"
+        assert prompt[1]["role"] == "system"
+        assert prompt[2]["role"] == "user"
+        assert prompt[2]["content"] == "hola"
+
+    @pytest.mark.asyncio
+    async def test_second_turn_includes_history(self) -> None:
+        """5.2: Second turn includes history from buffer."""
+        router = _make_router(route_a=RouteALabel.SIMPLE)
+        coord = _make_coordinator(router=router)
+
+        # First turn
+        speech1 = _envelope(call_id=coord._call_id, event_type="speech_started")
+        await coord.handle_event(speech1)
+        transcript1 = _envelope(
+            call_id=coord._call_id,
+            event_type="transcript_final",
+            payload={"text": "hola"},
+        )
+        with patch("src.routing.language.detect_language", return_value="es"):
+            await coord.handle_event(transcript1)
+        coord.drain_output_events()
+
+        # Second turn
+        speech2 = _envelope(call_id=coord._call_id, event_type="speech_started")
+        await coord.handle_event(speech2)
+        coord.drain_output_events()
+        transcript2 = _envelope(
+            call_id=coord._call_id,
+            event_type="transcript_final",
+            payload={"text": "mi factura"},
+        )
+        with patch("src.routing.language.detect_language", return_value="es"):
+            await coord.handle_event(transcript2)
+
+        events = coord.drain_output_events()
+        voice_starts = [e for e in events if isinstance(e, RealtimeVoiceStart)]
+        assert len(voice_starts) == 1
+        prompt = voice_starts[0].prompt
+        # [system, policy, history_user, history_assistant, user]
+        assert len(prompt) == 5
+        assert prompt[2]["role"] == "user"
+        assert prompt[2]["content"] == "hola"
+        assert prompt[3]["role"] == "assistant"
+        assert prompt[-1]["role"] == "user"
+        assert prompt[-1]["content"] == "mi factura"
+
+    @pytest.mark.asyncio
+    async def test_barge_in_turn_not_in_buffer(self) -> None:
+        """5.3: Cancelled turn (barge-in before voice start) not in buffer."""
+        router = _make_router(route_a=RouteALabel.SIMPLE)
+        coord = _make_coordinator(router=router)
+
+        # First turn — completes successfully
+        speech1 = _envelope(call_id=coord._call_id, event_type="speech_started")
+        await coord.handle_event(speech1)
+        transcript1 = _envelope(
+            call_id=coord._call_id,
+            event_type="transcript_final",
+            payload={"text": "hola"},
+        )
+        with patch("src.routing.language.detect_language", return_value="es"):
+            await coord.handle_event(transcript1)
+        coord.drain_output_events()
+
+        # Barge-in: speech_started cancels the active voice
+        speech2 = _envelope(call_id=coord._call_id, event_type="speech_started")
+        await coord.handle_event(speech2)
+        coord.drain_output_events()
+
+        # New turn after barge-in
+        transcript2 = _envelope(
+            call_id=coord._call_id,
+            event_type="transcript_final",
+            payload={"text": "adiós"},
+        )
+        with patch("src.routing.language.detect_language", return_value="es"):
+            await coord.handle_event(transcript2)
+
+        events = coord.drain_output_events()
+        voice_starts = [e for e in events if isinstance(e, RealtimeVoiceStart)]
+        assert len(voice_starts) == 1
+        prompt = voice_starts[0].prompt
+        # History should contain "hola" from first turn, current is "adiós"
+        assert prompt[-1]["content"] == "adiós"
+        # First turn's history is present
+        history_users = [m for m in prompt if m["role"] == "user"]
+        assert len(history_users) == 2  # history "hola" + current "adiós"
+
+    @pytest.mark.asyncio
+    async def test_three_turns_accumulate_history(self) -> None:
+        """5.4: Three consecutive turns accumulate correct history."""
+        router = _make_router(route_a=RouteALabel.SIMPLE)
+        coord = _make_coordinator(router=router)
+
+        for i, text in enumerate(["uno", "dos", "tres"]):
+            speech = _envelope(call_id=coord._call_id, event_type="speech_started")
+            await coord.handle_event(speech)
+            if i > 0:
+                coord.drain_output_events()  # clear barge-in cancels
+            transcript = _envelope(
+                call_id=coord._call_id,
+                event_type="transcript_final",
+                payload={"text": text},
+            )
+            with patch("src.routing.language.detect_language", return_value="es"):
+                await coord.handle_event(transcript)
+            if i < 2:
+                coord.drain_output_events()
+
+        events = coord.drain_output_events()
+        voice_starts = [e for e in events if isinstance(e, RealtimeVoiceStart)]
+        assert len(voice_starts) == 1
+        prompt = voice_starts[0].prompt
+        # system, policy, history(uno), assistant, history(dos), assistant, user(tres)
+        assert prompt[-1]["content"] == "tres"
+        user_msgs = [m for m in prompt if m["role"] == "user"]
+        assert [m["content"] for m in user_msgs] == ["uno", "dos", "tres"]
+
+    @pytest.mark.asyncio
+    async def test_buffer_respects_max_history_turns(self) -> None:
+        """5.5: Buffer respects max_history_turns setting."""
+        router = _make_router(route_a=RouteALabel.SIMPLE)
+        coord = _make_coordinator(router=router)
+        # Override buffer with max_turns=2
+        from src.voice_runtime.conversation_buffer import ConversationBuffer
+
+        coord._conversation_buffer = ConversationBuffer(max_turns=2, max_chars=10000)
+
+        for i, text in enumerate(["uno", "dos", "tres"]):
+            speech = _envelope(call_id=coord._call_id, event_type="speech_started")
+            await coord.handle_event(speech)
+            if i > 0:
+                coord.drain_output_events()
+            transcript = _envelope(
+                call_id=coord._call_id,
+                event_type="transcript_final",
+                payload={"text": text},
+            )
+            with patch("src.routing.language.detect_language", return_value="es"):
+                await coord.handle_event(transcript)
+            if i < 2:
+                coord.drain_output_events()
+
+        events = coord.drain_output_events()
+        voice_starts = [e for e in events if isinstance(e, RealtimeVoiceStart)]
+        prompt = voice_starts[0].prompt
+        # Only 2 history turns (dos + tres's own entry not yet in buffer at prompt time)
+        # At prompt time for "tres", buffer has [uno, dos] -> max_turns=2 keeps both
+        # After voice start, "tres" is appended -> buffer becomes [dos, tres]
+        user_msgs = [m for m in prompt if m["role"] == "user"]
+        assert len(user_msgs) == 3  # history(uno, dos) + current(tres)
+
+
     @pytest.mark.asyncio
     async def test_persistence_error_does_not_crash(self) -> None:
         turn_repo = AsyncMock()
@@ -782,3 +967,103 @@ class TestPersistenceWiring:
         # Should not crash — persistence is fire-and-forget
         events = coord.drain_output_events()
         assert len(events) >= 1  # Voice start still emitted
+
+
+# ---------------------------------------------------------------------------
+# Context-Aware Routing Integration Tests
+# ---------------------------------------------------------------------------
+
+
+class TestContextAwareRouting:
+    """7.1-7.3 — Coordinator builds enriched routing inputs."""
+
+    @pytest.mark.asyncio
+    async def test_short_followup_passes_enriched_text(self) -> None:
+        """7.1 — Short follow-up after a prior turn passes enriched text to router."""
+        router = _make_router(route_a=RouteALabel.SIMPLE)
+        coord = _make_coordinator(router=router)
+
+        # Turn 1: long text (establishes history)
+        speech1 = _envelope(call_id=coord._call_id, event_type="speech_started")
+        await coord.handle_event(speech1)
+        t1 = _envelope(
+            call_id=coord._call_id,
+            event_type="transcript_final",
+            payload={"text": "tengo un problema con mi factura"},
+        )
+        with patch("src.routing.language.detect_language", return_value="es"):
+            await coord.handle_event(t1)
+        coord.drain_output_events()
+
+        # Turn 2: short follow-up
+        speech2 = _envelope(call_id=coord._call_id, event_type="speech_started")
+        await coord.handle_event(speech2)
+        coord.drain_output_events()
+        t2 = _envelope(
+            call_id=coord._call_id,
+            event_type="transcript_final",
+            payload={"text": "de este mes"},
+        )
+        with patch("src.routing.language.detect_language", return_value="es"):
+            await coord.handle_event(t2)
+
+        # Router should have been called with enriched text on 2nd turn
+        assert router.classify.call_count == 2
+        second_call = router.classify.call_args_list[1]
+        assert second_call.kwargs["enriched_text"] == "tengo un problema con mi factura. de este mes"
+        assert "previous_turn: tengo un problema con mi factura" in second_call.kwargs["llm_context"]
+
+    @pytest.mark.asyncio
+    async def test_first_turn_no_enrichment(self) -> None:
+        """7.2 — First turn of call has no enrichment."""
+        router = _make_router(route_a=RouteALabel.SIMPLE)
+        coord = _make_coordinator(router=router)
+
+        speech = _envelope(call_id=coord._call_id, event_type="speech_started")
+        await coord.handle_event(speech)
+        t1 = _envelope(
+            call_id=coord._call_id,
+            event_type="transcript_final",
+            payload={"text": "hola buenos días"},
+        )
+        with patch("src.routing.language.detect_language", return_value="es"):
+            await coord.handle_event(t1)
+
+        router.classify.assert_called_once_with(
+            "hola buenos días", "es", enriched_text=None, llm_context=None
+        )
+
+    @pytest.mark.asyncio
+    async def test_long_text_no_enriched_but_has_llm_context(self) -> None:
+        """7.3 — Long text does not enrich but still passes llm_context."""
+        router = _make_router(route_a=RouteALabel.SIMPLE)
+        coord = _make_coordinator(router=router)
+
+        # Turn 1
+        speech1 = _envelope(call_id=coord._call_id, event_type="speech_started")
+        await coord.handle_event(speech1)
+        t1 = _envelope(
+            call_id=coord._call_id,
+            event_type="transcript_final",
+            payload={"text": "hola"},
+        )
+        with patch("src.routing.language.detect_language", return_value="es"):
+            await coord.handle_event(t1)
+        coord.drain_output_events()
+
+        # Turn 2: long text (>= 20 chars)
+        speech2 = _envelope(call_id=coord._call_id, event_type="speech_started")
+        await coord.handle_event(speech2)
+        coord.drain_output_events()
+        t2 = _envelope(
+            call_id=coord._call_id,
+            event_type="transcript_final",
+            payload={"text": "quiero cambiar mi plan de datos a uno más barato"},
+        )
+        with patch("src.routing.language.detect_language", return_value="es"):
+            await coord.handle_event(t2)
+
+        second_call = router.classify.call_args_list[1]
+        assert second_call.kwargs["enriched_text"] is None
+        assert second_call.kwargs["llm_context"] is not None
+        assert "previous_turn: hola" in second_call.kwargs["llm_context"]
