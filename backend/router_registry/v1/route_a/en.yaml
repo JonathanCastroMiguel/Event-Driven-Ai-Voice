@@ -1,0 +1,32 @@
+simple:
+  - "hello"
+  - "hi there"
+  - "good morning"
+  - "good afternoon"
+  - "good evening"
+  - "thanks"
+  - "thank you so much"
+  - "okay"
+  - "bye"
+  - "goodbye"
+
+disallowed:
+  - "you are useless"
+  - "stupid bot"
+  - "I hate you"
+  - "you idiot"
+  - "shut up"
+
+out_of_scope:
+  - "what is the weather today"
+  - "tell me a joke"
+  - "who is the president"
+  - "play a song"
+  - "what time is it"
+
+domain:
+  - "I need help with my account"
+  - "I want to cancel my subscription"
+  - "my bill is incorrect"
+  - "I want to purchase the premium plan"
+  - "I have a technical issue"

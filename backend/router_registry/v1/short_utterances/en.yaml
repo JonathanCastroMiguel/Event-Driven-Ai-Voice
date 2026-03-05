@@ -1,0 +1,15 @@
+greetings:
+  - "hello"
+  - "hi"
+  - "hey"
+  - "good morning"
+  - "good afternoon"
+  - "good evening"
+
+acknowledgements:
+  - "ok"
+  - "okay"
+  - "yes"
+  - "no"
+  - "thanks"
+  - "bye"

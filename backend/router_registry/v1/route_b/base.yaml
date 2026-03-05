@@ -1,0 +1,27 @@
+sales:
+  - "I want to buy a plan"
+  - "tell me about your products"
+  - "what plans do you offer"
+  - "I want to upgrade"
+  - "pricing information"
+
+billing:
+  - "my bill is wrong"
+  - "I was overcharged"
+  - "refund my payment"
+  - "when is my next payment"
+  - "payment method update"
+
+support:
+  - "my service is not working"
+  - "I have a technical problem"
+  - "my internet is slow"
+  - "I cannot log in"
+  - "error message on my screen"
+
+retention:
+  - "I want to cancel"
+  - "I am leaving your service"
+  - "cancel my account"
+  - "I want to close my account"
+  - "I found a better deal"

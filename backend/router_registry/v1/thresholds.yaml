@@ -1,0 +1,42 @@
+version: "v1.0.0"
+
+route_a:
+  simple:
+    high: 0.85
+    medium: 0.70
+  disallowed:
+    high: 0.80
+    medium: 0.65
+  out_of_scope:
+    high: 0.80
+    medium: 0.65
+  domain:
+    high: 0.80
+    medium: 0.65
+
+route_b:
+  sales:
+    high: 0.82
+    medium: 0.68
+  billing:
+    high: 0.82
+    medium: 0.68
+  support:
+    high: 0.82
+    medium: 0.68
+  retention:
+    high: 0.82
+    medium: 0.68
+
+ambiguous_margin: 0.05
+short_text_len_chars: 5
+
+fallback:
+  enable: true
+  min_score: 0.50
+  max_latency_budget_ms: 2000
+
+filler:
+  enable: true
+  start_after_ms: 350
+  max_ms: 1200

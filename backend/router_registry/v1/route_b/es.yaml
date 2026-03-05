@@ -1,0 +1,27 @@
+sales:
+  - "quiero comprar un plan"
+  - "cuéntame sobre sus productos"
+  - "qué planes ofrecen"
+  - "quiero mejorar mi plan"
+  - "información de precios"
+
+billing:
+  - "mi factura está mal"
+  - "me cobraron de más"
+  - "devuelvan mi pago"
+  - "cuándo es mi próximo pago"
+  - "actualizar método de pago"
+
+support:
+  - "mi servicio no funciona"
+  - "tengo un problema técnico"
+  - "mi internet está lento"
+  - "no puedo iniciar sesión"
+  - "me sale un error en la pantalla"
+
+retention:
+  - "quiero cancelar"
+  - "me voy de su servicio"
+  - "cancelar mi cuenta"
+  - "quiero cerrar mi cuenta"
+  - "encontré una mejor oferta"
