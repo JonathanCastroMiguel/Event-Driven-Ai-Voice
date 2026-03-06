@@ -23,17 +23,19 @@ class RoutingContextBuilder:
     Layer 1 (embedding enrichment): For short texts, concatenates the previous
     turn's user_text to produce a richer embedding input.
 
-    Layer 2 (LLM fallback context): Always produces a context string with the
-    previous turn when the buffer is non-empty.
+    Layer 2 (LLM fallback context): Produces a structured multi-turn context
+    string with up to llm_context_window prior turns when the buffer is non-empty.
     """
 
     def __init__(
         self,
         short_text_chars: int = 20,
         context_window: int = 1,
+        llm_context_window: int = 3,
     ) -> None:
         self._short_text_chars = short_text_chars
         self._context_window = context_window
+        self._llm_context_window = llm_context_window
 
     def build(
         self,
@@ -45,20 +47,26 @@ class RoutingContextBuilder:
 
         Returns a RoutingContext with:
         - enriched_text: concatenated text for embeddings (or None if not needed)
-        - llm_context: context string for LLM fallback (or None on first turn)
+        - llm_context: structured multi-turn context for LLM fallback (or None on first turn)
         """
         if len(buffer) == 0:
             return RoutingContext()
 
-        recent = buffer.entries[-self._context_window :]
-        prev_text = recent[-1].user_text
-
-        # Layer 1: embedding enrichment for short texts
+        # Layer 1: embedding enrichment for short texts (uses context_window)
+        embed_entries = buffer.entries[-self._context_window :]
+        prev_text = embed_entries[-1].user_text
         enriched_text: str | None = None
         if len(user_text) < self._short_text_chars:
             enriched_text = f"{prev_text}. {user_text}"
 
-        # Layer 2: LLM fallback context (always when buffer non-empty)
-        llm_context = f"language={language}; previous_turn: {prev_text}"
+        # Layer 2: multi-turn LLM fallback context (uses llm_context_window)
+        llm_entries = buffer.entries[-self._llm_context_window :]
+        lines: list[str] = [f"language={language}"]
+        total = len(llm_entries)
+        for i, entry in enumerate(llm_entries):
+            offset = -(total - i)
+            lines.append(f"turn[{offset}] user: {entry.user_text}")
+            lines.append(f"turn[{offset}] route: {entry.route_a_label}")
+        llm_context = "\n".join(lines)
 
         return RoutingContext(enriched_text=enriched_text, llm_context=llm_context)
