@@ -91,6 +91,107 @@ paths:
         "503":
           description: Database not configured
 
+  # ---- WebRTC Signaling ----
+
+  /api/v1/calls:
+    post:
+      summary: Create voice call session
+      description: >
+        Creates a new voice call session for WebRTC signaling. Returns a call_id
+        used for subsequent SDP/ICE exchange. Enforces max_concurrent_calls limit.
+      tags: [webrtc]
+      responses:
+        "201":
+          description: Call session created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateCallResponse"
+        "503":
+          description: Max concurrent calls exceeded
+
+  /api/v1/calls/{call_id}/offer:
+    post:
+      summary: SDP offer exchange
+      description: >
+        Accepts an SDP offer from the browser, creates an RTCPeerConnection with
+        an audio transceiver (sendrecv) and two DataChannels ("control" for VAD
+        signals and transcriptions, "debug" for telemetry). Returns the SDP answer.
+      tags: [webrtc]
+      parameters:
+        - name: call_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SDPRequest"
+      responses:
+        "200":
+          description: SDP answer
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SDPResponse"
+        "404":
+          description: Call not found
+        "409":
+          description: Offer already processed
+
+  /api/v1/calls/{call_id}/ice:
+    post:
+      summary: Trickle ICE candidate
+      description: >
+        Adds a trickle ICE candidate to the peer connection. In local/Docker
+        scenarios aiortc gathers candidates during SDP exchange, so this is
+        primarily for remote NAT traversal.
+      tags: [webrtc]
+      parameters:
+        - name: call_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ICECandidateRequest"
+      responses:
+        "204":
+          description: Candidate accepted
+        "400":
+          description: No peer connection (send offer first)
+        "404":
+          description: Call not found
+
+  /api/v1/calls/{call_id}/end:
+    delete:
+      summary: End voice call
+      description: >
+        Ends an active voice call, closes the RTCPeerConnection, and cleans up
+        all associated resources (bridge, coordinator, provider).
+      tags: [webrtc]
+      parameters:
+        - name: call_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "204":
+          description: Call ended and resources cleaned up
+        "404":
+          description: Call not found
+
 components:
   schemas:
     HealthResponse:
@@ -185,3 +286,52 @@ components:
           nullable: true
         created_at:
           type: integer
+
+    # ---- WebRTC Signaling schemas ----
+
+    CreateCallResponse:
+      type: object
+      required: [call_id, status]
+      properties:
+        call_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [created]
+
+    SDPRequest:
+      type: object
+      required: [sdp, type]
+      properties:
+        sdp:
+          type: string
+          description: SDP offer string
+        type:
+          type: string
+          enum: [offer]
+
+    SDPResponse:
+      type: object
+      required: [sdp, type]
+      properties:
+        sdp:
+          type: string
+          description: SDP answer string
+        type:
+          type: string
+          enum: [answer]
+
+    ICECandidateRequest:
+      type: object
+      required: [candidate]
+      properties:
+        candidate:
+          type: string
+          description: ICE candidate string
+        sdpMid:
+          type: string
+          nullable: true
+        sdpMLineIndex:
+          type: integer
+          nullable: true

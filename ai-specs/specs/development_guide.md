@@ -33,6 +33,13 @@ SENTRY_DSN=
 LLM_FALLBACK_URL=
 LLM_FALLBACK_API_KEY=
 LLM_FALLBACK_MODEL=gpt-4o-mini
+
+# WebRTC (optional — defaults are suitable for local dev)
+STUN_SERVERS=stun:stun.l.google.com:19302
+TURN_SERVERS=
+TURN_USERNAME=
+TURN_CREDENTIAL=
+MAX_CONCURRENT_CALLS=50
 ```
 
 ### 3. Start Infrastructure
@@ -45,10 +52,12 @@ docker compose up -d  # PostgreSQL 16 + Redis 7
 
 ```bash
 cd backend
-python -m venv .venv
+uv venv
 source .venv/bin/activate
-pip install -e ".[dev]"
+uv pip install -e ".[dev]"
 ```
+
+> **Note**: The project uses `uv` as its package manager. Key dependencies include `aiortc` for server-side WebRTC.
 
 ### 5. Database Migrations
 
@@ -112,8 +121,12 @@ The runtime uses an **Event-Driven Actor Model** with four actors communicating 
 |---|---|
 | `GET /health` | Health check (DB, Redis, models) |
 | `GET /metrics` | Prometheus metrics exposition |
-| `GET /api/v1/calls` | List recent call sessions |
-| `GET /api/v1/calls/{call_id}` | Call detail with turns and generations |
+| `GET /api/v1/calls` | List recent call sessions (admin) |
+| `GET /api/v1/calls/{call_id}` | Call detail with turns and generations (admin) |
+| `POST /api/v1/calls` | Create WebRTC voice call session |
+| `POST /api/v1/calls/{call_id}/offer` | SDP offer/answer exchange |
+| `POST /api/v1/calls/{call_id}/ice` | Trickle ICE candidate |
+| `DELETE /api/v1/calls/{call_id}` | End call and clean up |
 
 ### Observability
 

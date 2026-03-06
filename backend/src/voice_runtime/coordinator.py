@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Callable, Coroutine
 from uuid import UUID, uuid4
 
 import time
@@ -103,6 +103,7 @@ class Coordinator:
         self._output_events: list[
             RealtimeVoiceStart | RealtimeVoiceCancel | CancelAgentGeneration
         ] = []
+        self._debug_callback: Callable[[dict[str, Any]], Coroutine[Any, Any, None]] | None = None
 
     @property
     def state(self) -> CoordinatorRuntimeState:
@@ -114,6 +115,25 @@ class Coordinator:
         events = self._output_events
         self._output_events = []
         return events
+
+    # ------------------------------------------------------------------
+    # Debug event emission
+    # ------------------------------------------------------------------
+
+    def set_debug_callback(
+        self,
+        callback: Callable[[dict[str, Any]], Coroutine[Any, Any, None]] | None,
+    ) -> None:
+        """Register or unregister a debug event callback."""
+        self._debug_callback = callback
+
+    async def _emit_debug(self, event: dict[str, Any]) -> None:
+        """Emit a debug event if a callback is registered."""
+        if self._debug_callback is not None:
+            try:
+                await self._debug_callback(event)
+            except Exception:
+                pass  # Debug is best-effort
 
     # ------------------------------------------------------------------
     # Persistence helpers (10.9)
@@ -353,6 +373,22 @@ class Coordinator:
             )
             await self._persist_safe(self._agent_gen_repo.insert(gen_entity))
 
+        # Debug: turn update
+        await self._emit_debug({
+            "type": "turn_update",
+            "turn_id": str(turn_id),
+            "text": text,
+            "state": "finalized",
+        })
+
+        # Debug: routing decision
+        await self._emit_debug({
+            "type": "routing",
+            "route_a": routing_result.route_a_label.value,
+            "route_a_confidence": routing_result.route_a_confidence,
+            "route_b": routing_result.route_b_label.value if routing_result.route_b_label else None,
+        })
+
         # Run Agent FSM
         fsm_output = self._agent_fsm.handle_turn(
             agent_generation_id=agent_generation_id,
@@ -362,6 +398,13 @@ class Coordinator:
             user_text=text,
             ts=envelope.ts,
         )
+
+        # Debug: FSM state after handle_turn
+        await self._emit_debug({
+            "type": "fsm_state",
+            "state": self._agent_fsm.state.value if hasattr(self._agent_fsm.state, "value") else str(self._agent_fsm.state),
+            "agent_generation_id": str(agent_generation_id),
+        })
 
         # Process FSM output
         for guided in fsm_output.guided_responses:
@@ -479,6 +522,13 @@ class Coordinator:
                 ts=envelope.ts,
             )
         )
+
+        # Debug: latency from turn finalized to voice start
+        await self._emit_debug({
+            "type": "latency",
+            "metric": "turn_processing_ms",
+            "value": round((time.time() * 1000) - envelope.ts, 2),
+        })
 
         # Append to conversation buffer
         self._conversation_buffer.append(

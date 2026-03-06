@@ -38,6 +38,13 @@ class Settings(BaseSettings):
     routing_short_text_chars: int = 20
     llm_context_window: int = 3
 
+    # WebRTC
+    stun_servers: str = "stun:stun.l.google.com:19302"
+    turn_servers: str = ""
+    turn_username: str = ""
+    turn_credential: str = ""
+    max_concurrent_calls: int = 50
+
     # Router registry
     router_registry_path: str = "router_registry/v1"
 

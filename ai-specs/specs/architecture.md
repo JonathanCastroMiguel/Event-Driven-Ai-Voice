@@ -30,6 +30,9 @@ Detailed documentation of the Event-Driven Voice Runtime: actors, events, proces
   - [6.2 Session Registry](#62-session-registry)
   - [6.3 Persistence (Repositories)](#63-persistence-repositories)
   - [6.4 Realtime Client](#64-realtime-client)
+  - [6.5 RealtimeVoiceProvider](#65-realtimevoiceprovider)
+  - [6.6 RealtimeVoiceBridge](#66-realtimevoicebridge)
+  - [6.7 WebRTC Signaling](#67-webrtc-signaling)
 - [7. Runtime State](#7-runtime-state)
 - [8. End-to-End Flows](#8-end-to-end-flows)
   - [8.1 Happy Path: Simple Greeting](#81-happy-path-simple-greeting)
@@ -40,8 +43,16 @@ Detailed documentation of the Event-Driven Voice Runtime: actors, events, proces
   - [8.6 Multi-Turn Conversation with History](#86-multi-turn-conversation-with-history)
   - [8.7 Context-Aware Routing: Short Follow-Up](#87-context-aware-routing-short-follow-up)
 - [9. Observability](#9-observability)
+  - [9.1 Debug Event Emission](#91-debug-event-emission)
 - [10. API Layer](#10-api-layer)
 - [11. Application Startup](#11-application-startup)
+- [12. Frontend Architecture](#12-frontend-architecture)
+  - [12.1 Overview](#121-overview)
+  - [12.2 Key Files](#122-key-files)
+  - [12.3 Hooks](#123-hooks)
+  - [12.4 Components](#124-components)
+  - [12.5 Data Flow](#125-data-flow)
+  - [12.6 Deployment](#126-deployment)
 
 ---
 
@@ -50,14 +61,18 @@ Detailed documentation of the Event-Driven Voice Runtime: actors, events, proces
 The Voice AI Runtime is an event-driven system for real-time call center voice interactions. It uses four actors communicating via typed events:
 
 ```
-Realtime Provider
+Browser (WebRTC + VAD)
+    ↕ Opus audio / DataChannels (control + debug)
+RealtimeVoiceBridge (implements RealtimeClient Protocol)
+    ↕ PCM audio / transcriptions
+RealtimeVoiceProvider (STT/TTS — e.g. OpenAI Realtime, Deepgram)
     ↓ speech_started / transcript_final / voice_completed
 Coordinator (CallSession)
     ↔ TurnManager       (turn detection)
     ↔ Agent FSM          (intent classification)
     ↔ ToolExecutor       (tool execution)
     ↓ RealtimeVoiceStart / RealtimeVoiceCancel
-Realtime Provider
+RealtimeVoiceBridge → RealtimeVoiceProvider (TTS) → Browser (WebRTC audio)
 ```
 
 The Coordinator is the **single orchestrator** — it receives all events, delegates to actors, manages cancellation, idempotency, and emits voice output commands.
@@ -76,6 +91,10 @@ The Coordinator is the **single orchestrator** — it receives all events, deleg
 | Event Bus | `backend/src/voice_runtime/bus.py` |
 | Router | `backend/src/routing/router.py` |
 | Policies | `backend/src/routing/policies.py` |
+| RealtimeVoiceProvider | `backend/src/voice_runtime/realtime_provider.py` |
+| RealtimeVoiceBridge | `backend/src/voice_runtime/realtime_bridge.py` |
+| WebRTC Signaling | `backend/src/api/routes/calls.py` |
+| Config | `backend/src/config.py` |
 
 ---
 
@@ -591,6 +610,80 @@ All repos use raw `asyncpg` for maximum performance. Tables are created via Alem
 - Supports error injection via `fail_voice_ids` set
 - Respects cancellation (cancelled IDs skip completion emission)
 
+### 6.5 RealtimeVoiceProvider
+
+**File**: `backend/src/voice_runtime/realtime_provider.py`
+
+**`RealtimeVoiceProvider` Protocol** — abstraction for streaming STT/TTS providers (OpenAI Realtime, Deepgram, etc.):
+- `async send_audio(frame: bytes)`: Send a PCM audio frame to the STT engine
+- `async receive_transcription() -> AsyncIterator[TranscriptionEvent]`: Yield transcription events (partial/final) as they arrive
+- `async send_text_for_tts(text: str) -> AsyncIterator[bytes]`: Send text for TTS, yield PCM audio frames as generated
+- `async close()`: Clean up provider resources
+
+**`TranscriptionEvent`** dataclass: `text: str`, `is_final: bool`.
+
+**`StubVoiceProvider`** (line 43): Test implementation that returns canned transcriptions and silent audio frames. Stores received audio for assertions.
+
+### 6.6 RealtimeVoiceBridge
+
+**File**: `backend/src/voice_runtime/realtime_bridge.py`
+
+Bridges WebRTC audio ↔ `RealtimeVoiceProvider` ↔ Coordinator. Implements the `RealtimeClient` Protocol so the Coordinator uses it as a drop-in replacement for `StubRealtimeClient`.
+
+**Constructor dependencies:**
+
+| Parameter | Type | Purpose |
+|---|---|---|
+| `call_id` | `UUID` | Unique call identifier |
+| `provider` | `RealtimeVoiceProvider` | STT/TTS provider instance |
+| `control_channel` | `RTCDataChannel` | For VAD signals + transcriptions |
+| `debug_channel` | `RTCDataChannel` | For telemetry data |
+
+**RealtimeClient Protocol methods:**
+
+| Method | What It Does |
+|---|---|
+| `send_voice_start(event)` | Streams `event.prompt` to `provider.send_text_for_tts()`, emits `voice_generation_completed` when done |
+| `send_voice_cancel(event)` | Adds voice_id to cancelled set, cancels active TTS task |
+| `on_event(callback)` | Registers Coordinator's event callback |
+| `close()` | Cancels all async tasks, closes provider |
+
+**Audio forwarding** (line 143): `start_audio_forwarding(track)` creates an async task that reads frames from the WebRTC audio track (`track.recv()`), converts to PCM via `to_ndarray().tobytes()`, and sends to `provider.send_audio()`.
+
+**STT listener** (line 162): `start_stt_listener()` creates an async task that iterates `provider.receive_transcription()`, forwards transcription JSON to browser via control DataChannel, and dispatches final transcriptions as `transcript_final` EventEnvelopes to the Coordinator.
+
+**VAD signal handling** (line 197): Parses `speech_started`/`speech_ended` JSON from the control DataChannel. Maps browser `speech_ended` to internal `speech_stopped` event type (matching the `SpeechStopped` event in `events.py`).
+
+**Debug forwarding** (line 244): `emit_debug(event)` sends debug JSON to the debug DataChannel when debug mode is enabled. Debug enable/disable is toggled via control DataChannel messages.
+
+### 6.7 WebRTC Signaling
+
+**File**: `backend/src/api/routes/calls.py`
+
+REST-based WebRTC signaling for browser-to-backend audio connections. Uses `aiortc` for server-side WebRTC.
+
+**In-memory session registry**: `_sessions: dict[UUID, CallSessionEntry]` tracks active WebRTC calls. Each entry holds:
+- `call_id`, `peer_connection`, `coordinator`, `bridge`, `control_channel`, `debug_channel`
+
+**ICE configuration**: Built from environment variables via `build_rtc_configuration()`:
+- `STUN_SERVERS` (default: `stun:stun.l.google.com:19302`)
+- `TURN_SERVERS`, `TURN_USERNAME`, `TURN_CREDENTIAL` (optional, for NAT traversal)
+
+**Endpoints:**
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/api/v1/calls` | POST | Create call session, returns `call_id` |
+| `/api/v1/calls/{call_id}/offer` | POST | Accept SDP offer, create `RTCPeerConnection` with audio transceiver (sendrecv) and DataChannels ("control", "debug"), return SDP answer |
+| `/api/v1/calls/{call_id}/ice` | POST | Receive trickle ICE candidates (logged; aiortc gathers during SDP exchange) |
+| `/api/v1/calls/{call_id}` | DELETE | End call, clean up all resources |
+
+**Peer connection lifecycle:**
+- Audio transceiver added as `sendrecv` for bidirectional Opus audio
+- DataChannels created server-side: `"control"` (ordered) and `"debug"` (ordered)
+- `connectionstatechange` event triggers auto-cleanup on `"failed"` or `"closed"` states
+- `MAX_CONCURRENT_CALLS` (default: 50) enforced at session creation
+
 ---
 
 ## 7. Runtime State
@@ -865,6 +958,23 @@ Every `handle_event()` call creates a span (`coordinator.<event_type>`) with att
 
 Setup: `setup_telemetry()` creates a `TracerProvider` with optional OTLP gRPC exporter.
 
+### 9.1 Debug Event Emission
+
+The Coordinator supports an optional debug callback for real-time telemetry, used by the `RealtimeVoiceBridge` to forward debug data to the browser via the "debug" DataChannel.
+
+**Setup**: `Coordinator.set_debug_callback(callback)` registers an async callback. When `None` (default), no debug events are emitted — zero overhead on the hot path.
+
+**Debug events emitted:**
+
+| Event Type | When | Data |
+|---|---|---|
+| `turn_update` | After `_on_human_turn_finalized` processes routing | `turn_id`, `text`, `route_a`, `route_b`, `policy_key`, `specialist` |
+| `routing` | During classification | `route_a_label`, `route_a_confidence`, `route_b_label`, `route_b_confidence`, `short_circuit`, `fallback_used` |
+| `fsm_state` | After `AgentFSM.handle_turn` | `agent_generation_id`, `state`, `guided_responses`, `agent_actions` |
+| `latency` | In `_on_request_guided_response` | `turn_processing_ms` (time from turn finalization to voice start) |
+
+**Emission pattern**: Best-effort via `_emit_debug()` — exceptions are caught and logged, never crash the voice hot path.
+
 ### Router Calibration Logging
 
 Every routing decision emits a structured log (line 395 of coordinator.py):
@@ -895,6 +1005,8 @@ Factory function `create_app()` with:
 
 ### Endpoints
 
+**Health & Metrics:**
+
 **`GET /health`** (`backend/src/api/routes/health.py`):
 - Checks asyncpg pool (executes `SELECT 1`)
 - Checks Redis (executes `PING`)
@@ -904,11 +1016,23 @@ Factory function `create_app()` with:
 **`GET /metrics`** (`backend/src/api/routes/health.py:54`):
 - Returns Prometheus metrics in text exposition format
 
+**Admin:**
+
 **`GET /api/v1/calls`** (`backend/src/api/routes/admin.py`):
 - Lists 50 most recent call sessions
 
 **`GET /api/v1/calls/{call_id}`** (`backend/src/api/routes/admin.py:39`):
 - Returns call detail with turns and agent generations
+
+**WebRTC Signaling** (`backend/src/api/routes/calls.py`):
+
+**`POST /api/v1/calls`** — Create a new voice call session. Returns `{ call_id, status }`. Enforces `MAX_CONCURRENT_CALLS` (503 if exceeded).
+
+**`POST /api/v1/calls/{call_id}/offer`** — Accept SDP offer, create RTCPeerConnection with audio transceiver and DataChannels, return SDP answer. 409 if offer already processed.
+
+**`POST /api/v1/calls/{call_id}/ice`** — Receive trickle ICE candidate. Logged for debugging; aiortc gathers candidates during SDP exchange. 204 on success.
+
+**`DELETE /api/v1/calls/{call_id}`** — End call, close peer connection, clean up all resources. 204 on success.
 
 ---
 
@@ -933,3 +1057,127 @@ The `lifespan()` async context manager wires everything at startup:
 On shutdown: close asyncpg pool and Redis connection.
 
 The app runs via `uvicorn` with `uvloop` for maximum async performance.
+
+---
+
+## 12. Frontend Architecture
+
+### 12.1 Overview
+
+The frontend is a Next.js 15 (App Router) browser-based voice client for runtime testing. It connects to the backend via WebRTC, captures microphone audio, runs client-side VAD, and displays real-time transcriptions with an optional debug panel.
+
+```
+Browser
+├─ Microphone (getUserMedia) → MediaStream
+│     ↓
+├─ Client-side VAD (Silero WASM via @ricky0123/vad-web)
+│     ↓ speech_started / speech_ended
+├─ WebRTC (RTCPeerConnection)
+│     ├─ Audio Track → Opus codec → Backend (RealtimeVoiceBridge)
+│     ├─ DataChannel "control" → VAD signals, transcriptions
+│     └─ DataChannel "debug" → FSM state, routing, latency
+├─ Transcription Panel (real-time display)
+└─ Debug Panel (optional, lazy-loaded)
+```
+
+**Design priorities**: Latency-first. Client-side VAD avoids network RTT for speech detection. Opus is native WebRTC codec (zero transformation). Frontend overhead target: < 5ms (VAD ~1-3ms + Opus encode ~2-3ms).
+
+### 12.2 Key Files
+
+| Component | File |
+|---|---|
+| Page (entry) | `frontend/src/app/page.tsx` |
+| Types | `frontend/src/lib/types.ts` |
+| API Client | `frontend/src/lib/api.ts` |
+| Voice Session Hook | `frontend/src/hooks/use-voice-session.ts` |
+| Microphone Hook | `frontend/src/hooks/use-microphone.ts` |
+| VAD Hook | `frontend/src/hooks/use-vad.ts` |
+| Debug Channel Hook | `frontend/src/hooks/use-debug-channel.ts` |
+| Voice Session UI | `frontend/src/components/voice/voice-session.tsx` |
+| Mic Animation | `frontend/src/components/voice/mic-animation.tsx` |
+| Speaker Animation | `frontend/src/components/voice/speaker-animation.tsx` |
+| Transcription Panel | `frontend/src/components/voice/transcription-panel.tsx` |
+| Debug Panel | `frontend/src/components/debug/debug-panel.tsx` |
+| Dockerfile | `frontend/Dockerfile` |
+
+### 12.3 Hooks
+
+**`useVoiceSession`** — Full WebRTC lifecycle manager.
+- Calls `POST /calls` to create session → `POST /calls/{id}/offer` for SDP exchange → ICE handling
+- Creates two DataChannels client-side: `"control"` (VAD signals + transcriptions) and `"debug"` (telemetry)
+- Monitors `connectionstatechange` (connected/failed/disconnected)
+- Returns: `status`, `callId`, `startSession`, `endSession`, `peerConnection`, `sendControl`, `onControlMessage`, `onDebugMessage`, `error`
+
+**`useMicrophone`** — getUserMedia with echo cancellation, noise suppression, auto gain control.
+- Returns: `status` (`idle`/`requesting`/`active`/`denied`/`error`), `stream`, `startMicrophone`, `stopMicrophone`, `attachToConnection`
+- Handles `NotAllowedError` for mic denial fallback UX
+
+**`useVAD`** — Client-side Voice Activity Detection via Silero WASM.
+- Dynamic import of `@ricky0123/vad-web` to avoid SSR issues
+- Uses `MicVAD.new({ getStream: () => Promise.resolve(stream) })` to attach to existing mic stream
+- Parameters: `positiveSpeechThreshold: 0.8`, `negativeSpeechThreshold: 0.4`, `minSpeechMs: 100`, `preSpeechPadMs: 30`, `redemptionMs: 250`
+- Sends `speech_started` / `speech_ended` messages on control DataChannel with timestamps
+
+**`useDebugChannel`** — Parses debug DataChannel events into typed state.
+- Maintains: `turns` (DebugTurn[]), `fsmState`, `routing` (DebugRouting), `events` (DebugEvent[]), `latencies` (DebugLatency[])
+- Limits events array to 100 entries
+
+### 12.4 Components
+
+**`VoiceSession`** — Main orchestrator component. Wires all hooks together.
+- Lazy-loads `DebugPanel` via `next/dynamic` (no debug overhead when disabled)
+- Debug toggle sends `debug_enable` / `debug_disable` on control channel
+- Shows: connection status badge, mic denied fallback, start/end call buttons, mic/speaker animations, transcription panel
+
+**`MicAnimation`** — Green pulsing circle with mic icon when user is speaking.
+
+**`SpeakerAnimation`** — Blue pulsing circle with speaker icon when agent is speaking.
+
+**`TranscriptionPanel`** — Chat-style display. Human messages right-aligned (primary color), agent messages left-aligned (muted). Auto-scrolls to bottom on new entries.
+
+**`DebugPanel`** — 3-column grid: FSM State badge, Last Routing details (Route A/B confidence, short circuit, LLM fallback), Latency measurements (color-coded: green < 200ms, red > 200ms). Plus Turn History list and Event Log (last 20, monospace JSON).
+
+### 12.5 Data Flow
+
+```
+1. User clicks "Start Call"
+   → useVoiceSession.startSession()
+   → POST /calls → POST /calls/{id}/offer (SDP exchange)
+   → RTCPeerConnection established
+
+2. User clicks "Allow" on mic permission
+   → useMicrophone.startMicrophone()
+   → getUserMedia → MediaStream
+   → attachToConnection(pc) adds audio track to WebRTC
+
+3. Audio flows continuously via WebRTC (Opus, UDP)
+   → Backend receives via aiortc
+   → RealtimeVoiceBridge forwards to RealtimeVoiceProvider (STT)
+
+4. User speaks
+   → useVAD detects speech_started → sends on control channel
+   → Backend Coordinator receives speech_started event
+   → User stops → VAD detects speech_ended → sends on control channel
+   → Backend processes turn (classify, route, generate response)
+
+5. Transcriptions arrive on control channel
+   → onControlMessage callback → TranscriptionPanel updates
+
+6. Agent response audio streams back via WebRTC
+   → Browser plays through speaker (remote audio track)
+
+7. Debug events arrive on debug channel (when enabled)
+   → useDebugChannel parses → DebugPanel updates
+```
+
+### 12.6 Deployment
+
+3-stage Docker build (`frontend/Dockerfile`): deps (pnpm install) → builder (next build) → runner (standalone server.js). Uses `output: "standalone"` in `next.config.ts`.
+
+Root `docker-compose.yml` runs 4 services:
+- `frontend` (Next.js, port 3000) → depends on `voice-runtime`
+- `voice-runtime` (FastAPI + asyncio, port 8000)
+- `postgres` (PostgreSQL 16)
+- `redis` (Redis 7)
+
+Frontend env: `NEXT_PUBLIC_API_URL=http://voice-runtime:8000`
