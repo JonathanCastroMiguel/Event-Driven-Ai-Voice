@@ -57,7 +57,20 @@
       "Bash(.venv/bin/python3 -m pytest tests/unit/test_coordinator.py::TestLLMFallbackHistory -x -q)",
       "Bash(.venv/bin/python3 -m pytest tests/e2e/test_event_pipeline.py::TestLLMFallbackHistoryE2E -x -q)",
       "Bash(.venv/bin/python3 -m pytest tests/ -x -q)",
-      "Bash(.venv/bin/python3 -m pytest tests/unit/ tests/e2e/ -q)"
+      "Bash(.venv/bin/python3 -m pytest tests/unit/ tests/e2e/ -q)",
+      "Bash(openspec status --change \"routing-calibration-logging\" --json)",
+      "Bash(openspec instructions proposal --change \"routing-calibration-logging\" --json)",
+      "Bash(openspec status --change \"routing-calibration-logging\")",
+      "Bash(openspec instructions design --change \"routing-calibration-logging\" --json)",
+      "Bash(openspec instructions specs --change \"routing-calibration-logging\" --json)",
+      "Bash(openspec instructions tasks --change \"routing-calibration-logging\" --json)",
+      "Bash(openspec instructions apply --change \"routing-calibration-logging\" --json)",
+      "Bash(.venv/bin/python3 -m pytest backend/tests/unit/test_routing.py -x -q)",
+      "Bash(ls .venv/bin/python*)",
+      "Bash(ls backend/.venv/bin/python*)",
+      "Bash(backend/.venv/bin/python3 -m pytest backend/tests/unit/test_routing.py -x -q)",
+      "Bash(.venv/bin/python3 -m pytest tests/unit/test_routing.py -x -q)",
+      "Bash(.venv/bin/python3 -m pytest tests/ -x -q --ignore=tests/integration)"
     ]
   }
 }
