@@ -34,6 +34,10 @@ LLM_FALLBACK_URL=
 LLM_FALLBACK_API_KEY=
 LLM_FALLBACK_MODEL=gpt-4o-mini
 
+# OpenAI Realtime (for real STT/TTS — omit for stub provider)
+OPENAI_API_KEY=
+OPENAI_REALTIME_MODEL=gpt-4o-mini-realtime-preview
+
 # WebRTC (optional — defaults are suitable for local dev)
 STUN_SERVERS=stun:stun.l.google.com:19302
 TURN_SERVERS=

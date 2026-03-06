@@ -11,6 +11,8 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from src.config import settings
+from src.voice_runtime.realtime_bridge import RealtimeVoiceBridge
+from src.voice_runtime.realtime_provider import create_voice_provider
 
 logger = structlog.get_logger()
 
@@ -75,6 +77,9 @@ async def _cleanup_session(call_id: UUID) -> None:
     if entry is None:
         return
 
+    if entry.bridge is not None:
+        await entry.bridge.close()
+
     if entry.peer_connection is not None:
         await entry.peer_connection.close()
 
@@ -138,6 +143,26 @@ async def handle_offer(call_id: UUID, body: SDPRequest) -> SDPResponse:
     # Create DataChannels
     entry.control_channel = pc.createDataChannel("control", ordered=True)
     entry.debug_channel = pc.createDataChannel("debug", ordered=True)
+
+    # Create voice provider and bridge
+    provider = await create_voice_provider()
+    bridge = RealtimeVoiceBridge(
+        call_id=call_id,
+        provider=provider,
+        control_channel=entry.control_channel,
+        debug_channel=entry.debug_channel,
+    )
+    entry.bridge = bridge
+
+    # Start STT listener
+    bridge.start_stt_listener()
+
+    # Forward audio from WebRTC track to provider when track arrives
+    @pc.on("track")
+    def on_track(track: Any) -> None:
+        if track.kind == "audio":
+            bridge.start_audio_forwarding(track)
+            logger.debug("audio_track_forwarding_started", call_id=str(call_id))
 
     # Detect peer disconnection for auto-cleanup
     @pc.on("connectionstatechange")

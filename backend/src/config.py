@@ -38,6 +38,10 @@ class Settings(BaseSettings):
     routing_short_text_chars: int = 20
     llm_context_window: int = 3
 
+    # OpenAI Realtime
+    openai_api_key: str = ""
+    openai_realtime_model: str = "gpt-4o-mini-realtime-preview"
+
     # WebRTC
     stun_servers: str = "stun:stun.l.google.com:19302"
     turn_servers: str = ""

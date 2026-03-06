@@ -30,7 +30,7 @@ Detailed documentation of the Event-Driven Voice Runtime: actors, events, proces
   - [6.2 Session Registry](#62-session-registry)
   - [6.3 Persistence (Repositories)](#63-persistence-repositories)
   - [6.4 Realtime Client](#64-realtime-client)
-  - [6.5 RealtimeVoiceProvider](#65-realtimevoiceprovider)
+  - [6.5 RealtimeVoiceProvider](#65-realtimevoiceprovider) (Protocol, StubVoiceProvider, OpenAIRealtimeProvider, factory)
   - [6.6 RealtimeVoiceBridge](#66-realtimevoicebridge)
   - [6.7 WebRTC Signaling](#67-webrtc-signaling)
 - [7. Runtime State](#7-runtime-state)
@@ -624,6 +624,23 @@ All repos use raw `asyncpg` for maximum performance. Tables are created via Alem
 
 **`StubVoiceProvider`** (line 43): Test implementation that returns canned transcriptions and silent audio frames. Stores received audio for assertions.
 
+**`create_voice_provider()`** (line 79): Async factory function that returns `OpenAIRealtimeProvider` when `OPENAI_API_KEY` is set, otherwise `StubVoiceProvider`. Called during SDP offer handling in `calls.py`.
+
+**`OpenAIRealtimeProvider`** — File: `backend/src/voice_runtime/openai_realtime_provider.py`
+
+Production implementation backed by the OpenAI Realtime API (`gpt-4o-mini-realtime-preview`). Uses a single persistent WebSocket per call for bidirectional streaming STT and TTS, optimized for minimum latency.
+
+| Method | Behavior |
+|---|---|
+| `connect()` | Opens WebSocket to `wss://api.openai.com/v1/realtime`, starts background reader task |
+| `send_audio(frame)` | Downsamples 48kHz→24kHz (every 2nd sample), base64-encodes, sends `input_audio_buffer.append` (fire-and-forget) |
+| `commit_audio_buffer()` | Sends `input_audio_buffer.commit` to trigger transcription |
+| `receive_transcription()` | Yields `TranscriptionEvent` from internal STT queue (fed by reader) |
+| `send_text_for_tts(text)` | Sends `response.create`, yields PCM16 audio frames from TTS queue |
+| `close()` | Cancels reader, closes WebSocket, signals queues |
+
+**Architecture**: Fire-and-forget sends + async reader task. Reader routes `conversation.item.input_audio_transcription.completed` → STT queue, `response.audio.delta` → TTS queue (base64-decoded), `response.audio.done` → None sentinel.
+
 ### 6.6 RealtimeVoiceBridge
 
 **File**: `backend/src/voice_runtime/realtime_bridge.py`
@@ -652,7 +669,7 @@ Bridges WebRTC audio ↔ `RealtimeVoiceProvider` ↔ Coordinator. Implements the
 
 **STT listener** (line 162): `start_stt_listener()` creates an async task that iterates `provider.receive_transcription()`, forwards transcription JSON to browser via control DataChannel, and dispatches final transcriptions as `transcript_final` EventEnvelopes to the Coordinator.
 
-**VAD signal handling** (line 197): Parses `speech_started`/`speech_ended` JSON from the control DataChannel. Maps browser `speech_ended` to internal `speech_stopped` event type (matching the `SpeechStopped` event in `events.py`).
+**VAD signal handling** (line 197): Parses `speech_started`/`speech_ended` JSON from the control DataChannel. Maps browser `speech_ended` to internal `speech_stopped` event type (matching the `SpeechStopped` event in `events.py`). On `speech_ended`, also calls `provider.commit_audio_buffer()` if available (triggers transcription of accumulated audio).
 
 **Debug forwarding** (line 244): `emit_debug(event)` sends debug JSON to the debug DataChannel when debug mode is enabled. Debug enable/disable is toggled via control DataChannel messages.
 
@@ -681,7 +698,8 @@ REST-based WebRTC signaling for browser-to-backend audio connections. Uses `aior
 **Peer connection lifecycle:**
 - Audio transceiver added as `sendrecv` for bidirectional Opus audio
 - DataChannels created server-side: `"control"` (ordered) and `"debug"` (ordered)
-- `connectionstatechange` event triggers auto-cleanup on `"failed"` or `"closed"` states
+- During SDP offer handling: `create_voice_provider()` selects provider, creates `RealtimeVoiceBridge`, starts STT listener, and registers `on("track")` handler for audio forwarding
+- `connectionstatechange` event triggers auto-cleanup on `"failed"` or `"closed"` states (closes bridge + provider)
 - `MAX_CONCURRENT_CALLS` (default: 50) enforced at session creation
 
 ---
