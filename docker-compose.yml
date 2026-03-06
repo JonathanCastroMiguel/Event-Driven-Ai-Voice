@@ -8,6 +8,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    env_file:
+      - .env
     environment:
       DATABASE_URL: postgresql://voiceai:voiceai@postgres:5432/voiceai
       REDIS_URL: redis://redis:6379/0

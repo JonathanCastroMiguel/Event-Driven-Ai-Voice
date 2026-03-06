@@ -74,3 +74,26 @@ class StubVoiceProvider:
     async def close(self) -> None:
         """Mark as closed."""
         self._closed = True
+
+
+async def create_voice_provider() -> StubVoiceProvider:
+    """Factory: returns OpenAIRealtimeProvider if API key is set, else StubVoiceProvider.
+
+    Return type annotation is the base case; the actual return may be
+    OpenAIRealtimeProvider (which satisfies the same Protocol).
+    """
+    from src.config import settings
+
+    if settings.openai_api_key:
+        from src.voice_runtime.openai_realtime_provider import OpenAIRealtimeProvider
+
+        provider = OpenAIRealtimeProvider(
+            api_key=settings.openai_api_key,
+            model=settings.openai_realtime_model,
+        )
+        await provider.connect()
+        logger.info("voice_provider_selected", provider="openai_realtime")
+        return provider  # type: ignore[return-value]
+
+    logger.info("voice_provider_selected", provider="stub")
+    return StubVoiceProvider()

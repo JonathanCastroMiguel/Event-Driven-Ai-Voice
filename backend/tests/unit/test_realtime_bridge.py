@@ -224,6 +224,42 @@ class TestVADSignals:
         await bridge._handle_control_message("not json")
 
     @pytest.mark.asyncio
+    async def test_speech_ended_triggers_commit_audio_buffer(self) -> None:
+        """speech_ended should call commit_audio_buffer on the provider if available."""
+        provider = StubVoiceProvider()
+        provider.commit_audio_buffer = AsyncMock()  # type: ignore[attr-defined]
+        bridge, ctrl, _ = _make_bridge(provider)
+
+        async def cb(env: EventEnvelope) -> None:
+            pass
+
+        bridge.on_event(cb)
+
+        await bridge._handle_control_message(json.dumps({
+            "type": "speech_ended",
+            "ts": 99999,
+        }))
+
+        provider.commit_audio_buffer.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_speech_ended_no_crash_without_commit(self) -> None:
+        """speech_ended should not crash if provider lacks commit_audio_buffer."""
+        provider = StubVoiceProvider()
+        bridge, ctrl, _ = _make_bridge(provider)
+
+        async def cb(env: EventEnvelope) -> None:
+            pass
+
+        bridge.on_event(cb)
+
+        # StubVoiceProvider doesn't have commit_audio_buffer — should not raise
+        await bridge._handle_control_message(json.dumps({
+            "type": "speech_ended",
+            "ts": 99999,
+        }))
+
+    @pytest.mark.asyncio
     async def test_debug_enable_disable(self) -> None:
         bridge, _, _ = _make_bridge()
 

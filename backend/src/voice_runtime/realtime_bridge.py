@@ -228,6 +228,9 @@ class RealtimeVoiceBridge:
             )
             if self._callback:
                 await self._callback(envelope)
+            # Trigger transcription of accumulated audio
+            if hasattr(self._provider, "commit_audio_buffer"):
+                await self._provider.commit_audio_buffer()
 
         elif msg_type == "debug_enable":
             self._debug_enabled = True

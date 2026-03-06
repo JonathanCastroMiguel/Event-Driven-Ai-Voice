@@ -113,7 +113,19 @@
       "Bash(do mkdir -p \"openspec/specs/$dir\")",
       "Bash(cp -r \"openspec/changes/voice-frontend/specs/$dir/\"* \"openspec/specs/$dir/\")",
       "Bash(done)",
-      "Bash(uv lock)"
+      "Bash(uv lock)",
+      "Bash(openspec new change \"openai-realtime-provider\")",
+      "Bash(openspec status --change \"openai-realtime-provider\")",
+      "Bash(openspec instructions proposal --change \"openai-realtime-provider\" --json)",
+      "Bash(openspec status --change \"openai-realtime-provider\" --json)",
+      "Bash(openspec instructions design --change \"openai-realtime-provider\" --json)",
+      "Bash(openspec instructions specs --change \"openai-realtime-provider\" --json)",
+      "Bash(openspec instructions tasks --change \"openai-realtime-provider\" --json)",
+      "Bash(openspec instructions apply --change \"openai-realtime-provider\" --json)",
+      "Bash(.venv/bin/python -m pytest tests/unit/test_openai_realtime_provider.py tests/unit/test_voice_provider_factory.py tests/unit/test_realtime_bridge.py -v --no-header)",
+      "Bash(uv sync)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(git add backend/src/voice_runtime/openai_realtime_provider.py backend/src/voice_runtime/realtime_provider.py backend/src/voice_runtime/realtime_bridge.py backend/src/config.py backend/src/api/routes/calls.py backend/pyproject.toml backend/uv.lock backend/tests/unit/test_openai_realtime_provider.py backend/tests/unit/test_voice_provider_factory.py backend/tests/unit/test_realtime_bridge.py docker-compose.yml ai-specs/specs/architecture.md ai-specs/specs/development_guide.md openspec/specs/openai-realtime-provider/ openspec/specs/realtime-voice-bridge/spec.md openspec/changes/archive/2026-03-06-openai-realtime-provider/ .claude/settings.json)"
     ]
   }
 }
