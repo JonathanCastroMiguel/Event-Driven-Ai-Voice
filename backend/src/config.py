@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     # Context-aware routing
     routing_context_window: int = 1
     routing_short_text_chars: int = 20
+    llm_context_window: int = 3
 
     # Router registry
     router_registry_path: str = "router_registry/v1"

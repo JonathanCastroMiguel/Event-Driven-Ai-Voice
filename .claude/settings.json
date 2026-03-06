@@ -41,7 +41,23 @@
       "Bash(touch:*)",
       "Bash(wc:*)",
       "Bash(cd:*)",
-      "Bash(.venv/bin/python3:*)"
+      "Bash(.venv/bin/python3:*)",
+      "Bash(openspec new change \"llm-fallback-history\")",
+      "Bash(openspec status --change \"llm-fallback-history\")",
+      "Bash(openspec status --change \"llm-fallback-history\" --json)",
+      "Bash(openspec instructions design --change \"llm-fallback-history\" --json)",
+      "Bash(openspec instructions apply --change \"llm-fallback-history\" --json)",
+      "Bash(python -m pytest tests/unit/test_routing_context.py tests/unit/test_routing.py tests/unit/test_coordinator.py -x -q)",
+      "Bash(.venv/bin/python3 -m pytest tests/unit/test_routing_context.py tests/unit/test_routing.py tests/unit/test_coordinator.py -x -q)",
+      "Bash(.venv/bin/python3 -m pytest tests/unit/test_routing_context.py -x -q)",
+      "Bash(.venv/bin/python3 -m pytest tests/unit/test_routing.py tests/unit/test_coordinator.py -x -q)",
+      "Bash(.venv/bin/python3 -m pytest tests/unit/test_coordinator.py::TestContextAwareRouting::test_short_followup_passes_enriched_text -x -q)",
+      "Bash(.venv/bin/python3 -m pytest tests/unit/test_routing_context.py tests/unit/test_routing.py tests/unit/test_coordinator.py tests/e2e/test_event_pipeline.py -x -q)",
+      "Bash(.venv/bin/python3 -m pytest tests/unit/test_routing.py::TestMultiTurnLLMContextPassthrough -x -q)",
+      "Bash(.venv/bin/python3 -m pytest tests/unit/test_coordinator.py::TestLLMFallbackHistory -x -q)",
+      "Bash(.venv/bin/python3 -m pytest tests/e2e/test_event_pipeline.py::TestLLMFallbackHistoryE2E -x -q)",
+      "Bash(.venv/bin/python3 -m pytest tests/ -x -q)",
+      "Bash(.venv/bin/python3 -m pytest tests/unit/ tests/e2e/ -q)"
     ]
   }
 }

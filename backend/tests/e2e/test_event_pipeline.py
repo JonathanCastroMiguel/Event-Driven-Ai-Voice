@@ -533,7 +533,7 @@ class TestContextAwareRoutingE2E:
             "tengo un problema con mi factura. de este mes"
         )
         assert second_call.kwargs["llm_context"] is not None
-        assert "previous_turn: tengo un problema con mi factura" in second_call.kwargs["llm_context"]
+        assert "turn[-1] user: tengo un problema con mi factura" in second_call.kwargs["llm_context"]
 
     @pytest.mark.asyncio
     async def test_first_turn_short_text_no_enrichment(self) -> None:
@@ -548,3 +548,40 @@ class TestContextAwareRoutingE2E:
         call = router.classify.call_args
         assert call.kwargs["enriched_text"] is None
         assert call.kwargs["llm_context"] is None
+
+
+# ---------------------------------------------------------------------------
+# LLM Fallback History E2E Tests
+# ---------------------------------------------------------------------------
+
+
+class TestLLMFallbackHistoryE2E:
+    @pytest.mark.asyncio
+    async def test_three_turn_multi_turn_llm_context(self) -> None:
+        """7.1 — 3-turn conversation produces multi-turn llm_context in Router.classify()."""
+        router = make_router(route_a=RouteALabel.SIMPLE)
+        coord, fake, capture, _ = make_e2e_stack(router=router)
+
+        # Turn 1
+        await fake.speech_started(ts=1000)
+        await fake.transcript_final("mi factura", ts=2000)
+        capture.drain()
+
+        # Turn 2
+        await fake.speech_started(ts=3000)
+        await fake.transcript_final("no me llega el recibo", ts=4000)
+        capture.drain()
+
+        # Turn 3
+        await fake.speech_started(ts=5000)
+        await fake.transcript_final("de este mes", ts=6000)
+
+        assert router.classify.call_count == 3
+        third_call = router.classify.call_args_list[2]
+        llm_ctx = third_call.kwargs["llm_context"]
+        assert llm_ctx is not None
+        assert llm_ctx.startswith("language=es")
+        assert "turn[-2] user: mi factura" in llm_ctx
+        assert "turn[-1] user: no me llega el recibo" in llm_ctx
+        # enriched_text uses only most recent turn (context_window=1)
+        assert third_call.kwargs["enriched_text"] == "no me llega el recibo. de este mes"

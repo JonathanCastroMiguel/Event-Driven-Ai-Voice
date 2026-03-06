@@ -26,13 +26,13 @@ On receiving `human_turn_finalized`, the Coordinator SHALL create a new `agent_g
 - **WHEN** a new `human_turn_finalized` arrives while a previous generation is still active
 - **THEN** Coordinator SHALL cancel the previous `agent_generation_id` and `voice_generation_id` before starting the new turn
 
-#### Scenario: Short follow-up text enriched before classification
-- **WHEN** `human_turn_finalized` arrives with `text="de este mes"` (< 20 chars) AND the conversation buffer contains a prior turn with `user_text="tengo un problema con mi factura"`
-- **THEN** the Coordinator SHALL call `Router.classify(text="de este mes", language=lang, enriched_text="tengo un problema con mi factura. de este mes", llm_context="language=es; previous_turn: tengo un problema con mi factura")`
+#### Scenario: Short follow-up text with multi-turn LLM context
+- **WHEN** `human_turn_finalized` arrives with `text="de este mes"` (< 20 chars) AND the conversation buffer contains 2 prior turns with `user_text` values `["mi factura", "no me llega"]`
+- **THEN** the Coordinator SHALL call `Router.classify(text="de este mes", language=lang, enriched_text="no me llega. de este mes", llm_context=<multi-turn context with 2 prior turns>)`
 
-#### Scenario: Long text not enriched
-- **WHEN** `human_turn_finalized` arrives with `text="quiero cambiar mi plan de datos a uno más barato"` (>= 20 chars)
-- **THEN** the Coordinator SHALL call `Router.classify(text=..., language=lang)` without enriched_text or llm_context enrichment from the context builder (llm_context may still be provided if buffer is non-empty)
+#### Scenario: Long text not enriched but LLM context still provided
+- **WHEN** `human_turn_finalized` arrives with `text="quiero cambiar mi plan de datos a uno más barato"` (>= 20 chars) AND the conversation buffer is non-empty
+- **THEN** the Coordinator SHALL call `Router.classify(text=..., language=lang, enriched_text=None, llm_context=<multi-turn context>)`
 
 #### Scenario: First turn of call (no history)
 - **WHEN** `human_turn_finalized` arrives and the conversation buffer is empty
@@ -110,7 +110,15 @@ The Coordinator SHALL read `max_history_turns` (default: 10) and `max_history_ch
 - **THEN** the ConversationBuffer SHALL use max_turns=10 and max_chars=2000
 
 ### Requirement: Configuration for context-aware routing
-The Coordinator SHALL read `routing_context_window` (default: 1) and `routing_short_text_chars` (default: 20) from the application Settings and pass them to the `RoutingContextBuilder`.
+The Coordinator SHALL read `routing_context_window` (default: 1), `routing_short_text_chars` (default: 20), and `llm_context_window` (default: 3) from the application Settings and pass them to the `RoutingContextBuilder`.
+
+#### Scenario: Custom LLM context window from environment
+- **WHEN** `LLM_CONTEXT_WINDOW=2` is set in the environment
+- **THEN** the `RoutingContextBuilder` SHALL use `llm_context_window=2`
+
+#### Scenario: Default LLM context window
+- **WHEN** no `LLM_CONTEXT_WINDOW` environment variable is set
+- **THEN** the `RoutingContextBuilder` SHALL use `llm_context_window=3`
 
 #### Scenario: Custom routing context settings from environment
 - **WHEN** `ROUTING_CONTEXT_WINDOW=2` and `ROUTING_SHORT_TEXT_CHARS=30` are set in the environment

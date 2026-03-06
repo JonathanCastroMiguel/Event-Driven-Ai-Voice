@@ -359,3 +359,55 @@ class TestEnrichedTextRouting:
         llm.classify.assert_called_once()
         call_kwargs = llm.classify.call_args
         assert call_kwargs[1]["context"] == llm_ctx or call_kwargs[0][2] == llm_ctx
+
+
+class TestMultiTurnLLMContextPassthrough:
+    """5.1/5.2 — Multi-turn llm_context passed through Router to LLMFallbackClient."""
+
+    async def test_multi_turn_context_passed_to_llm_classify_a(self) -> None:
+        """5.1 — Multi-turn context reaches LLM fallback for Route A."""
+        registry = _make_registry()
+        engine = _mock_engine(
+            ("domain", 0.72, {"simple": 0.70, "disallowed": 0.1, "out_of_scope": 0.1, "domain": 0.72})
+        )
+        llm = AsyncMock(spec=LLMFallbackClient)
+        llm.classify.return_value = LLMClassificationResult(
+            label="domain", confidence=0.90, raw_response='{"label":"domain","confidence":0.90}'
+        )
+        router = Router(registry, engine, llm_fallback=llm)
+        multi_turn_ctx = (
+            "language=es\n"
+            "turn[-2] user: mi factura\n"
+            "turn[-2] route: billing\n"
+            "turn[-1] user: no me llega\n"
+            "turn[-1] route: billing"
+        )
+        await router.classify("de este mes", "es", llm_context=multi_turn_ctx)
+        llm.classify.assert_called_once()
+        call_kwargs = llm.classify.call_args
+        assert call_kwargs[1]["context"] == multi_turn_ctx
+
+    async def test_multi_turn_context_passed_to_llm_classify_b(self) -> None:
+        """5.2 — Multi-turn context reaches LLM fallback for Route B."""
+        registry = _make_registry()
+        engine = _mock_engine(
+            ("domain", 0.85, {"simple": 0.1, "disallowed": 0.1, "out_of_scope": 0.1, "domain": 0.85}),
+            ("billing", 0.72, {"sales": 0.70, "billing": 0.72, "support": 0.3, "retention": 0.2}),
+        )
+        llm = AsyncMock(spec=LLMFallbackClient)
+        llm.classify.return_value = LLMClassificationResult(
+            label="billing", confidence=0.90, raw_response='{"label":"billing","confidence":0.90}'
+        )
+        router = Router(registry, engine, llm_fallback=llm)
+        multi_turn_ctx = (
+            "language=es\n"
+            "turn[-2] user: mi factura\n"
+            "turn[-2] route: billing\n"
+            "turn[-1] user: no me llega\n"
+            "turn[-1] route: billing"
+        )
+        result = await router.classify("de este mes", "es", llm_context=multi_turn_ctx)
+        llm.classify.assert_called_once()
+        call_kwargs = llm.classify.call_args
+        assert call_kwargs[1]["context"] == multi_turn_ctx
+        assert result.route_b_label == RouteBLabel.BILLING

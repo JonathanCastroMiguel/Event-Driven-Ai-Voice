@@ -65,6 +65,7 @@ def _make_coordinator(
     turn_repo: object | None = None,
     agent_gen_repo: object | None = None,
     voice_gen_repo: object | None = None,
+    llm_context_window: int = 3,
 ) -> Coordinator:
     call_id = uuid4()
     return Coordinator(
@@ -79,6 +80,7 @@ def _make_coordinator(
         turn_repo=turn_repo,
         agent_gen_repo=agent_gen_repo,
         voice_gen_repo=voice_gen_repo,
+        llm_context_window=llm_context_window,
     )
 
 
@@ -1011,7 +1013,7 @@ class TestContextAwareRouting:
         assert router.classify.call_count == 2
         second_call = router.classify.call_args_list[1]
         assert second_call.kwargs["enriched_text"] == "tengo un problema con mi factura. de este mes"
-        assert "previous_turn: tengo un problema con mi factura" in second_call.kwargs["llm_context"]
+        assert "turn[-1] user: tengo un problema con mi factura" in second_call.kwargs["llm_context"]
 
     @pytest.mark.asyncio
     async def test_first_turn_no_enrichment(self) -> None:
@@ -1066,4 +1068,74 @@ class TestContextAwareRouting:
         second_call = router.classify.call_args_list[1]
         assert second_call.kwargs["enriched_text"] is None
         assert second_call.kwargs["llm_context"] is not None
-        assert "previous_turn: hola" in second_call.kwargs["llm_context"]
+        assert "turn[-1] user: hola" in second_call.kwargs["llm_context"]
+
+
+# ---------------------------------------------------------------------------
+# LLM Fallback History Tests (llm-fallback-history change)
+# ---------------------------------------------------------------------------
+
+
+class TestLLMFallbackHistory:
+    """6.1-6.2 — Coordinator passes llm_context_window and multi-turn context."""
+
+    def test_coordinator_passes_llm_context_window(self) -> None:
+        """6.1 — Coordinator passes llm_context_window to RoutingContextBuilder."""
+        coord = _make_coordinator(llm_context_window=2)
+        assert coord._routing_context_builder._llm_context_window == 2
+
+    def test_coordinator_default_llm_context_window(self) -> None:
+        """6.1b — Default llm_context_window is 3."""
+        coord = _make_coordinator()
+        assert coord._routing_context_builder._llm_context_window == 3
+
+    @pytest.mark.asyncio
+    async def test_multi_turn_llm_context_on_third_turn(self) -> None:
+        """6.2 — Multi-turn llm_context reaches Router.classify on 3rd turn."""
+        router = _make_router(route_a=RouteALabel.SIMPLE)
+        coord = _make_coordinator(router=router, llm_context_window=3)
+
+        # Turn 1
+        s1 = _envelope(call_id=coord._call_id, event_type="speech_started")
+        await coord.handle_event(s1)
+        t1 = _envelope(
+            call_id=coord._call_id,
+            event_type="transcript_final",
+            payload={"text": "mi factura"},
+        )
+        with patch("src.routing.language.detect_language", return_value="es"):
+            await coord.handle_event(t1)
+        coord.drain_output_events()
+
+        # Turn 2
+        s2 = _envelope(call_id=coord._call_id, event_type="speech_started")
+        await coord.handle_event(s2)
+        coord.drain_output_events()
+        t2 = _envelope(
+            call_id=coord._call_id,
+            event_type="transcript_final",
+            payload={"text": "no me llega el recibo"},
+        )
+        with patch("src.routing.language.detect_language", return_value="es"):
+            await coord.handle_event(t2)
+        coord.drain_output_events()
+
+        # Turn 3
+        s3 = _envelope(call_id=coord._call_id, event_type="speech_started")
+        await coord.handle_event(s3)
+        coord.drain_output_events()
+        t3 = _envelope(
+            call_id=coord._call_id,
+            event_type="transcript_final",
+            payload={"text": "de este mes"},
+        )
+        with patch("src.routing.language.detect_language", return_value="es"):
+            await coord.handle_event(t3)
+
+        assert router.classify.call_count == 3
+        third_call = router.classify.call_args_list[2]
+        llm_ctx = third_call.kwargs["llm_context"]
+        assert llm_ctx is not None
+        assert "turn[-2] user: mi factura" in llm_ctx
+        assert "turn[-1] user: no me llega el recibo" in llm_ctx
+        assert llm_ctx.startswith("language=es")

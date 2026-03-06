@@ -76,6 +76,7 @@ class Coordinator:
         max_history_chars: int = 2000,
         routing_context_window: int = 1,
         routing_short_text_chars: int = 20,
+        llm_context_window: int = 3,
     ) -> None:
         self._call_id = call_id
         self._turn_manager = turn_manager
@@ -95,6 +96,7 @@ class Coordinator:
         self._routing_context_builder = RoutingContextBuilder(
             short_text_chars=routing_short_text_chars,
             context_window=routing_context_window,
+            llm_context_window=llm_context_window,
         )
         self._seen_ids_fallback: set[str] = set()
         self._filler_task: asyncio.Task[None] | None = None

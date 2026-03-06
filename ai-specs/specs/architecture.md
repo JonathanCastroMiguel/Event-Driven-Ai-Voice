@@ -247,8 +247,9 @@ The Coordinator is the central orchestrator for a single call. One `Coordinator`
 | `voice_gen_repo` | `VoiceGenerationRepository` (optional) | DB persistence for voice generations |
 | `max_history_turns` | `int` (default: 10) | Max turns in conversation buffer |
 | `max_history_chars` | `int` (default: 2000) | Max total user_text chars in buffer |
-| `routing_context_window` | `int` (default: 1) | Prior turns used for routing context enrichment |
+| `routing_context_window` | `int` (default: 1) | Prior turns used for embedding enrichment |
 | `routing_short_text_chars` | `int` (default: 20) | Text length threshold for embedding enrichment |
+| `llm_context_window` | `int` (default: 3) | Prior turns included in LLM fallback context |
 
 **Main entry point**: `handle_event(envelope)` at line 142. This method:
 
@@ -291,7 +292,11 @@ On the first turn the buffer is empty, so the prompt is `[system, policy, user]`
 
 **Conversation Buffer** (`backend/src/voice_runtime/conversation_buffer.py`): A `ConversationBuffer` instance is created per call alongside `CoordinatorRuntimeState`. It accumulates `TurnEntry` records (frozen dataclass: `seq`, `user_text`, `route_a_label`, `policy_key`, `specialist`) after each successful `RealtimeVoiceStart` emission. Cancelled turns (barge-in) are never appended. The buffer enforces two bounds: `max_turns` (sliding window, default 10) and `max_chars` (character budget on total `user_text`, default 2000). `format_messages()` returns alternating `user`/`assistant` messages where assistant content is `[{policy_key}] Guided response` or `[{route_a_label}] Specialist: {specialist}`.
 
-**Context-Aware Routing** (`backend/src/routing/context.py`): A `RoutingContextBuilder` is instantiated per Coordinator with `short_text_chars` and `context_window` from Settings. Before each `Router.classify()` call, the Coordinator calls `builder.build(user_text, language, buffer)` which returns a `RoutingContext(enriched_text, llm_context)`. For short texts (< `routing_short_text_chars`), the builder concatenates the previous turn's `user_text` with the current text for richer embedding classification. The LLM fallback context (`"language={lang}; previous_turn: {prev_text}"`) is always produced when the buffer is non-empty. Both outputs are passed to `Router.classify()` as optional parameters — the original `user_text` is preserved for lexicon checks, short utterance checks, prompt construction, and buffer storage.
+**Context-Aware Routing** (`backend/src/routing/context.py`): A `RoutingContextBuilder` is instantiated per Coordinator with `short_text_chars`, `context_window`, and `llm_context_window` from Settings. Before each `Router.classify()` call, the Coordinator calls `builder.build(user_text, language, buffer)` which returns a `RoutingContext(enriched_text, llm_context)`. The two context layers are independently configurable:
+- **Layer 1 (embedding enrichment)**: For short texts (< `routing_short_text_chars`), concatenates the previous turn's `user_text` (from `context_window=1` most recent entry) with the current text for richer embedding classification.
+- **Layer 2 (LLM fallback context)**: Produces a structured multi-turn context string with up to `llm_context_window` (default: 3) prior turns in a labeled format: `turn[-N] user: {text}` / `turn[-N] route: {label}`. This enables the LLM to reason about conversation flow across 2-3 turns, significantly improving disambiguation of short follow-ups.
+
+Both outputs are passed to `Router.classify()` as optional parameters — the original `user_text` is preserved for lexicon checks, short utterance checks, prompt construction, and buffer storage.
 
 **Filler strategy** (line 604): Disabled by default (`_should_emit_filler()` returns `False`). When enabled, emits a brief filler voice ("Un momento, por favor.") before specialist responses, with a 1200ms auto-cancel timeout.
 
@@ -498,7 +503,7 @@ Async HTTP client for 3rd-party LLM classification when embeddings are ambiguous
 - **Model**: Configurable via `llm_fallback_model` (default: `gpt-4o-mini`)
 - **Timeout**: Configurable via `llm_fallback_timeout_s` (default: 2.0s)
 - **Prompt**: Asks the LLM to classify text into one of the given labels, respond with JSON `{"label": "...", "confidence": 0.0-1.0}`
-- **Context parameter**: Accepts a `context` string. When context-aware routing is active, the Coordinator passes `"language={lang}; previous_turn: {prev_text}"` so the LLM can reason about conversational continuity
+- **Context parameter**: Accepts a `context` string. When context-aware routing is active, the Coordinator passes a structured multi-turn context with up to 3 prior turns (configurable via `llm_context_window`), formatted as `language={lang}\nturn[-N] user: {text}\nturn[-N] route: {label}` lines. This enables the LLM to reason about conversational continuity across multiple turns
 - **Failure mode**: Returns `None` on timeout or error — classification continues without fallback
 
 ### 5.6 Language Detection
@@ -779,7 +784,7 @@ User has a multi-turn conversation: "hola" → "mi factura" → "¿cuánto debo?
 
 ### 8.7 Context-Aware Routing: Short Follow-Up
 
-User says "tengo un problema con mi factura" (turn 1), then "de este mes" (turn 2, short follow-up).
+User says "tengo un problema con mi factura" (turn 1), "no me llega el recibo" (turn 2), then "de este mes" (turn 3, short follow-up).
 
 ```
 === Turn 1: "tengo un problema con mi factura" ===
@@ -789,30 +794,47 @@ User says "tengo un problema con mi factura" (turn 1), then "de este mes" (turn 
 3. Router.classify("tengo un problema con mi factura", "es")
    → Route A: DOMAIN → Route B: BILLING
 4. AgentFSM → RequestAgentAction(specialist="billing")
-5. buffer.append(TurnEntry(seq=1, user_text="tengo un problema con mi factura", specialist="billing"))
+5. buffer.append(TurnEntry(seq=1, user_text="tengo un problema con mi factura", route_a_label="domain", specialist="billing"))
 
-=== Turn 2: "de este mes" (11 chars, < 20 threshold) ===
-6. speech_started → transcript_final("de este mes")
-7. RoutingContextBuilder.build("de este mes", "es", buffer):
-   → len("de este mes") = 11 < 20 → Layer 1 active
-   → enriched_text = "tengo un problema con mi factura. de este mes"
-   → llm_context = "language=es; previous_turn: tengo un problema con mi factura"
-8. Router.classify("de este mes", "es",
-     enriched_text="tengo un problema con mi factura. de este mes",
-     llm_context="language=es; previous_turn: tengo un problema con mi factura"):
-   → Lexicon check on "de este mes" → no match
-   → Short utterance check on "de este mes" → no match
-   → Route A embeddings on enriched text → DOMAIN (higher confidence than bare "de este mes")
-   → Route B embeddings on enriched text → BILLING
-   → If ambiguous, LLM fallback receives llm_context for conversational reasoning
-9. AgentFSM → RequestAgentAction(specialist="billing")
-   → Correct classification despite the short, ambiguous follow-up
+=== Turn 2: "no me llega el recibo" ===
+6. speech_started → transcript_final("no me llega el recibo")
+7. RoutingContextBuilder.build("no me llega el recibo", "es", buffer):
+   → len = 21 >= 20 → Layer 1 inactive (enriched_text=None)
+   → Layer 2: llm_context with 1 prior turn:
+     language=es
+     turn[-1] user: tengo un problema con mi factura
+     turn[-1] route: domain
+8. Router.classify → DOMAIN → BILLING
+9. buffer.append(TurnEntry(seq=2, user_text="no me llega el recibo", ...))
+
+=== Turn 3: "de este mes" (11 chars, < 20 threshold) ===
+10. speech_started → transcript_final("de este mes")
+11. RoutingContextBuilder.build("de este mes", "es", buffer):
+    → len("de este mes") = 11 < 20 → Layer 1 active
+    → enriched_text = "no me llega el recibo. de este mes" (context_window=1, most recent)
+    → Layer 2: llm_context with 2 prior turns (llm_context_window=3, only 2 available):
+      language=es
+      turn[-2] user: tengo un problema con mi factura
+      turn[-2] route: domain
+      turn[-1] user: no me llega el recibo
+      turn[-1] route: domain
+12. Router.classify("de este mes", "es",
+      enriched_text="no me llega el recibo. de este mes",
+      llm_context=<multi-turn context>):
+    → Lexicon check on "de este mes" → no match
+    → Short utterance check on "de este mes" → no match
+    → Route A embeddings on enriched text → DOMAIN
+    → Route B embeddings on enriched text → BILLING
+    → If ambiguous, LLM fallback receives multi-turn llm_context for conversational reasoning
+13. AgentFSM → RequestAgentAction(specialist="billing")
+    → Correct classification despite the short, ambiguous follow-up
 ```
 
 **Key behaviors:**
-- Enrichment only applies to texts shorter than `routing_short_text_chars` (default: 20). Long, self-contained utterances are classified as-is.
+- **Embedding enrichment** (Layer 1): Only applies to texts shorter than `routing_short_text_chars` (default: 20). Uses `context_window=1` (most recent turn only). Long, self-contained utterances are classified as-is.
+- **LLM fallback context** (Layer 2): Always produced when buffer is non-empty. Includes up to `llm_context_window` (default: 3) prior turns in structured format with `turn[-N] user:` and `turn[-N] route:` labels, enabling the LLM to reason about multi-turn conversation flow.
+- The two layers are independently configurable: embeddings use 1 turn, LLM uses up to 3 turns.
 - Lexicon and short utterance checks always use the original text — enrichment cannot bypass guardrails.
-- The LLM fallback receives conversation context on any non-first turn (even for long texts), enabling it to reason about conversational continuity.
 - The original `user_text` is preserved for prompt construction, buffer storage, and logging.
 
 ---
