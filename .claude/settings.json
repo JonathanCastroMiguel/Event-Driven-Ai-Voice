@@ -70,7 +70,14 @@
       "Bash(ls backend/.venv/bin/python*)",
       "Bash(backend/.venv/bin/python3 -m pytest backend/tests/unit/test_routing.py -x -q)",
       "Bash(.venv/bin/python3 -m pytest tests/unit/test_routing.py -x -q)",
-      "Bash(.venv/bin/python3 -m pytest tests/ -x -q --ignore=tests/integration)"
+      "Bash(.venv/bin/python3 -m pytest tests/ -x -q --ignore=tests/integration)",
+      "Bash(.venv/bin/python3 -m pytest tests/e2e/ -v --tb=short)",
+      "Bash(.venv/bin/python3 -m pytest tests/e2e/ -v --tb=short -durations=0)",
+      "Bash(.venv/bin/python3 -m pytest tests/e2e/ -v --tb=short --durations=0)",
+      "Bash(.venv/bin/python3 -m pytest tests/e2e/ -vv --tb=short --durations=0)",
+      "Bash(.venv/bin/python3 -m pytest tests/e2e/ -vv --tb=short --durations=30)",
+      "Bash(.venv/bin/python3 -m pytest tests/e2e/ -v --tb=short -p no:cacheprovider)",
+      "Bash(grep -v \"^$\")"
     ]
   }
 }
