@@ -25,6 +25,8 @@ class RoutingResult:
     route_a_confidence: float
     route_b_label: RouteBLabel | None = None
     route_b_confidence: float | None = None
+    route_a_margin: float = 0.0
+    route_b_margin: float | None = None
     language: str = "es"
     short_circuit: str | None = None  # "lexicon" | "short_utterance" | None
     fallback_used: bool = False
@@ -75,12 +77,14 @@ class Router:
         lexicon = self._registry.get_lexicon(language)
         if check_lexicon(text, lexicon):
             logger.info("routing_lexicon_match", language=language)
-            return RoutingResult(
+            result = RoutingResult(
                 route_a_label=RouteALabel.DISALLOWED,
                 route_a_confidence=1.0,
                 language=language,
                 short_circuit="lexicon",
             )
+            self._log_routing_completed(result)
+            return result
 
         # Step 2: Short utterance check (always uses original text)
         short_utts = self._registry.get_short_utterances(language)
@@ -88,12 +92,14 @@ class Router:
         category = check_short_utterance(text, short_utts, max_chars)
         if category is not None:
             logger.info("routing_short_utterance_match", category=category, language=language)
-            return RoutingResult(
+            result = RoutingResult(
                 route_a_label=RouteALabel.SIMPLE,
                 route_a_confidence=1.0,
                 language=language,
                 short_circuit="short_utterance",
             )
+            self._log_routing_completed(result)
+            return result
 
         # Step 3: Route A embedding classification (uses enriched text when available)
         embed_text = enriched_text if enriched_text is not None else text
@@ -111,32 +117,39 @@ class Router:
         if is_ambiguous_a and self._should_fallback():
             llm_result = await self._llm_classify_a(text, language, llm_context)
             if llm_result is not None:
-                return RoutingResult(
+                result = RoutingResult(
                     route_a_label=RouteALabel(llm_result),
                     route_a_confidence=score_a,
+                    route_a_margin=margin_a,
                     language=language,
                     fallback_used=True,
                     all_scores_a=scores_a,
                 )
+                self._log_routing_completed(result)
+                return result
 
         # Step 4: If domain, proceed to Route B
         if route_a_label == RouteALabel.DOMAIN:
             return await self._classify_route_b(
-                text, language, score_a, scores_a, enriched_text, llm_context
+                text, language, score_a, margin_a, scores_a, enriched_text, llm_context
             )
 
-        return RoutingResult(
+        result = RoutingResult(
             route_a_label=route_a_label,
             route_a_confidence=score_a,
+            route_a_margin=margin_a,
             language=language,
             all_scores_a=scores_a,
         )
+        self._log_routing_completed(result)
+        return result
 
     async def _classify_route_b(
         self,
         text: str,
         language: str,
         route_a_confidence: float,
+        route_a_margin: float,
         scores_a: dict[str, float],
         enriched_text: str | None = None,
         llm_context: str | None = None,
@@ -155,37 +168,64 @@ class Router:
         if is_ambiguous_b and self._should_fallback():
             llm_result = await self._llm_classify_b(text, language, llm_context)
             if llm_result is not None:
-                return RoutingResult(
+                result = RoutingResult(
                     route_a_label=RouteALabel.DOMAIN,
                     route_a_confidence=route_a_confidence,
+                    route_a_margin=route_a_margin,
                     route_b_label=RouteBLabel(llm_result),
                     route_b_confidence=score_b,
+                    route_b_margin=margin_b,
                     language=language,
                     fallback_used=True,
                     all_scores_a=scores_a,
                     all_scores_b=scores_b,
                 )
+                self._log_routing_completed(result)
+                return result
 
         # If still ambiguous without LLM, return None for route_b to signal clarify
         if is_ambiguous_b:
-            return RoutingResult(
+            result = RoutingResult(
                 route_a_label=RouteALabel.DOMAIN,
                 route_a_confidence=route_a_confidence,
+                route_a_margin=route_a_margin,
                 route_b_label=None,
                 route_b_confidence=score_b,
+                route_b_margin=margin_b,
                 language=language,
                 all_scores_a=scores_a,
                 all_scores_b=scores_b,
             )
+            self._log_routing_completed(result)
+            return result
 
-        return RoutingResult(
+        result = RoutingResult(
             route_a_label=RouteALabel.DOMAIN,
             route_a_confidence=route_a_confidence,
+            route_a_margin=route_a_margin,
             route_b_label=RouteBLabel(best_b),
             route_b_confidence=score_b,
+            route_b_margin=margin_b,
             language=language,
             all_scores_a=scores_a,
             all_scores_b=scores_b,
+        )
+        self._log_routing_completed(result)
+        return result
+
+    def _log_routing_completed(self, result: RoutingResult) -> None:
+        logger.info(
+            "routing_completed",
+            router_version=self._registry.thresholds.version,
+            language=result.language,
+            route_a_label=result.route_a_label.value,
+            route_a_score=result.route_a_confidence,
+            route_a_margin=result.route_a_margin,
+            route_b_label=result.route_b_label.value if result.route_b_label is not None else None,
+            route_b_score=result.route_b_confidence,
+            route_b_margin=result.route_b_margin,
+            short_circuit=result.short_circuit,
+            fallback_used=result.fallback_used,
         )
 
     def _get_centroids_a(self, language: str) -> dict[str, NDArray[np.float32]]:

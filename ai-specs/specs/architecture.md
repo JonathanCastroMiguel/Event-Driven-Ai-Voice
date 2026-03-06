@@ -429,11 +429,13 @@ Input text + optional enriched_text + optional llm_context
 **Context enrichment**: The Coordinator's `RoutingContextBuilder` produces `enriched_text` for short follow-up turns (< 20 chars by default) by concatenating the previous turn's text. Lexicon and short utterance checks always use the original `text` to ensure exact-match behavior is preserved.
 
 **Returns**: `RoutingResult` dataclass (line 23) with:
-- `route_a_label`, `route_a_confidence`
-- `route_b_label`, `route_b_confidence` (optional)
+- `route_a_label`, `route_a_confidence`, `route_a_margin` (top1 - top2)
+- `route_b_label`, `route_b_confidence`, `route_b_margin` (optional)
 - `short_circuit` ("lexicon", "short_utterance", or None)
 - `fallback_used` (bool)
 - `all_scores_a`, `all_scores_b` (full score maps for calibration logging)
+
+**Calibration logging**: Every `classify()` call emits a `routing_completed` structured log with `router_version`, `language`, all scores/margins, `short_circuit`, and `fallback_used`. Used for threshold recalibration from production data.
 
 ### 5.2 Router Registry
 

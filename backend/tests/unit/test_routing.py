@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
 import pytest
+import structlog.testing
 
 from src.routing.embeddings import EmbeddingEngine, get_top_two
 from src.routing.llm_fallback import LLMClassificationResult, LLMFallbackClient
@@ -411,3 +412,116 @@ class TestMultiTurnLLMContextPassthrough:
         call_kwargs = llm.classify.call_args
         assert call_kwargs[1]["context"] == multi_turn_ctx
         assert result.route_b_label == RouteBLabel.BILLING
+
+
+# ---------------------------------------------------------------------------
+# Routing Calibration Logging Tests
+# ---------------------------------------------------------------------------
+
+
+def _find_routing_completed(cap_logs: list[dict]) -> dict:
+    """Find the routing_completed log entry from captured logs."""
+    for entry in cap_logs:
+        if entry.get("event") == "routing_completed":
+            return entry
+    msg = f"routing_completed not found in logs: {[e.get('event') for e in cap_logs]}"
+    raise AssertionError(msg)
+
+
+class TestCalibrationLoggingLexicon:
+    async def test_lexicon_short_circuit_log(self) -> None:
+        registry = _make_registry()
+        engine = MagicMock(spec=EmbeddingEngine)
+        router = Router(registry, engine)
+        with structlog.testing.capture_logs() as cap_logs:
+            await router.classify("eres un idiota", "es")
+        log = _find_routing_completed(cap_logs)
+        assert log["short_circuit"] == "lexicon"
+        assert log["route_a_label"] == "disallowed"
+        assert log["route_a_score"] == 1.0
+        assert log["route_a_margin"] == 0.0
+        assert log["route_b_label"] is None
+        assert log["route_b_score"] is None
+        assert log["route_b_margin"] is None
+        assert log["fallback_used"] is False
+
+
+class TestCalibrationLoggingShortUtterance:
+    async def test_short_utterance_log(self) -> None:
+        registry = _make_registry()
+        engine = MagicMock(spec=EmbeddingEngine)
+        router = Router(registry, engine)
+        with structlog.testing.capture_logs() as cap_logs:
+            await router.classify("hola", "es")
+        log = _find_routing_completed(cap_logs)
+        assert log["short_circuit"] == "short_utterance"
+        assert log["route_a_label"] == "simple"
+        assert log["route_a_score"] == 1.0
+        assert log["route_a_margin"] == 0.0
+        assert log["fallback_used"] is False
+
+
+class TestCalibrationLoggingEmbeddingRouteA:
+    async def test_embedding_route_a_non_domain_log(self) -> None:
+        registry = _make_registry()
+        engine = _mock_engine(
+            ("simple", 0.90, {"simple": 0.90, "disallowed": 0.3, "out_of_scope": 0.2, "domain": 0.1})
+        )
+        router = Router(registry, engine)
+        with structlog.testing.capture_logs() as cap_logs:
+            await router.classify("good morning, how are you doing today", "en")
+        log = _find_routing_completed(cap_logs)
+        assert log["route_a_label"] == "simple"
+        assert log["route_a_score"] == 0.90
+        assert log["route_a_margin"] == pytest.approx(0.60, abs=0.01)
+        assert log["route_b_label"] is None
+        assert log["short_circuit"] is None
+
+
+class TestCalibrationLoggingRouteB:
+    async def test_route_b_confident_log(self) -> None:
+        registry = _make_registry()
+        engine = _mock_engine(
+            ("domain", 0.85, {"simple": 0.1, "disallowed": 0.1, "out_of_scope": 0.1, "domain": 0.85}),
+            ("billing", 0.90, {"sales": 0.3, "billing": 0.90, "support": 0.2, "retention": 0.15}),
+        )
+        router = Router(registry, engine)
+        with structlog.testing.capture_logs() as cap_logs:
+            await router.classify("my bill is wrong", "en")
+        log = _find_routing_completed(cap_logs)
+        assert log["route_a_label"] == "domain"
+        assert log["route_b_label"] == "billing"
+        assert log["route_b_score"] == 0.90
+        assert log["route_b_margin"] == pytest.approx(0.60, abs=0.01)
+        assert log["fallback_used"] is False
+
+
+class TestCalibrationLoggingLLMFallback:
+    async def test_llm_fallback_log(self) -> None:
+        registry = _make_registry()
+        engine = _mock_engine(
+            ("domain", 0.72, {"simple": 0.70, "disallowed": 0.1, "out_of_scope": 0.1, "domain": 0.72})
+        )
+        llm = AsyncMock(spec=LLMFallbackClient)
+        llm.classify.return_value = LLMClassificationResult(
+            label="simple", confidence=0.95, raw_response='{"label":"simple","confidence":0.95}'
+        )
+        router = Router(registry, engine, llm_fallback=llm)
+        with structlog.testing.capture_logs() as cap_logs:
+            await router.classify("hm ok sure", "en")
+        log = _find_routing_completed(cap_logs)
+        assert log["fallback_used"] is True
+        assert log["route_a_label"] == "simple"
+
+
+class TestCalibrationLoggingRouterVersion:
+    async def test_router_version_in_log(self) -> None:
+        registry = _make_registry()
+        engine = _mock_engine(
+            ("simple", 0.90, {"simple": 0.90, "disallowed": 0.3, "out_of_scope": 0.2, "domain": 0.1})
+        )
+        router = Router(registry, engine)
+        with structlog.testing.capture_logs() as cap_logs:
+            await router.classify("good morning, how are you doing today", "en")
+        log = _find_routing_completed(cap_logs)
+        assert log["router_version"] == registry.thresholds.version
