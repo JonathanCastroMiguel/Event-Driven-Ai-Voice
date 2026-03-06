@@ -204,6 +204,26 @@ erDiagram
     Turn ||--o{ ToolExecution : "associated"
 ```
 
+## In-Memory Structures (Not Persisted)
+
+### WebRTC Session Registry
+
+**File**: `backend/src/api/routes/calls.py`
+
+`CallSessionEntry` tracks active WebRTC call resources in a process-local dictionary (`_sessions: dict[UUID, CallSessionEntry]`). This is **not** persisted to PostgreSQL — it exists only for the lifetime of the server process.
+
+**Fields:**
+- `call_id`: UUID identifier for the call
+- `peer_connection`: `RTCPeerConnection` instance (aiortc)
+- `coordinator`: Coordinator instance for this call
+- `bridge`: `RealtimeVoiceBridge` instance
+- `control_channel`: DataChannel for VAD signals and transcriptions
+- `debug_channel`: DataChannel for telemetry
+
+**Lifecycle:** Created on `POST /calls`, populated on `POST /calls/{call_id}/offer`, destroyed on `DELETE /calls/{call_id}` or peer connection disconnect. Max entries governed by `MAX_CONCURRENT_CALLS` (default: 50).
+
+**Note:** This registry is separate from the Redis-backed `RedisSessionRegistry` (which tracks call metadata for distributed scenarios). The WebRTC session registry is per-process because `RTCPeerConnection` objects cannot be serialized.
+
 ## Key Design Principles
 
 1. **UUID Primary Keys**: All entities use UUIDs for distributed-safe identity without central sequence coordination.
