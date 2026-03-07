@@ -1,32 +1,17 @@
 "use client";
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { api } from "@/lib/api";
-import type {
-  ConnectionStatus,
-  ControlInMessage,
-  ControlOutMessage,
-} from "@/lib/types";
+import type { ConnectionStatus, ControlInMessage } from "@/lib/types";
 
 interface UseVoiceSessionReturn {
-  /** Current connection status. */
   status: ConnectionStatus;
-  /** Active call ID (set after POST /calls). */
   callId: string | null;
-  /** Start a new voice session (POST /calls -> SDP exchange -> connected). */
   startSession: () => Promise<void>;
-  /** End the current voice session. */
   endSession: () => Promise<void>;
-  /** The RTCPeerConnection (for adding audio tracks). */
-  peerConnection: RTCPeerConnection | null;
-  /** Send a message on the control DataChannel. */
-  sendControl: (message: ControlOutMessage) => void;
-  /** Register a handler for control channel messages. */
   onControlMessage: (handler: (msg: ControlInMessage) => void) => void;
-  /** Register a handler for debug channel messages. */
   onDebugMessage: (handler: (msg: unknown) => void) => void;
-  /** Error message if connection failed. */
   error: string | null;
 }
 
@@ -36,72 +21,124 @@ export function useVoiceSession(): UseVoiceSessionReturn {
   const [error, setError] = useState<string | null>(null);
 
   const pcRef = useRef<RTCPeerConnection | null>(null);
-  const controlChannelRef = useRef<RTCDataChannel | null>(null);
-  const debugChannelRef = useRef<RTCDataChannel | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
   const controlHandlerRef = useRef<((msg: ControlInMessage) => void) | null>(
     null,
   );
   const debugHandlerRef = useRef<((msg: unknown) => void) | null>(null);
+  const callIdRef = useRef<string | null>(null);
 
-  const cleanup = useCallback(async (currentCallId: string | null) => {
+  const cleanup = useCallback(async (id: string | null) => {
     if (pcRef.current) {
+      pcRef.current.getSenders().forEach((sender) => {
+        if (sender.track) sender.track.stop();
+      });
       pcRef.current.close();
       pcRef.current = null;
     }
-    controlChannelRef.current = null;
-    debugChannelRef.current = null;
+    if (audioRef.current) {
+      audioRef.current.srcObject = null;
+      audioRef.current = null;
+    }
 
-    if (currentCallId) {
+    if (id) {
       try {
-        await api.calls.end(currentCallId);
+        await api.calls.end(id);
       } catch {
-        // Best-effort cleanup
+        // Best-effort
       }
     }
+  }, []);
+
+  // Clean up on page unload
+  useEffect(() => {
+    const onUnload = () => {
+      if (callIdRef.current) {
+        navigator.sendBeacon(
+          `${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"}/api/v1/calls/${callIdRef.current}`,
+        );
+      }
+    };
+    window.addEventListener("beforeunload", onUnload);
+    return () => window.removeEventListener("beforeunload", onUnload);
   }, []);
 
   const startSession = useCallback(async () => {
     setError(null);
     setStatus("connecting");
 
+    let newCallId: string | null = null;
+
     try {
       // 1. Create call session
       const { call_id } = await api.calls.create();
+      newCallId = call_id;
       setCallId(call_id);
+      callIdRef.current = call_id;
 
       // 2. Create RTCPeerConnection
-      const pc = new RTCPeerConnection({
-        iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
-      });
+      const pc = new RTCPeerConnection();
       pcRef.current = pc;
 
-      // 3. Create DataChannels (must match server-side names)
-      const controlChannel = pc.createDataChannel("control", { ordered: true });
-      controlChannelRef.current = controlChannel;
-
-      const debugChannel = pc.createDataChannel("debug", { ordered: true });
-      debugChannelRef.current = debugChannel;
-
-      // 4. Wire DataChannel message handlers
-      controlChannel.onmessage = (event) => {
-        try {
-          const msg = JSON.parse(event.data) as ControlInMessage;
-          controlHandlerRef.current?.(msg);
-        } catch {
-          // Ignore unparseable messages
-        }
+      // 3. Audio playback from OpenAI
+      const audio = document.createElement("audio");
+      audio.autoplay = true;
+      audioRef.current = audio;
+      pc.ontrack = (e) => {
+        audio.srcObject = e.streams[0];
       };
 
-      debugChannel.onmessage = (event) => {
-        try {
-          const msg: unknown = JSON.parse(event.data);
-          debugHandlerRef.current?.(msg);
-        } catch {
-          // Ignore unparseable messages
-        }
-      };
+      // 4. Microphone
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      pc.addTrack(stream.getTracks()[0]);
 
-      // 5. Handle connection state changes
+      // 5. Data channel — wire listeners inline (not in useEffect)
+      const dc = pc.createDataChannel("oai-events");
+
+      dc.addEventListener("open", () => {
+        setStatus("connected");
+      });
+
+      dc.addEventListener("message", (e: MessageEvent) => {
+        try {
+          const event = JSON.parse(e.data) as Record<string, unknown>;
+
+          // Forward to debug handler (filter high-frequency audio deltas)
+          if (event.type !== "response.audio.delta") {
+            debugHandlerRef.current?.(event);
+          }
+
+          // Translate OpenAI events to transcription format
+          if (
+            event.type ===
+            "conversation.item.input_audio_transcription.completed"
+          ) {
+            const text = (event.transcript as string) ?? "";
+            if (text) {
+              controlHandlerRef.current?.({
+                type: "transcription",
+                text,
+                is_final: true,
+                speaker: "human",
+              });
+            }
+          } else if (event.type === "response.audio_transcript.done") {
+            const text = (event.transcript as string) ?? "";
+            if (text) {
+              controlHandlerRef.current?.({
+                type: "transcription",
+                text,
+                is_final: true,
+                speaker: "agent",
+              });
+            }
+          }
+        } catch {
+          // Ignore unparseable
+        }
+      });
+
+      // 6. Connection state
       pc.onconnectionstatechange = () => {
         const state = pc.connectionState;
         if (state === "connected") {
@@ -114,51 +151,30 @@ export function useVoiceSession(): UseVoiceSessionReturn {
         }
       };
 
-      // 6. Add audio transceiver (sendrecv for bidirectional)
-      pc.addTransceiver("audio", { direction: "sendrecv" });
-
-      // 7. Create SDP offer
+      // 7. SDP exchange
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
 
-      // 8. Send offer to backend, get answer
       const answer = await api.calls.offer(call_id, offer.sdp!);
       await pc.setRemoteDescription(
         new RTCSessionDescription({ sdp: answer.sdp, type: "answer" }),
       );
-
-      // 9. Handle ICE candidates
-      pc.onicecandidate = (event) => {
-        if (event.candidate) {
-          api.calls
-            .ice(call_id, event.candidate.candidate, event.candidate.sdpMid)
-            .catch(() => {
-              // Best-effort ICE trickle
-            });
-        }
-      };
     } catch (err) {
       const message =
         err instanceof Error ? err.message : "Failed to start session";
       setError(message);
       setStatus("failed");
-      await cleanup(callId);
+      await cleanup(newCallId);
     }
-  }, [callId, cleanup]);
+  }, [cleanup]);
 
   const endSession = useCallback(async () => {
-    const currentCallId = callId;
+    const currentCallId = callIdRef.current;
     setStatus("disconnected");
     setCallId(null);
+    callIdRef.current = null;
     await cleanup(currentCallId);
-  }, [callId, cleanup]);
-
-  const sendControl = useCallback((message: ControlOutMessage) => {
-    const channel = controlChannelRef.current;
-    if (channel && channel.readyState === "open") {
-      channel.send(JSON.stringify(message));
-    }
-  }, []);
+  }, [cleanup]);
 
   const onControlMessage = useCallback(
     (handler: (msg: ControlInMessage) => void) => {
@@ -176,8 +192,6 @@ export function useVoiceSession(): UseVoiceSessionReturn {
     callId,
     startSession,
     endSession,
-    peerConnection: pcRef.current,
-    sendControl,
     onControlMessage,
     onDebugMessage,
     error,

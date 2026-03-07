@@ -30,9 +30,8 @@ Detailed documentation of the Event-Driven Voice Runtime: actors, events, proces
   - [6.2 Session Registry](#62-session-registry)
   - [6.3 Persistence (Repositories)](#63-persistence-repositories)
   - [6.4 Realtime Client](#64-realtime-client)
-  - [6.5 RealtimeVoiceProvider](#65-realtimevoiceprovider) (Protocol, StubVoiceProvider, OpenAIRealtimeProvider, factory)
-  - [6.6 RealtimeVoiceBridge](#66-realtimevoicebridge)
-  - [6.7 WebRTC Signaling](#67-webrtc-signaling)
+  - [6.5 OpenAI WebRTC SDP Proxy](#65-openai-webrtc-sdp-proxy)
+  - [6.6 WebRTC Signaling](#66-webrtc-signaling)
 - [7. Runtime State](#7-runtime-state)
 - [8. End-to-End Flows](#8-end-to-end-flows)
   - [8.1 Happy Path: Simple Greeting](#81-happy-path-simple-greeting)
@@ -61,19 +60,23 @@ Detailed documentation of the Event-Driven Voice Runtime: actors, events, proces
 The Voice AI Runtime is an event-driven system for real-time call center voice interactions. It uses four actors communicating via typed events:
 
 ```
-Browser (WebRTC + VAD)
-    ↕ Opus audio / DataChannels (control + debug)
-RealtimeVoiceBridge (implements RealtimeClient Protocol)
-    ↕ PCM audio / transcriptions
-RealtimeVoiceProvider (STT/TTS — e.g. OpenAI Realtime, Deepgram)
-    ↓ speech_started / transcript_final / voice_completed
-Coordinator (CallSession)
+Browser (WebRTC)
+    ↕ Opus audio (direct to OpenAI via WebRTC)
+    ↕ Data channel "oai-events" (OpenAI events: transcription, VAD, audio)
+    ↕ HTTP (SDP signaling via backend proxy)
+Backend (SDP Proxy)
+    → POST /v1/realtime/calls (OpenAI Realtime WebRTC API)
+    ← SDP answer returned to browser
+
+Coordinator (CallSession) — NOT YET CONNECTED to voice flow
     ↔ TurnManager       (turn detection)
     ↔ Agent FSM          (intent classification)
     ↔ ToolExecutor       (tool execution)
-    ↓ RealtimeVoiceStart / RealtimeVoiceCancel
-RealtimeVoiceBridge → RealtimeVoiceProvider (TTS) → Browser (WebRTC audio)
 ```
+
+> **Note:** The Coordinator, TurnManager, and AgentFSM exist but are currently disconnected
+> from the WebRTC voice flow. The backend only handles SDP signaling; all audio and events
+> flow directly between browser and OpenAI. Runtime integration is deferred to a future change.
 
 The Coordinator is the **single orchestrator** — it receives all events, delegates to actors, manages cancellation, idempotency, and emits voice output commands.
 
@@ -91,9 +94,7 @@ The Coordinator is the **single orchestrator** — it receives all events, deleg
 | Event Bus | `backend/src/voice_runtime/bus.py` |
 | Router | `backend/src/routing/router.py` |
 | Policies | `backend/src/routing/policies.py` |
-| RealtimeVoiceProvider | `backend/src/voice_runtime/realtime_provider.py` |
-| RealtimeVoiceBridge | `backend/src/voice_runtime/realtime_bridge.py` |
-| WebRTC Signaling | `backend/src/api/routes/calls.py` |
+| WebRTC Signaling (SDP Proxy) | `backend/src/api/routes/calls.py` |
 | Config | `backend/src/config.py` |
 
 ---
@@ -610,97 +611,42 @@ All repos use raw `asyncpg` for maximum performance. Tables are created via Alem
 - Supports error injection via `fail_voice_ids` set
 - Respects cancellation (cancelled IDs skip completion emission)
 
-### 6.5 RealtimeVoiceProvider
-
-**File**: `backend/src/voice_runtime/realtime_provider.py`
-
-**`RealtimeVoiceProvider` Protocol** — abstraction for streaming STT/TTS providers (OpenAI Realtime, Deepgram, etc.):
-- `async send_audio(frame: bytes)`: Send a PCM audio frame to the STT engine
-- `async receive_transcription() -> AsyncIterator[TranscriptionEvent]`: Yield transcription events (partial/final) as they arrive
-- `async send_text_for_tts(text: str) -> AsyncIterator[bytes]`: Send text for TTS, yield PCM audio frames as generated
-- `async close()`: Clean up provider resources
-
-**`TranscriptionEvent`** dataclass: `text: str`, `is_final: bool`.
-
-**`StubVoiceProvider`** (line 43): Test implementation that returns canned transcriptions and silent audio frames. Stores received audio for assertions.
-
-**`create_voice_provider()`** (line 79): Async factory function that returns `OpenAIRealtimeProvider` when `OPENAI_API_KEY` is set, otherwise `StubVoiceProvider`. Called during SDP offer handling in `calls.py`.
-
-**`OpenAIRealtimeProvider`** — File: `backend/src/voice_runtime/openai_realtime_provider.py`
-
-Production implementation backed by the OpenAI Realtime API (`gpt-4o-mini-realtime-preview`). Uses a single persistent WebSocket per call for bidirectional streaming STT and TTS, optimized for minimum latency.
-
-| Method | Behavior |
-|---|---|
-| `connect()` | Opens WebSocket to `wss://api.openai.com/v1/realtime`, starts background reader task |
-| `send_audio(frame)` | Downsamples 48kHz→24kHz (every 2nd sample), base64-encodes, sends `input_audio_buffer.append` (fire-and-forget) |
-| `commit_audio_buffer()` | Sends `input_audio_buffer.commit` to trigger transcription |
-| `receive_transcription()` | Yields `TranscriptionEvent` from internal STT queue (fed by reader) |
-| `send_text_for_tts(text)` | Sends `response.create`, yields PCM16 audio frames from TTS queue |
-| `close()` | Cancels reader, closes WebSocket, signals queues |
-
-**Architecture**: Fire-and-forget sends + async reader task. Reader routes `conversation.item.input_audio_transcription.completed` → STT queue, `response.audio.delta` → TTS queue (base64-decoded), `response.audio.done` → None sentinel.
-
-### 6.6 RealtimeVoiceBridge
-
-**File**: `backend/src/voice_runtime/realtime_bridge.py`
-
-Bridges WebRTC audio ↔ `RealtimeVoiceProvider` ↔ Coordinator. Implements the `RealtimeClient` Protocol so the Coordinator uses it as a drop-in replacement for `StubRealtimeClient`.
-
-**Constructor dependencies:**
-
-| Parameter | Type | Purpose |
-|---|---|---|
-| `call_id` | `UUID` | Unique call identifier |
-| `provider` | `RealtimeVoiceProvider` | STT/TTS provider instance |
-| `control_channel` | `RTCDataChannel` | For VAD signals + transcriptions |
-| `debug_channel` | `RTCDataChannel` | For telemetry data |
-
-**RealtimeClient Protocol methods:**
-
-| Method | What It Does |
-|---|---|
-| `send_voice_start(event)` | Streams `event.prompt` to `provider.send_text_for_tts()`, emits `voice_generation_completed` when done |
-| `send_voice_cancel(event)` | Adds voice_id to cancelled set, cancels active TTS task |
-| `on_event(callback)` | Registers Coordinator's event callback |
-| `close()` | Cancels all async tasks, closes provider |
-
-**Audio forwarding** (line 143): `start_audio_forwarding(track)` creates an async task that reads frames from the WebRTC audio track (`track.recv()`), converts to PCM via `to_ndarray().tobytes()`, and sends to `provider.send_audio()`.
-
-**STT listener** (line 162): `start_stt_listener()` creates an async task that iterates `provider.receive_transcription()`, forwards transcription JSON to browser via control DataChannel, and dispatches final transcriptions as `transcript_final` EventEnvelopes to the Coordinator.
-
-**VAD signal handling** (line 197): Parses `speech_started`/`speech_ended` JSON from the control DataChannel. Maps browser `speech_ended` to internal `speech_stopped` event type (matching the `SpeechStopped` event in `events.py`). On `speech_ended`, also calls `provider.commit_audio_buffer()` if available (triggers transcription of accumulated audio).
-
-**Debug forwarding** (line 244): `emit_debug(event)` sends debug JSON to the debug DataChannel when debug mode is enabled. Debug enable/disable is toggled via control DataChannel messages.
-
-### 6.7 WebRTC Signaling
+### 6.5 OpenAI WebRTC SDP Proxy
 
 **File**: `backend/src/api/routes/calls.py`
 
-REST-based WebRTC signaling for browser-to-backend audio connections. Uses `aiortc` for server-side WebRTC.
+The backend acts as a **pure SDP signaling proxy**. It does NOT process audio or manage WebRTC peer connections. The browser connects directly to OpenAI via WebRTC for audio and events.
 
-**In-memory session registry**: `_sessions: dict[UUID, CallSessionEntry]` tracks active WebRTC calls. Each entry holds:
-- `call_id`, `peer_connection`, `coordinator`, `bridge`, `control_channel`, `debug_channel`
+**SDP proxy flow:**
+1. Browser sends SDP offer to `POST /calls/{call_id}/offer`
+2. Backend forwards raw SDP to `POST https://api.openai.com/v1/realtime/calls?model={model}` with `Content-Type: application/sdp` and `Authorization: Bearer {api_key}`
+3. OpenAI returns SDP answer
+4. Backend returns SDP answer to browser
+5. Browser establishes direct WebRTC connection with OpenAI
 
-**ICE configuration**: Built from environment variables via `build_rtc_configuration()`:
-- `STUN_SERVERS` (default: `stun:stun.l.google.com:19302`)
-- `TURN_SERVERS`, `TURN_USERNAME`, `TURN_CREDENTIAL` (optional, for NAT traversal)
+**Why proxy instead of ephemeral keys:** Keeps OpenAI API key server-side. Also provides a future injection point for session configuration (system prompts, tools, routing instructions).
+
+> **Note:** `RealtimeVoiceProvider` and `RealtimeVoiceBridge` have been removed. Audio and events
+> flow directly between browser and OpenAI. The Coordinator is not yet connected to the voice flow.
+
+### 6.6 WebRTC Signaling
+
+**File**: `backend/src/api/routes/calls.py`
+
+**In-memory session registry**: `_sessions: dict[UUID, CallSessionEntry]` tracks active calls. Each entry holds only `call_id`.
 
 **Endpoints:**
 
 | Endpoint | Method | Purpose |
 |---|---|---|
-| `/api/v1/calls` | POST | Create call session, returns `call_id` |
-| `/api/v1/calls/{call_id}/offer` | POST | Accept SDP offer, create `RTCPeerConnection` with audio transceiver (sendrecv) and DataChannels ("control", "debug"), return SDP answer |
-| `/api/v1/calls/{call_id}/ice` | POST | Receive trickle ICE candidates (logged; aiortc gathers during SDP exchange) |
-| `/api/v1/calls/{call_id}` | DELETE | End call, clean up all resources |
+| `/api/v1/calls` | POST | Create call session, returns `call_id`. Enforces `max_concurrent_calls`. |
+| `/api/v1/calls/{call_id}/offer` | POST | Proxy SDP offer to OpenAI Realtime WebRTC API, return SDP answer |
+| `/api/v1/calls/{call_id}` | DELETE | End call, remove from session registry |
 
-**Peer connection lifecycle:**
-- Audio transceiver added as `sendrecv` for bidirectional Opus audio
-- DataChannels created server-side: `"control"` (ordered) and `"debug"` (ordered)
-- During SDP offer handling: `create_voice_provider()` selects provider, creates `RealtimeVoiceBridge`, starts STT listener, and registers `on("track")` handler for audio forwarding
-- `connectionstatechange` event triggers auto-cleanup on `"failed"` or `"closed"` states (closes bridge + provider)
-- `MAX_CONCURRENT_CALLS` (default: 50) enforced at session creation
+**Configuration:**
+- `OPENAI_API_KEY`: Required for SDP proxy
+- `OPENAI_REALTIME_MODEL`: Model to use (default: `gpt-4o-realtime-preview`)
+- `MAX_CONCURRENT_CALLS`: Session limit (default: 50)
 
 ---
 
@@ -1042,15 +988,13 @@ Factory function `create_app()` with:
 **`GET /api/v1/calls/{call_id}`** (`backend/src/api/routes/admin.py:39`):
 - Returns call detail with turns and agent generations
 
-**WebRTC Signaling** (`backend/src/api/routes/calls.py`):
+**WebRTC Signaling — SDP Proxy** (`backend/src/api/routes/calls.py`):
 
 **`POST /api/v1/calls`** — Create a new voice call session. Returns `{ call_id, status }`. Enforces `MAX_CONCURRENT_CALLS` (503 if exceeded).
 
-**`POST /api/v1/calls/{call_id}/offer`** — Accept SDP offer, create RTCPeerConnection with audio transceiver and DataChannels, return SDP answer. 409 if offer already processed.
+**`POST /api/v1/calls/{call_id}/offer`** — Proxy SDP offer to OpenAI Realtime WebRTC API, return SDP answer. 502 on OpenAI error.
 
-**`POST /api/v1/calls/{call_id}/ice`** — Receive trickle ICE candidate. Logged for debugging; aiortc gathers candidates during SDP exchange. 204 on success.
-
-**`DELETE /api/v1/calls/{call_id}`** — End call, close peer connection, clean up all resources. 204 on success.
+**`DELETE /api/v1/calls/{call_id}`** — End call, remove from session registry. 204 on success.
 
 ---
 
@@ -1082,23 +1026,20 @@ The app runs via `uvicorn` with `uvloop` for maximum async performance.
 
 ### 12.1 Overview
 
-The frontend is a Next.js 15 (App Router) browser-based voice client for runtime testing. It connects to the backend via WebRTC, captures microphone audio, runs client-side VAD, and displays real-time transcriptions with an optional debug panel.
+The frontend is a Next.js 15 (App Router) browser-based voice client for runtime testing. It connects directly to OpenAI via WebRTC for audio and events, using the backend only for SDP signaling (keeping the API key server-side).
 
 ```
 Browser
 ├─ Microphone (getUserMedia) → MediaStream
-│     ↓
-├─ Client-side VAD (Silero WASM via @ricky0123/vad-web)
-│     ↓ speech_started / speech_ended
-├─ WebRTC (RTCPeerConnection)
-│     ├─ Audio Track → Opus codec → Backend (RealtimeVoiceBridge)
-│     ├─ DataChannel "control" → VAD signals, transcriptions
-│     └─ DataChannel "debug" → FSM state, routing, latency
+├─ WebRTC (RTCPeerConnection → direct to OpenAI)
+│     ├─ Audio Track → Opus codec → OpenAI (STT + TTS)
+│     └─ DataChannel "oai-events" → OpenAI events (transcriptions, VAD, audio)
+├─ HTTP → Backend (SDP proxy only)
 ├─ Transcription Panel (real-time display)
 └─ Debug Panel (optional, lazy-loaded)
 ```
 
-**Design priorities**: Latency-first. Client-side VAD avoids network RTT for speech detection. Opus is native WebRTC codec (zero transformation). Frontend overhead target: < 5ms (VAD ~1-3ms + Opus encode ~2-3ms).
+**Design priorities**: Latency-first. Direct browser-to-OpenAI WebRTC eliminates backend audio relay. OpenAI handles VAD server-side. Opus is native WebRTC codec (zero transformation).
 
 ### 12.2 Key Files
 
@@ -1108,8 +1049,6 @@ Browser
 | Types | `frontend/src/lib/types.ts` |
 | API Client | `frontend/src/lib/api.ts` |
 | Voice Session Hook | `frontend/src/hooks/use-voice-session.ts` |
-| Microphone Hook | `frontend/src/hooks/use-microphone.ts` |
-| VAD Hook | `frontend/src/hooks/use-vad.ts` |
 | Debug Channel Hook | `frontend/src/hooks/use-debug-channel.ts` |
 | Voice Session UI | `frontend/src/components/voice/voice-session.tsx` |
 | Mic Animation | `frontend/src/components/voice/mic-animation.tsx` |
@@ -1120,32 +1059,24 @@ Browser
 
 ### 12.3 Hooks
 
-**`useVoiceSession`** — Full WebRTC lifecycle manager.
-- Calls `POST /calls` to create session → `POST /calls/{id}/offer` for SDP exchange → ICE handling
-- Creates two DataChannels client-side: `"control"` (VAD signals + transcriptions) and `"debug"` (telemetry)
-- Monitors `connectionstatechange` (connected/failed/disconnected)
-- Returns: `status`, `callId`, `startSession`, `endSession`, `peerConnection`, `sendControl`, `onControlMessage`, `onDebugMessage`, `error`
+**`useVoiceSession`** — Full WebRTC lifecycle manager with direct OpenAI connection.
+- Calls `POST /calls` to create session → `POST /calls/{id}/offer` for SDP proxy exchange
+- Creates RTCPeerConnection, captures microphone, creates `"oai-events"` data channel
+- Translates OpenAI events to internal format: `conversation.item.input_audio_transcription.completed` → human transcription, `response.audio_transcript.done` → agent transcription
+- Filters `response.audio.delta` from debug handler (high-frequency)
+- Uses local variable for cleanup (avoids stale closure bug) + `beforeunload` beacon
+- Returns: `status`, `callId`, `startSession`, `endSession`, `onControlMessage`, `onDebugMessage`, `error`
 
-**`useMicrophone`** — getUserMedia with echo cancellation, noise suppression, auto gain control.
-- Returns: `status` (`idle`/`requesting`/`active`/`denied`/`error`), `stream`, `startMicrophone`, `stopMicrophone`, `attachToConnection`
-- Handles `NotAllowedError` for mic denial fallback UX
-
-**`useVAD`** — Client-side Voice Activity Detection via Silero WASM.
-- Dynamic import of `@ricky0123/vad-web` to avoid SSR issues
-- Uses `MicVAD.new({ getStream: () => Promise.resolve(stream) })` to attach to existing mic stream
-- Parameters: `positiveSpeechThreshold: 0.8`, `negativeSpeechThreshold: 0.4`, `minSpeechMs: 100`, `preSpeechPadMs: 30`, `redemptionMs: 250`
-- Sends `speech_started` / `speech_ended` messages on control DataChannel with timestamps
-
-**`useDebugChannel`** — Parses debug DataChannel events into typed state.
+**`useDebugChannel`** — Parses debug events into typed state.
 - Maintains: `turns` (DebugTurn[]), `fsmState`, `routing` (DebugRouting), `events` (DebugEvent[]), `latencies` (DebugLatency[])
 - Limits events array to 100 entries
 
 ### 12.4 Components
 
-**`VoiceSession`** — Main orchestrator component. Wires all hooks together.
+**`VoiceSession`** — Main orchestrator component. Wires hooks together.
 - Lazy-loads `DebugPanel` via `next/dynamic` (no debug overhead when disabled)
-- Debug toggle sends `debug_enable` / `debug_disable` on control channel
-- Shows: connection status badge, mic denied fallback, start/end call buttons, mic/speaker animations, transcription panel
+- Uses OpenAI events for speaking indicators (`speech_started/stopped`, `response.audio.delta/done`)
+- Shows: connection status badge, start/end call buttons, mic/speaker animations, transcription panel
 
 **`MicAnimation`** — Green pulsing circle with mic icon when user is speaking.
 
@@ -1160,31 +1091,24 @@ Browser
 ```
 1. User clicks "Start Call"
    → useVoiceSession.startSession()
-   → POST /calls → POST /calls/{id}/offer (SDP exchange)
-   → RTCPeerConnection established
+   → POST /calls → POST /calls/{id}/offer (SDP proxy to OpenAI)
+   → RTCPeerConnection established directly with OpenAI
+   → getUserMedia → microphone track added to connection
+   → Data channel "oai-events" created
 
-2. User clicks "Allow" on mic permission
-   → useMicrophone.startMicrophone()
-   → getUserMedia → MediaStream
-   → attachToConnection(pc) adds audio track to WebRTC
+2. Audio flows continuously via WebRTC (Opus, UDP) directly to OpenAI
+   → OpenAI handles STT, VAD, and response generation
 
-3. Audio flows continuously via WebRTC (Opus, UDP)
-   → Backend receives via aiortc
-   → RealtimeVoiceBridge forwards to RealtimeVoiceProvider (STT)
+3. OpenAI events arrive on "oai-events" data channel
+   → conversation.item.input_audio_transcription.completed → human transcription
+   → response.audio_transcript.done → agent transcription
+   → input_audio_buffer.speech_started/stopped → speaking indicators
+   → response.audio.delta/done → agent speaking indicators
 
-4. User speaks
-   → useVAD detects speech_started → sends on control channel
-   → Backend Coordinator receives speech_started event
-   → User stops → VAD detects speech_ended → sends on control channel
-   → Backend processes turn (classify, route, generate response)
-
-5. Transcriptions arrive on control channel
-   → onControlMessage callback → TranscriptionPanel updates
-
-6. Agent response audio streams back via WebRTC
+4. Agent response audio streams back via WebRTC directly from OpenAI
    → Browser plays through speaker (remote audio track)
 
-7. Debug events arrive on debug channel (when enabled)
+5. Non-audio events forwarded to debug handler (when enabled)
    → useDebugChannel parses → DebugPanel updates
 ```
 

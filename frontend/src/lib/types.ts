@@ -8,19 +8,13 @@ export type ConnectionStatus =
   | "disconnected"
   | "failed";
 
-/** A transcription message received from the backend. */
+/** A transcription message received via the data channel. */
 export interface TranscriptionMessage {
   type: "transcription";
   text: string;
   is_final: boolean;
+  speaker?: "human" | "agent";
 }
-
-/** Control channel message sent from browser to backend. */
-export type ControlOutMessage =
-  | { type: "speech_started"; ts: number }
-  | { type: "speech_ended"; ts: number }
-  | { type: "debug_enable" }
-  | { type: "debug_disable" };
 
 /** Control channel message received from backend. */
 export type ControlInMessage = TranscriptionMessage;

@@ -41,12 +41,6 @@ export const api = {
         body: JSON.stringify({ sdp, type: "offer" }),
       }),
 
-    ice: (callId: string, candidate: string, sdpMid?: string | null) =>
-      apiFetch<void>(`/api/v1/calls/${callId}/ice`, {
-        method: "POST",
-        body: JSON.stringify({ candidate, sdpMid }),
-      }),
-
     end: (callId: string) =>
       apiFetch<void>(`/api/v1/calls/${callId}`, { method: "DELETE" }),
   },
