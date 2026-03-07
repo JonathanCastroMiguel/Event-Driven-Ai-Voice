@@ -232,4 +232,6 @@ EVENT_TYPE_MAP: dict[str, type[msgspec.Struct]] = {
     "tool_result": ToolResult,
     "realtime_voice_start": RealtimeVoiceStart,
     "realtime_voice_cancel": RealtimeVoiceCancel,
+    "audio_committed": EventEnvelope,
+    "model_router_action": EventEnvelope,
 }

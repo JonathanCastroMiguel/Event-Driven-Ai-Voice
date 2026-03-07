@@ -27,6 +27,7 @@ class TurnManager:
         self._seq = 0
         self._current_turn_id: UUID | None = None
         self._current_state: TurnState | None = None
+        self._current_transcript: str | None = None
         self._pending_events: list[HumanTurnStarted | HumanTurnFinalized | HumanTurnCancelled] = []
 
     @property
@@ -70,10 +71,14 @@ class TurnManager:
             seq=self._seq,
         )
 
-    def handle_transcript_final(self, text: str, ts: int) -> None:
-        """Handle transcript_final event. Finalizes the current open turn."""
+    def handle_audio_committed(self, ts: int) -> None:
+        """Handle audio_committed event. Finalizes the current open turn.
+
+        This is the primary turn-closing signal in the model-as-router architecture.
+        The committed event fires when server VAD confirms the user has stopped speaking.
+        """
         if self._current_turn_id is None or self._current_state != TurnState.OPEN:
-            logger.warning("transcript_final_without_open_turn")
+            logger.warning("audio_committed_without_open_turn")
             return
 
         self._current_state = TurnState.FINALIZED
@@ -81,17 +86,36 @@ class TurnManager:
             HumanTurnFinalized(
                 call_id=self._call_id,
                 turn_id=self._current_turn_id,
-                text=text,
+                text="",  # Text arrives asynchronously via transcript_final
                 ts=ts,
             )
         )
         logger.info(
-            "turn_finalized",
+            "turn_finalized_via_committed",
+            turn_id=str(self._current_turn_id),
+            seq=self._seq,
+        )
+
+    def handle_transcript_final(self, text: str, ts: int) -> None:
+        """Handle transcript_final event. Stores transcript for logging only.
+
+        In the model-as-router architecture, transcript_final does NOT finalize
+        turns — that's done by audio_committed. The transcript is stored for
+        persistence, conversation buffer, and debug display.
+        """
+        self._current_transcript = text
+        logger.info(
+            "transcript_stored",
             turn_id=str(self._current_turn_id),
             seq=self._seq,
             text_len=len(text),
             text=text,
         )
+
+    @property
+    def current_transcript(self) -> str | None:
+        """The most recent transcript text (stored for logging, not turn finalization)."""
+        return self._current_transcript
 
     def handle_no_transcript_timeout(self, ts: int) -> None:
         """Handle timeout when no transcript_final arrives after speech_started."""

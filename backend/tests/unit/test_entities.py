@@ -103,9 +103,9 @@ class TestAgentGeneration:
             call_id=uuid4(),
             turn_id=uuid4(),
             created_at=1000,
-            state=AgentState.THINKING,
+            state=AgentState.ROUTING,
         )
-        assert gen.state == AgentState.THINKING
+        assert gen.state == AgentState.ROUTING
         assert gen.route_a_label is None
         assert gen.final_outcome is None
 
@@ -130,7 +130,7 @@ class TestAgentGeneration:
             call_id=uuid4(),
             turn_id=uuid4(),
             created_at=1000,
-            state=AgentState.THINKING,
+            state=AgentState.ROUTING,
         )
         try:
             gen.state = AgentState.DONE  # type: ignore[misc]

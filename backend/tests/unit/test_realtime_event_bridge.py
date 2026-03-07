@@ -90,13 +90,26 @@ class TestInputEventTranslation:
 
         callback.assert_not_awaited()
 
-    async def test_voice_generation_completed(self, bridge, call_id):
+    async def test_audio_committed(self, bridge, call_id):
+        received = []
+        callback = AsyncMock(side_effect=lambda e: received.append(e))
+        bridge.on_event(callback)
+
+        await bridge._translate_event({"type": "input_audio_buffer.committed"})
+
+        assert len(received) == 1
+        assert received[0].type == "audio_committed"
+        assert received[0].call_id == call_id
+        assert received[0].source.value == "realtime"
+
+    async def test_voice_generation_completed_direct_voice(self, bridge, call_id):
         received = []
         callback = AsyncMock(side_effect=lambda e: received.append(e))
         bridge.on_event(callback)
 
         voice_id = uuid4()
         bridge._active_voice_generation_id = voice_id
+        bridge._response_transcript_buffer = "Buenos días, ¿en qué puedo ayudarle?"
 
         await bridge._translate_event({"type": "response.done"})
 
@@ -104,6 +117,7 @@ class TestInputEventTranslation:
         assert received[0].type == "voice_generation_completed"
         assert received[0].payload["voice_generation_id"] == str(voice_id)
         assert bridge._active_voice_generation_id is None
+        assert bridge._response_transcript_buffer == ""
 
     async def test_voice_generation_completed_no_active_id(self, bridge):
         callback = AsyncMock()
@@ -292,3 +306,101 @@ class TestFrontendWebSocketLifecycle:
         """Calling close() without WebSocket should not raise."""
         await bridge.close()
         assert bridge._closed is True
+
+
+# ---------------------------------------------------------------------------
+# Transcript accumulation and JSON action detection
+# ---------------------------------------------------------------------------
+
+
+class TestTranscriptBufferAndJsonDetection:
+    async def test_transcript_delta_accumulation(self, bridge):
+        """response.audio_transcript.delta events accumulate in buffer."""
+        await bridge._translate_event({"type": "response.audio_transcript.delta", "delta": "Buenos "})
+        assert bridge._response_transcript_buffer == "Buenos "
+
+        await bridge._translate_event({"type": "response.audio_transcript.delta", "delta": "días"})
+        assert bridge._response_transcript_buffer == "Buenos días"
+
+    async def test_buffer_reset_on_response_created(self, bridge):
+        """response.created resets the transcript buffer."""
+        bridge._response_transcript_buffer = "leftover text"
+        await bridge._translate_event({"type": "response.created"})
+        assert bridge._response_transcript_buffer == ""
+
+    async def test_json_action_detected_on_response_done(self, bridge, call_id):
+        """Valid JSON action in transcript emits model_router_action instead of voice_generation_completed."""
+        received = []
+        callback = AsyncMock(side_effect=lambda e: received.append(e))
+        bridge.on_event(callback)
+
+        voice_id = uuid4()
+        bridge._active_voice_generation_id = voice_id
+        bridge._response_transcript_buffer = '{"action": "specialist", "department": "billing", "summary": "billing issue"}'
+
+        await bridge._translate_event({"type": "response.done"})
+
+        assert len(received) == 1
+        assert received[0].type == "model_router_action"
+        assert received[0].payload["department"] == "billing"
+        assert received[0].payload["summary"] == "billing issue"
+        assert bridge._active_voice_generation_id is None
+
+    async def test_malformed_json_falls_through_to_voice_completed(self, bridge, call_id):
+        """Malformed JSON in transcript treats response as direct voice."""
+        received = []
+        callback = AsyncMock(side_effect=lambda e: received.append(e))
+        bridge.on_event(callback)
+
+        voice_id = uuid4()
+        bridge._active_voice_generation_id = voice_id
+        bridge._response_transcript_buffer = '{"action": "specialist", "department": '
+
+        await bridge._translate_event({"type": "response.done"})
+
+        assert len(received) == 1
+        assert received[0].type == "voice_generation_completed"
+
+    async def test_unknown_department_falls_through(self, bridge, call_id):
+        """Unknown department in JSON falls through to voice_generation_completed."""
+        received = []
+        callback = AsyncMock(side_effect=lambda e: received.append(e))
+        bridge.on_event(callback)
+
+        voice_id = uuid4()
+        bridge._active_voice_generation_id = voice_id
+        bridge._response_transcript_buffer = '{"action": "specialist", "department": "unknown", "summary": "test"}'
+
+        await bridge._translate_event({"type": "response.done"})
+
+        assert len(received) == 1
+        assert received[0].type == "voice_generation_completed"
+
+    async def test_full_delta_accumulation_then_action(self, bridge, call_id):
+        """Full flow: deltas accumulate, then response.done detects JSON action."""
+        received = []
+        callback = AsyncMock(side_effect=lambda e: received.append(e))
+        bridge.on_event(callback)
+
+        bridge._active_voice_generation_id = uuid4()
+
+        # Simulate deltas arriving
+        await bridge._translate_event({"type": "response.created"})
+        await bridge._translate_event({"type": "response.audio_transcript.delta", "delta": '{"action": "'})
+        await bridge._translate_event({"type": "response.audio_transcript.delta", "delta": 'specialist", "department": "sales", '})
+        await bridge._translate_event({"type": "response.audio_transcript.delta", "delta": '"summary": "wants upgrade"}'})
+        await bridge._translate_event({"type": "response.done"})
+
+        assert len(received) == 1
+        assert received[0].type == "model_router_action"
+        assert received[0].payload["department"] == "sales"
+
+    async def test_buffer_cleared_after_response_done(self, bridge):
+        """Buffer is cleared after response.done regardless of content."""
+        bridge._active_voice_generation_id = uuid4()
+        bridge._response_transcript_buffer = "some text"
+        callback = AsyncMock()
+        bridge.on_event(callback)
+
+        await bridge._translate_event({"type": "response.done"})
+        assert bridge._response_transcript_buffer == ""

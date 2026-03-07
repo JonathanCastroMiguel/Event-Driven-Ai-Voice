@@ -110,6 +110,8 @@ class TestEventTypeMap:
             "tool_result",
             "realtime_voice_start",
             "realtime_voice_cancel",
+            "audio_committed",
+            "model_router_action",
         }
         assert set(EVENT_TYPE_MAP.keys()) == expected_types
 

@@ -19,6 +19,7 @@ from uuid import UUID, uuid4
 import orjson
 import structlog
 
+from src.routing.model_router import parse_model_action
 from src.voice_runtime.events import (
     EventEnvelope,
     RealtimeVoiceCancel,
@@ -47,6 +48,7 @@ class OpenAIRealtimeEventBridge:
         self._frontend_ws: Any | None = None  # FastAPI WebSocket
         self._closed = False
         self._active_voice_generation_id: UUID | None = None
+        self._response_transcript_buffer: str = ""
 
     # ------------------------------------------------------------------
     # RealtimeClient protocol: on_event
@@ -206,6 +208,23 @@ class OpenAIRealtimeEventBridge:
                 source=EventSource.REALTIME,
             )
 
+        elif event_type == "input_audio_buffer.committed":
+            envelope = EventEnvelope(
+                event_id=uuid4(),
+                call_id=self._call_id,
+                ts=_now_ms(),
+                type="audio_committed",
+                payload={},
+                source=EventSource.REALTIME,
+            )
+
+        elif event_type == "response.created":
+            self._response_transcript_buffer = ""
+
+        elif event_type == "response.audio_transcript.delta":
+            delta = str(data.get("delta", ""))
+            self._response_transcript_buffer += delta
+
         elif event_type == "conversation.item.input_audio_transcription.completed":
             transcript = str(data.get("transcript", "")).strip()
             if not transcript:
@@ -221,7 +240,24 @@ class OpenAIRealtimeEventBridge:
 
         elif event_type == "response.done":
             voice_id = self._active_voice_generation_id
-            if voice_id is not None:
+            transcript = self._response_transcript_buffer
+            self._response_transcript_buffer = ""
+
+            action = parse_model_action(transcript) if transcript else None
+            if action is not None:
+                envelope = EventEnvelope(
+                    event_id=uuid4(),
+                    call_id=self._call_id,
+                    ts=_now_ms(),
+                    type="model_router_action",
+                    payload={
+                        "department": action.department.value,
+                        "summary": action.summary,
+                    },
+                    source=EventSource.REALTIME,
+                )
+                self._active_voice_generation_id = None
+            elif voice_id is not None:
                 envelope = EventEnvelope(
                     event_id=uuid4(),
                     call_id=self._call_id,

@@ -19,8 +19,8 @@ from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 from src.config import settings
+from src.routing.model_router import RouterPromptBuilder
 from src.routing.policies import PoliciesRegistry
-from src.routing.router import Router
 from src.voice_runtime.agent_fsm import AgentFSM
 from src.voice_runtime.coordinator import Coordinator
 from src.voice_runtime.events import (
@@ -41,17 +41,17 @@ router = APIRouter(prefix="/calls", tags=["calls"])
 # Shared singletons (set at app startup)
 # ---------------------------------------------------------------------------
 
-_shared_router: Router | None = None
+_shared_router_prompt_builder: RouterPromptBuilder | None = None
 _shared_policies: PoliciesRegistry | None = None
 
 
-def set_shared_router_and_policies(
-    router_instance: Router,
+def set_shared_dependencies(
+    router_prompt_builder: RouterPromptBuilder,
     policies_instance: PoliciesRegistry,
 ) -> None:
-    """Set shared Router and PoliciesRegistry singletons (called at app startup)."""
-    global _shared_router, _shared_policies  # noqa: PLW0603
-    _shared_router = router_instance
+    """Set shared RouterPromptBuilder and PoliciesRegistry singletons (called at app startup)."""
+    global _shared_router_prompt_builder, _shared_policies  # noqa: PLW0603
+    _shared_router_prompt_builder = router_prompt_builder
     _shared_policies = policies_instance
 
 
@@ -137,13 +137,10 @@ async def create_call() -> CreateCallResponse:
         turn_manager=turn_manager,
         agent_fsm=agent_fsm,
         tool_executor=tool_executor,
-        router=_shared_router,
+        router_prompt_builder=_shared_router_prompt_builder,
         policies=policies,
         max_history_turns=settings.max_history_turns,
         max_history_chars=settings.max_history_chars,
-        routing_context_window=settings.routing_context_window,
-        routing_short_text_chars=settings.routing_short_text_chars,
-        llm_context_window=settings.llm_context_window,
     )
 
     bridge = OpenAIRealtimeEventBridge(call_id=call_id)
@@ -308,6 +305,7 @@ async def events_ws(websocket: WebSocket, call_id: UUID) -> None:
             "turn_detection": {
                 "type": "server_vad",
                 "create_response": False,
+                "silence_duration_ms": settings.vad_silence_duration_ms,
             },
         },
     }

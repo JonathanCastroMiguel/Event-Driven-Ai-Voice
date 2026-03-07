@@ -21,9 +21,9 @@ class PolicyKey(str, Enum):
 
 class AgentState(str, Enum):
     IDLE = "idle"
-    THINKING = "thinking"
+    ROUTING = "routing"
+    SPEAKING = "speaking"
     WAITING_TOOLS = "waiting_tools"
-    WAITING_VOICE = "waiting_voice"
     DONE = "done"
     CANCELLED = "cancelled"
     ERROR = "error"

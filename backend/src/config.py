@@ -42,6 +42,9 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_realtime_model: str = "gpt-4o-realtime-preview"
 
+    # Server VAD
+    vad_silence_duration_ms: int = 300
+
     # Calls
     max_concurrent_calls: int = 50
 

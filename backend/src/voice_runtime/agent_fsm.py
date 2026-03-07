@@ -1,37 +1,32 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from uuid import UUID
 
 import structlog
 
-from src.voice_runtime.events import (
-    AgentStateChanged,
-    RequestAgentAction,
-    RequestGuidedResponse,
-)
-from src.voice_runtime.types import AgentState, PolicyKey, RouteALabel, RouteBLabel
+from src.voice_runtime.events import AgentStateChanged
+from src.voice_runtime.types import AgentState
 
 logger = structlog.get_logger()
 
 # Valid state transitions: from_state -> {event -> to_state}
 TRANSITIONS: dict[AgentState, dict[str, AgentState]] = {
     AgentState.IDLE: {
-        "handle_turn": AgentState.THINKING,
+        "start_routing": AgentState.ROUTING,
     },
-    AgentState.THINKING: {
-        "classification_done": AgentState.DONE,
-        "needs_tools": AgentState.WAITING_TOOLS,
+    AgentState.ROUTING: {
+        "voice_started": AgentState.SPEAKING,
+        "specialist_action": AgentState.WAITING_TOOLS,
         "cancel": AgentState.CANCELLED,
         "error": AgentState.ERROR,
     },
     AgentState.WAITING_TOOLS: {
-        "tools_done": AgentState.WAITING_VOICE,
+        "tool_result": AgentState.SPEAKING,
         "cancel": AgentState.CANCELLED,
         "error": AgentState.ERROR,
     },
-    AgentState.WAITING_VOICE: {
-        "voice_done": AgentState.DONE,
+    AgentState.SPEAKING: {
+        "voice_completed": AgentState.DONE,
         "cancel": AgentState.CANCELLED,
         "error": AgentState.ERROR,
     },
@@ -40,27 +35,13 @@ TRANSITIONS: dict[AgentState, dict[str, AgentState]] = {
     AgentState.ERROR: {},
 }
 
-# Route A label -> PolicyKey mapping for guided responses
-ROUTE_A_POLICY_MAP: dict[RouteALabel, PolicyKey] = {
-    RouteALabel.SIMPLE: PolicyKey.GREETING,
-    RouteALabel.DISALLOWED: PolicyKey.GUARDRAIL_DISALLOWED,
-    RouteALabel.OUT_OF_SCOPE: PolicyKey.GUARDRAIL_OUT_OF_SCOPE,
-}
-
-
-@dataclass
-class AgentFSMOutput:
-    state_changes: list[AgentStateChanged] = field(default_factory=list)
-    guided_responses: list[RequestGuidedResponse] = field(default_factory=list)
-    agent_actions: list[RequestAgentAction] = field(default_factory=list)
-
 
 class AgentFSM:
     """Finite state machine for agent generation lifecycle.
 
-    Classifies user intent via the routing engine and emits
-    routing events to the Coordinator. Does NOT execute tools
-    or call the Realtime API directly.
+    Tracks the lifecycle of the model's response: routing → speaking (direct)
+    or routing → waiting_tools → speaking (specialist). Does NOT perform
+    classification or execute tools directly.
     """
 
     def __init__(self, call_id: UUID) -> None:
@@ -103,75 +84,26 @@ class AgentFSM:
             ts=ts,
         )
 
-    def handle_turn(
-        self,
-        agent_generation_id: UUID,
-        route_a_label: RouteALabel,
-        route_a_confidence: float,
-        route_b_label: RouteBLabel | None,
-        user_text: str,
-        ts: int,
-    ) -> AgentFSMOutput:
-        """Process a turn classification result and emit appropriate events."""
+    def start_routing(self, agent_generation_id: UUID, ts: int) -> AgentStateChanged | None:
+        """Begin routing for a new agent generation. idle → routing."""
         self._current_generation_id = agent_generation_id
-        output = AgentFSMOutput()
+        return self.transition("start_routing", ts)
 
-        # Transition to THINKING
-        state_change = self.transition("handle_turn", ts)
-        if state_change:
-            output.state_changes.append(state_change)
+    def voice_started(self, ts: int) -> AgentStateChanged | None:
+        """Model started speaking directly. routing → speaking."""
+        return self.transition("voice_started", ts)
 
-        # Route A: simple, disallowed, out_of_scope -> guided response
-        if route_a_label in ROUTE_A_POLICY_MAP:
-            policy_key = ROUTE_A_POLICY_MAP[route_a_label]
-            output.guided_responses.append(
-                RequestGuidedResponse(
-                    call_id=self._call_id,
-                    agent_generation_id=agent_generation_id,
-                    policy_key=policy_key.value,
-                    user_text=user_text,
-                    ts=ts,
-                )
-            )
-            done_change = self.transition("classification_done", ts)
-            if done_change:
-                output.state_changes.append(done_change)
-            return output
+    def specialist_action(self, ts: int) -> AgentStateChanged | None:
+        """Model returned a JSON action for specialist routing. routing → waiting_tools."""
+        return self.transition("specialist_action", ts)
 
-        # Route A: domain -> Route B
-        if route_a_label == RouteALabel.DOMAIN:
-            if route_b_label is None:
-                # Ambiguous -> clarify
-                output.guided_responses.append(
-                    RequestGuidedResponse(
-                        call_id=self._call_id,
-                        agent_generation_id=agent_generation_id,
-                        policy_key=PolicyKey.CLARIFY_DEPARTMENT.value,
-                        user_text=user_text,
-                        ts=ts,
-                    )
-                )
-            else:
-                # Clear specialist
-                output.agent_actions.append(
-                    RequestAgentAction(
-                        call_id=self._call_id,
-                        agent_generation_id=agent_generation_id,
-                        specialist=route_b_label.value,
-                        user_text=user_text,
-                        ts=ts,
-                    )
-                )
-            done_change = self.transition("classification_done", ts)
-            if done_change:
-                output.state_changes.append(done_change)
-            return output
+    def tool_result(self, ts: int) -> AgentStateChanged | None:
+        """Specialist tool completed. waiting_tools → speaking."""
+        return self.transition("tool_result", ts)
 
-        # Fallback (shouldn't happen with valid RouteALabel enum)
-        done_change = self.transition("classification_done", ts)
-        if done_change:
-            output.state_changes.append(done_change)
-        return output
+    def voice_completed(self, ts: int) -> AgentStateChanged | None:
+        """Voice generation finished. speaking → done."""
+        return self.transition("voice_completed", ts)
 
     def cancel(self, ts: int) -> AgentStateChanged | None:
         """Cancel the current generation if in an active state."""
