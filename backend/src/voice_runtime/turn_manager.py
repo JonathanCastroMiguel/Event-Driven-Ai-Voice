@@ -90,6 +90,7 @@ class TurnManager:
             turn_id=str(self._current_turn_id),
             seq=self._seq,
             text_len=len(text),
+            text=text,
         )
 
     def handle_no_transcript_timeout(self, ts: int) -> None:

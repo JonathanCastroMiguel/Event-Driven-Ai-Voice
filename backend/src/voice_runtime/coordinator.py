@@ -65,7 +65,7 @@ class Coordinator:
         turn_manager: TurnManager,
         agent_fsm: AgentFSM,
         tool_executor: ToolExecutor,
-        router: Router,
+        router: Router | None,
         policies: PoliciesRegistry,
         seen_events: TTLSet | None = None,
         tool_cache: TTLMap | None = None,
@@ -104,10 +104,24 @@ class Coordinator:
             RealtimeVoiceStart | RealtimeVoiceCancel | CancelAgentGeneration
         ] = []
         self._debug_callback: Callable[[dict[str, Any]], Coroutine[Any, Any, None]] | None = None
+        self._output_callback: Callable[
+            [RealtimeVoiceStart | RealtimeVoiceCancel | CancelAgentGeneration],
+            Coroutine[Any, Any, None],
+        ] | None = None
 
     @property
     def state(self) -> CoordinatorRuntimeState:
         return self._state
+
+    def set_output_callback(
+        self,
+        callback: Callable[
+            [RealtimeVoiceStart | RealtimeVoiceCancel | CancelAgentGeneration],
+            Coroutine[Any, Any, None],
+        ] | None,
+    ) -> None:
+        """Register callback for output events (voice start/cancel)."""
+        self._output_callback = callback
 
     def drain_output_events(
         self,
@@ -115,6 +129,22 @@ class Coordinator:
         events = self._output_events
         self._output_events = []
         return events
+
+    async def _emit_output(
+        self,
+        event: RealtimeVoiceStart | RealtimeVoiceCancel | CancelAgentGeneration,
+    ) -> None:
+        """Append to output list and invoke callback if registered."""
+        self._output_events.append(event)
+        if self._output_callback is not None:
+            try:
+                await self._output_callback(event)
+            except Exception:
+                logger.exception(
+                    "output_callback_error",
+                    call_id=str(self._call_id),
+                    event_type=type(event).__name__,
+                )
 
     # ------------------------------------------------------------------
     # Debug event emission
@@ -170,6 +200,12 @@ class Coordinator:
 
     async def handle_event(self, envelope: EventEnvelope) -> None:
         """Main entry point: dispatch event by type."""
+        logger.info(
+            "coordinator_handle_event",
+            call_id=str(self._call_id),
+            event_type=envelope.type,
+            source=envelope.source.value,
+        )
         if await self._is_duplicate(envelope.event_id):
             logger.debug("duplicate_event_ignored", event_id=str(envelope.event_id))
             return
@@ -216,7 +252,7 @@ class Coordinator:
         voice_id = s.cancel_active_voice()
         if voice_id is not None:
             BARGE_IN_TOTAL.inc()
-            self._output_events.append(
+            await self._emit_output(
                 RealtimeVoiceCancel(
                     call_id=self._call_id,
                     voice_generation_id=voice_id,
@@ -228,7 +264,7 @@ class Coordinator:
         # Cancel active generation if any
         gen_id = s.cancel_active_generation()
         if gen_id is not None:
-            self._output_events.append(
+            await self._emit_output(
                 CancelAgentGeneration(
                     call_id=self._call_id,
                     agent_generation_id=gen_id,
@@ -508,7 +544,7 @@ class Coordinator:
         actual_gen_id = gen_id or uuid4()
 
         history = self._conversation_buffer.format_messages()
-        self._output_events.append(
+        await self._emit_output(
             RealtimeVoiceStart(
                 call_id=self._call_id,
                 agent_generation_id=actual_gen_id,
@@ -573,7 +609,7 @@ class Coordinator:
         if self._should_emit_filler():
             FILLER_EMITTED_TOTAL.inc()
             filler_voice_id = uuid4()
-            self._output_events.append(
+            await self._emit_output(
                 RealtimeVoiceStart(
                     call_id=self._call_id,
                     agent_generation_id=gen_id or uuid4(),
@@ -587,7 +623,7 @@ class Coordinator:
         voice_gen_id = uuid4()
         s.active_voice_generation_id = voice_gen_id
         actual_gen_id = gen_id or uuid4()
-        self._output_events.append(
+        await self._emit_output(
             RealtimeVoiceStart(
                 call_id=self._call_id,
                 agent_generation_id=actual_gen_id,
@@ -707,7 +743,7 @@ class Coordinator:
             await asyncio.sleep(1.2)  # 1200ms max
             if not self._state.is_voice_cancelled(voice_gen_id):
                 self._state.cancelled_voice_generations.add(voice_gen_id)
-                self._output_events.append(
+                await self._emit_output(
                     RealtimeVoiceCancel(
                         call_id=self._call_id,
                         voice_generation_id=voice_gen_id,

@@ -1,15 +1,4 @@
-## ADDED Requirements
-
-### Requirement: Session creation endpoint
-The system SHALL expose `POST /calls` that creates a new CallSession, assigns a `call_id` (UUID), and instantiates the full runtime actor stack: Coordinator, TurnManager, AgentFSM, ToolExecutor, Router, and RealtimeEventBridge. All actors SHALL be stored in the session registry for the call's lifetime.
-
-#### Scenario: Successful call creation
-- **WHEN** a client sends `POST /calls`
-- **THEN** the system SHALL create all runtime actors (Coordinator, TurnManager, AgentFSM, ToolExecutor, Router), store them in the session entry, and return HTTP 201 with `{"call_id": "<uuid>", "status": "created"}`
-
-#### Scenario: Call creation with active call limit exceeded
-- **WHEN** `POST /calls` is called and the maximum concurrent call limit is reached
-- **THEN** the system SHALL return HTTP 503 with `{"detail": "max_calls_exceeded"}`
+## MODIFIED Requirements
 
 ### Requirement: SDP offer/answer exchange
 The system SHALL expose `POST /calls/{call_id}/offer` that performs a two-step exchange with OpenAI: (1) `POST /v1/realtime/sessions` with session config (model, modalities, input_audio_transcription, turn_detection with create_response=false) to obtain an ephemeral key, (2) `POST /v1/realtime` with the ephemeral key and SDP offer to obtain the SDP answer. The server API key SHALL only be used for the sessions call — the ephemeral key is used for the SDP exchange.
@@ -31,16 +20,7 @@ The system SHALL expose `POST /calls/{call_id}/offer` that performs a two-step e
 - **WHEN** `POST /calls/{call_id}/offer` is called with an unknown `call_id`
 - **THEN** the system SHALL return HTTP 404
 
-### Requirement: Call termination
-The system SHALL expose `DELETE /calls/{call_id}` that tears down all runtime actors, closes the RealtimeEventBridge WebSocket, removes the call from the session registry, and returns HTTP 204.
-
-#### Scenario: Graceful call termination with actor cleanup
-- **WHEN** a client sends `DELETE /calls/{call_id}`
-- **THEN** the system SHALL close the RealtimeEventBridge, tear down all runtime actors, remove the call from the session registry, and return HTTP 204
-
-#### Scenario: Termination of non-existent call
-- **WHEN** a client sends `DELETE /calls/{call_id}` with an unknown `call_id`
-- **THEN** the system SHALL return HTTP 404
+## ADDED Requirements
 
 ### Requirement: WebSocket event forwarding endpoint
 The system SHALL expose `WS /calls/{call_id}/events` for bidirectional event forwarding between the browser and the Coordinator. Input direction: browser forwards OpenAI data channel events → Bridge → Coordinator. Output direction: Coordinator commands → Bridge → browser → OpenAI data channel.
