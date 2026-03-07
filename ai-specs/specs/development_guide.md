@@ -127,10 +127,10 @@ The runtime uses an **Event-Driven Actor Model** with four actors communicating 
 | `GET /metrics` | Prometheus metrics exposition |
 | `GET /api/v1/calls` | List recent call sessions (admin) |
 | `GET /api/v1/calls/{call_id}` | Call detail with turns and generations (admin) |
-| `POST /api/v1/calls` | Create WebRTC voice call session |
-| `POST /api/v1/calls/{call_id}/offer` | SDP offer/answer exchange |
-| `POST /api/v1/calls/{call_id}/ice` | Trickle ICE candidate |
-| `DELETE /api/v1/calls/{call_id}` | End call and clean up |
+| `POST /api/v1/calls` | Create voice call session with full runtime actor stack |
+| `POST /api/v1/calls/{call_id}/offer` | Two-step SDP exchange (sessions + ephemeral key + SDP) |
+| `WS /api/v1/calls/{call_id}/events` | Bidirectional event forwarding (browser ↔ Coordinator) |
+| `DELETE /api/v1/calls/{call_id}` | End call, tear down actors, close bridge |
 
 ### Observability
 

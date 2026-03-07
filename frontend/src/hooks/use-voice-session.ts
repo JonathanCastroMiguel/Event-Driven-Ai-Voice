@@ -5,6 +5,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import type { ConnectionStatus, ControlInMessage } from "@/lib/types";
 
+const WS_BASE =
+  (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000").replace(
+    /^http/,
+    "ws",
+  );
+
 interface UseVoiceSessionReturn {
   status: ConnectionStatus;
   callId: string | null;
@@ -22,6 +28,8 @@ export function useVoiceSession(): UseVoiceSessionReturn {
 
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const eventWsRef = useRef<WebSocket | null>(null);
+  const dcRef = useRef<RTCDataChannel | null>(null);
   const controlHandlerRef = useRef<((msg: ControlInMessage) => void) | null>(
     null,
   );
@@ -40,6 +48,11 @@ export function useVoiceSession(): UseVoiceSessionReturn {
       audioRef.current.srcObject = null;
       audioRef.current = null;
     }
+    if (eventWsRef.current) {
+      eventWsRef.current.close();
+      eventWsRef.current = null;
+    }
+    dcRef.current = null;
 
     if (id) {
       try {
@@ -76,11 +89,46 @@ export function useVoiceSession(): UseVoiceSessionReturn {
       setCallId(call_id);
       callIdRef.current = call_id;
 
-      // 2. Create RTCPeerConnection
+      // 2. Open event-forwarding WebSocket to backend
+      const eventWs = new WebSocket(
+        `${WS_BASE}/api/v1/calls/${call_id}/events`,
+      );
+      eventWsRef.current = eventWs;
+
+      // Buffer backend messages until data channel is open, then flush
+      const pendingMessages: string[] = [];
+      let dcReady = false;
+
+      const sendOrBuffer = (data: string) => {
+        const dc = dcRef.current;
+        if (dcReady && dc && dc.readyState === "open") {
+          dc.send(data);
+        } else {
+          pendingMessages.push(data);
+        }
+      };
+
+      const flushPending = () => {
+        dcReady = true;
+        const dc = dcRef.current;
+        if (dc && dc.readyState === "open") {
+          for (const msg of pendingMessages) {
+            dc.send(msg);
+          }
+        }
+        pendingMessages.length = 0;
+      };
+
+      // Handle commands from backend (Coordinator → OpenAI via data channel)
+      eventWs.addEventListener("message", (e: MessageEvent) => {
+        sendOrBuffer(e.data as string);
+      });
+
+      // 3. Create RTCPeerConnection
       const pc = new RTCPeerConnection();
       pcRef.current = pc;
 
-      // 3. Audio playback from OpenAI
+      // 4. Audio playback from OpenAI
       const audio = document.createElement("audio");
       audio.autoplay = true;
       audioRef.current = audio;
@@ -88,20 +136,35 @@ export function useVoiceSession(): UseVoiceSessionReturn {
         audio.srcObject = e.streams[0];
       };
 
-      // 4. Microphone
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // 5. Microphone
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
       pc.addTrack(stream.getTracks()[0]);
 
-      // 5. Data channel — wire listeners inline (not in useEffect)
+      // 6. Data channel — wire listeners inline (not in useEffect)
       const dc = pc.createDataChannel("oai-events");
+      dcRef.current = dc;
 
       dc.addEventListener("open", () => {
         setStatus("connected");
+        flushPending();
       });
 
       dc.addEventListener("message", (e: MessageEvent) => {
         try {
-          const event = JSON.parse(e.data) as Record<string, unknown>;
+          const raw = e.data as string;
+
+          // Forward ALL events to backend via WebSocket
+          if (eventWsRef.current?.readyState === WebSocket.OPEN) {
+            eventWsRef.current.send(raw);
+          }
+
+          const event = JSON.parse(raw) as Record<string, unknown>;
 
           // Forward to debug handler (filter high-frequency audio deltas)
           if (event.type !== "response.audio.delta") {
@@ -138,7 +201,7 @@ export function useVoiceSession(): UseVoiceSessionReturn {
         }
       });
 
-      // 6. Connection state
+      // 7. Connection state
       pc.onconnectionstatechange = () => {
         const state = pc.connectionState;
         if (state === "connected") {
@@ -151,7 +214,7 @@ export function useVoiceSession(): UseVoiceSessionReturn {
         }
       };
 
-      // 7. SDP exchange
+      // 8. SDP exchange
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
 

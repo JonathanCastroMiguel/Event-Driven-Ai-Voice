@@ -30,8 +30,8 @@ Detailed documentation of the Event-Driven Voice Runtime: actors, events, proces
   - [6.2 Session Registry](#62-session-registry)
   - [6.3 Persistence (Repositories)](#63-persistence-repositories)
   - [6.4 Realtime Client](#64-realtime-client)
-  - [6.5 OpenAI WebRTC SDP Proxy](#65-openai-webrtc-sdp-proxy)
-  - [6.6 WebRTC Signaling](#66-webrtc-signaling)
+  - [6.5 Realtime Event Bridge](#65-realtime-event-bridge)
+  - [6.6 OpenAI WebRTC SDP Proxy & Session Lifecycle](#66-openai-webrtc-sdp-proxy--session-lifecycle)
 - [7. Runtime State](#7-runtime-state)
 - [8. End-to-End Flows](#8-end-to-end-flows)
   - [8.1 Happy Path: Simple Greeting](#81-happy-path-simple-greeting)
@@ -62,21 +62,20 @@ The Voice AI Runtime is an event-driven system for real-time call center voice i
 ```
 Browser (WebRTC)
     ↕ Opus audio (direct to OpenAI via WebRTC)
-    ↕ Data channel "oai-events" (OpenAI events: transcription, VAD, audio)
+    ↕ Data channel "oai-events" (OpenAI events for UI: transcription, VAD, audio)
     ↕ HTTP (SDP signaling via backend proxy)
-Backend (SDP Proxy)
-    → POST /v1/realtime/calls (OpenAI Realtime WebRTC API)
-    ← SDP answer returned to browser
-
-Coordinator (CallSession) — NOT YET CONNECTED to voice flow
+Backend
+    → SDP Proxy: POST /v1/realtime/calls (OpenAI Realtime WebRTC API)
+    → RealtimeEventBridge: WSS /v1/realtime (server-side WebSocket to OpenAI)
+        ↕ OpenAI events ↔ Coordinator EventEnvelopes
+Coordinator (CallSession)
     ↔ TurnManager       (turn detection)
     ↔ Agent FSM          (intent classification)
     ↔ ToolExecutor       (tool execution)
+    ↔ RealtimeEventBridge (OpenAI Realtime API commands)
 ```
 
-> **Note:** The Coordinator, TurnManager, and AgentFSM exist but are currently disconnected
-> from the WebRTC voice flow. The backend only handles SDP signaling; all audio and events
-> flow directly between browser and OpenAI. Runtime integration is deferred to a future change.
+The browser receives OpenAI events via WebRTC data channel for UI display (transcriptions, speaking indicators). The backend receives the same events via a server-side WebSocket, translates them to EventEnvelopes, and feeds them to the Coordinator for routing, classification, and response control.
 
 The Coordinator is the **single orchestrator** — it receives all events, delegates to actors, manages cancellation, idempotency, and emits voice output commands.
 
@@ -94,6 +93,8 @@ The Coordinator is the **single orchestrator** — it receives all events, deleg
 | Event Bus | `backend/src/voice_runtime/bus.py` |
 | Router | `backend/src/routing/router.py` |
 | Policies | `backend/src/routing/policies.py` |
+| RealtimeEventBridge | `backend/src/voice_runtime/realtime_event_bridge.py` |
+| RealtimeClient Protocol | `backend/src/voice_runtime/realtime_client.py` |
 | WebRTC Signaling (SDP Proxy) | `backend/src/api/routes/calls.py` |
 | Config | `backend/src/config.py` |
 
@@ -532,9 +533,9 @@ Async HTTP client for 3rd-party LLM classification when embeddings are ambiguous
 
 **File**: `backend/src/routing/language.py`
 
-Uses Facebook's fasttext language identification model (`lid.176.ftz`).
+Uses the `langid` library for language identification (~0.02-0.04ms per call, 97 languages supported, pure Python with no NumPy dependency).
 
-- **Model loading**: Lazy-loaded on first call. Checks local path → env var → downloads via `huggingface_hub`
+- **`detect_language(text)`**: Returns ISO 639-1 language code (e.g., `"es"`, `"en"`)
 - **Supported languages**: `es`, `en`. Unsupported languages fall back to `es` (default)
 - **Error handling**: Returns default language on any exception
 
@@ -611,40 +612,76 @@ All repos use raw `asyncpg` for maximum performance. Tables are created via Alem
 - Supports error injection via `fail_voice_ids` set
 - Respects cancellation (cancelled IDs skip completion emission)
 
-### 6.5 OpenAI WebRTC SDP Proxy
+**`OpenAIRealtimeEventBridge`**: Production implementation (see Section 6.5).
+
+### 6.5 Realtime Event Bridge
+
+**File**: `backend/src/voice_runtime/realtime_event_bridge.py`
+
+`OpenAIRealtimeEventBridge` implements the `RealtimeClient` protocol and connects the Coordinator to the OpenAI Realtime API via **browser-forwarded events**. The browser receives OpenAI events on the WebRTC data channel (`oai-events`) and forwards them to the backend via a WebSocket (`WS /calls/{call_id}/events`). The bridge translates these to Coordinator EventEnvelopes (input direction) and translates Coordinator commands back to OpenAI API messages sent to the browser for forwarding to the data channel (output direction).
+
+**Architecture:**
+```
+Browser ←WebRTC→ OpenAI (audio + data channel "oai-events")
+Browser ←WebSocket→ Backend (event forwarding, both directions)
+```
+
+**Frontend WebSocket management:**
+- `set_frontend_ws(ws)`: Register or clear the frontend WebSocket connection
+- `handle_frontend_event(data)`: Process a raw OpenAI event forwarded from the frontend
+- `send_to_frontend(data)`: Send a JSON message to the frontend via WebSocket (public method, used by both the bridge internally and external callers like `calls.py` for session.update)
+- `close()`: Clean up bridge state
+
+**Input event translation (OpenAI → Coordinator):**
+
+| OpenAI Event | Coordinator EventEnvelope |
+|---|---|
+| `input_audio_buffer.speech_started` | `type="speech_started"` |
+| `input_audio_buffer.speech_stopped` | `type="speech_stopped"` |
+| `conversation.item.input_audio_transcription.completed` | `type="transcript_final"` (empty transcripts ignored) |
+| `response.done` | `type="voice_generation_completed"` (only if active voice ID exists) |
+| `response.failed` | `type="voice_generation_error"` |
+
+**Output event translation (Coordinator → OpenAI):**
+- `send_voice_start(RealtimeVoiceStart)` with message array → single `response.create` with `instructions` (combined system messages) and `input` (user message). No per-turn `session.update` — instructions are passed inline to avoid the ~500ms round-trip.
+- `send_voice_start(RealtimeVoiceStart)` with string prompt → `response.create` (filler/simple response)
+- `send_voice_cancel(RealtimeVoiceCancel)` → `response.cancel`
+
+### 6.6 OpenAI WebRTC SDP Proxy & Session Lifecycle
 
 **File**: `backend/src/api/routes/calls.py`
 
-The backend acts as a **pure SDP signaling proxy**. It does NOT process audio or manage WebRTC peer connections. The browser connects directly to OpenAI via WebRTC for audio and events.
+The backend acts as a **SDP signaling proxy**, **session lifecycle manager**, and **event forwarding hub**. It does NOT process audio or manage WebRTC peer connections. The browser connects directly to OpenAI via WebRTC for audio. Events flow through the backend via WebSocket for Coordinator integration.
 
-**SDP proxy flow:**
-1. Browser sends SDP offer to `POST /calls/{call_id}/offer`
-2. Backend forwards raw SDP to `POST https://api.openai.com/v1/realtime/calls?model={model}` with `Content-Type: application/sdp` and `Authorization: Bearer {api_key}`
-3. OpenAI returns SDP answer
-4. Backend returns SDP answer to browser
-5. Browser establishes direct WebRTC connection with OpenAI
+**Session lifecycle:**
+1. `POST /calls` creates a full runtime actor stack: Coordinator, TurnManager, AgentFSM, ToolExecutor, and RealtimeEventBridge. The bridge is wired to the Coordinator bidirectionally:
+   - Input: `bridge.on_event(coordinator.handle_event)` — OpenAI events reach the Coordinator
+   - Output: `coordinator.set_output_callback(fn)` — Coordinator commands (RealtimeVoiceStart, RealtimeVoiceCancel) are dispatched to `bridge.send_voice_start()` / `bridge.send_voice_cancel()`
+2. `POST /calls/{call_id}/offer` performs a **two-step SDP exchange** with OpenAI:
+   - Step 1: `POST /v1/realtime/sessions` with session config (model, modalities, `input_audio_transcription`, `turn_detection` with `create_response: false`) → returns an ephemeral key
+   - Step 2: `POST /v1/realtime` with the ephemeral key and SDP offer → returns the SDP answer
+   - The server API key is only used for the sessions call — the ephemeral key is used for the SDP exchange, so the API key is never exposed to the browser
+3. `WS /calls/{call_id}/events` establishes bidirectional event forwarding:
+   - On connection: sends a one-time `session.update` via the bridge to configure transcription (`whisper-1`) and disable auto-response (`create_response: false`). The `/v1/realtime/sessions` endpoint does NOT reliably apply these settings, so the explicit `session.update` is required.
+   - Receive loop: forwards browser-sent OpenAI data channel events to `bridge.handle_frontend_event()`
+   - On disconnect: clears the frontend WebSocket reference via `bridge.set_frontend_ws(None)`
+4. `DELETE /calls/{call_id}` closes the bridge and removes the session.
 
-**Why proxy instead of ephemeral keys:** Keeps OpenAI API key server-side. Also provides a future injection point for session configuration (system prompts, tools, routing instructions).
+**In-memory session registry**: `_sessions: dict[UUID, CallSessionEntry]` tracks active calls. Each `CallSessionEntry` holds: `coordinator`, `turn_manager`, `agent_fsm`, `tool_executor`, `bridge`.
 
-> **Note:** `RealtimeVoiceProvider` and `RealtimeVoiceBridge` have been removed. Audio and events
-> flow directly between browser and OpenAI. The Coordinator is not yet connected to the voice flow.
-
-### 6.6 WebRTC Signaling
-
-**File**: `backend/src/api/routes/calls.py`
-
-**In-memory session registry**: `_sessions: dict[UUID, CallSessionEntry]` tracks active calls. Each entry holds only `call_id`.
+**Shared singletons**: `Router` and `PoliciesRegistry` are set at app startup via `set_shared_router_and_policies()` (called in `main.py` lifespan). If not initialized, a stub `PoliciesRegistry` with default policies is used (logs `policies_not_initialized_using_stubs` warning).
 
 **Endpoints:**
 
 | Endpoint | Method | Purpose |
 |---|---|---|
-| `/api/v1/calls` | POST | Create call session, returns `call_id`. Enforces `max_concurrent_calls`. |
-| `/api/v1/calls/{call_id}/offer` | POST | Proxy SDP offer to OpenAI Realtime WebRTC API, return SDP answer |
-| `/api/v1/calls/{call_id}` | DELETE | End call, remove from session registry |
+| `/api/v1/calls` | POST | Create call session with full actor stack, returns `call_id`. Enforces `max_concurrent_calls`. |
+| `/api/v1/calls/{call_id}/offer` | POST | Two-step SDP exchange: create session with config → get ephemeral key → SDP exchange |
+| `/api/v1/calls/{call_id}/events` | WS | Bidirectional event forwarding between browser data channel and Coordinator |
+| `/api/v1/calls/{call_id}` | DELETE | End call, close bridge, tear down actors |
 
 **Configuration:**
-- `OPENAI_API_KEY`: Required for SDP proxy
+- `OPENAI_API_KEY`: Required for session creation (Step 1 of SDP exchange)
 - `OPENAI_REALTIME_MODEL`: Model to use (default: `gpt-4o-realtime-preview`)
 - `MAX_CONCURRENT_CALLS`: Session limit (default: 50)
 

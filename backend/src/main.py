@@ -70,6 +70,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.models_loaded = True
     logger.info("embedding_model_loaded_and_centroids_computed")
 
+    # 5b. Wire shared router and policies for call sessions
+    from src.api.routes.calls import set_shared_router_and_policies
+
+    set_shared_router_and_policies(router, policies)
+    logger.info("shared_router_and_policies_wired")
+
     # 6. Store repositories for coordinator usage
     from src.infrastructure.repositories import (
         PgAgentGenerationRepository,
