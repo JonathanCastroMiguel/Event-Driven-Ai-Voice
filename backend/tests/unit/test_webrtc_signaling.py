@@ -1,8 +1,8 @@
-"""Unit tests for WebRTC signaling endpoints (task 11.1)."""
+"""Unit tests for WebRTC signaling endpoints."""
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 from uuid import UUID, uuid4
 
 import pytest
@@ -38,7 +38,6 @@ class TestCreateCall:
         data = resp.json()
         assert "call_id" in data
         assert data["status"] == "created"
-        # Validate UUID format
         UUID(data["call_id"])
 
     def test_returns_unique_ids(self, client: TestClient) -> None:
@@ -55,8 +54,6 @@ class TestCreateCall:
     @patch("src.api.routes.calls.settings")
     def test_max_concurrent_calls(self, mock_settings, client: TestClient) -> None:
         mock_settings.max_concurrent_calls = 2
-        mock_settings.stun_servers = "stun:stun.l.google.com:19302"
-        mock_settings.turn_servers = ""
 
         client.post("/api/v1/calls")
         client.post("/api/v1/calls")
@@ -66,7 +63,7 @@ class TestCreateCall:
 
 
 # ---------------------------------------------------------------------------
-# POST /api/v1/calls/{call_id}/offer — SDP exchange
+# POST /api/v1/calls/{call_id}/offer — SDP proxy
 # ---------------------------------------------------------------------------
 
 
@@ -85,31 +82,6 @@ class TestHandleOffer:
 
         resp = client.post(f"/api/v1/calls/{call_id}/offer", json={})
         assert resp.status_code == 422
-
-
-# ---------------------------------------------------------------------------
-# POST /api/v1/calls/{call_id}/ice — ICE candidates
-# ---------------------------------------------------------------------------
-
-
-class TestHandleICE:
-    def test_ice_without_session_returns_404(self, client: TestClient) -> None:
-        fake_id = str(uuid4())
-        resp = client.post(
-            f"/api/v1/calls/{fake_id}/ice",
-            json={"candidate": "candidate:1 1 udp 2122260223 10.0.0.1 1234 typ host"},
-        )
-        assert resp.status_code == 404
-
-    def test_ice_without_peer_connection_returns_400(self, client: TestClient) -> None:
-        create_resp = client.post("/api/v1/calls")
-        call_id = create_resp.json()["call_id"]
-
-        resp = client.post(
-            f"/api/v1/calls/{call_id}/ice",
-            json={"candidate": "candidate:1 1 udp 2122260223 10.0.0.1 1234 typ host"},
-        )
-        assert resp.status_code == 400
 
 
 # ---------------------------------------------------------------------------
@@ -150,8 +122,3 @@ class TestCallSessionEntry:
         call_id = uuid4()
         entry = CallSessionEntry(call_id)
         assert entry.call_id == call_id
-        assert entry.peer_connection is None
-        assert entry.coordinator is None
-        assert entry.bridge is None
-        assert entry.control_channel is None
-        assert entry.debug_channel is None

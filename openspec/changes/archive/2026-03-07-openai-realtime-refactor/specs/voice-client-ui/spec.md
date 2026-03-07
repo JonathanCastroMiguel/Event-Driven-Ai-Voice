@@ -1,4 +1,4 @@
-## ADDED Requirements
+## MODIFIED Requirements
 
 ### Requirement: WebRTC connection lifecycle
 The voice client SHALL manage a direct WebRTC connection to OpenAI: create a session via `POST /calls`, exchange SDP via `POST /calls/{call_id}/offer` (backend proxies to OpenAI), and create a data channel named `oai-events` for receiving OpenAI events.
@@ -18,25 +18,6 @@ The voice client SHALL manage a direct WebRTC connection to OpenAI: create a ses
 #### Scenario: Page unload during active call
 - **WHEN** the browser tab is closed while a call is active
 - **THEN** the client SHALL send a beacon request to `DELETE /calls/{call_id}` for best-effort cleanup
-
-### Requirement: Microphone capture and streaming
-The client SHALL capture audio from the user's microphone using the MediaDevices API and stream it via the WebRTC audio track using Opus codec.
-
-#### Scenario: Microphone permission granted
-- **WHEN** the user grants microphone access
-- **THEN** the client SHALL capture audio and add the media stream track to the RTCPeerConnection
-
-#### Scenario: Microphone permission denied
-- **WHEN** the user denies microphone access
-- **THEN** the client SHALL display a clear message explaining how to enable microphone access in browser settings
-- **AND** the "Start Call" button SHALL be disabled
-
-### Requirement: Audio playback
-The client SHALL play back agent audio received via the WebRTC audio track immediately as it arrives (streaming playback, not buffered).
-
-#### Scenario: Agent audio received
-- **WHEN** audio frames arrive on the remote WebRTC audio track
-- **THEN** the browser SHALL play them through the default audio output device immediately
 
 ### Requirement: OpenAI event translation
 The client SHALL receive events from the OpenAI data channel (`oai-events`) and translate them to internal transcription messages for display.
@@ -68,39 +49,6 @@ The client SHALL use OpenAI data channel events for speaking indicators instead 
 - **WHEN** the data channel receives a `response.audio.done` event
 - **THEN** the speaker animation SHALL deactivate
 
-### Requirement: Microphone input animation
-The client SHALL display a visual animation indicating when the user's microphone is capturing audio.
-
-#### Scenario: User speaking
-- **WHEN** OpenAI detects the user is speaking (via `input_audio_buffer.speech_started`)
-- **THEN** a microphone animation SHALL be visible indicating active input
-
-#### Scenario: User silent
-- **WHEN** OpenAI detects the user has stopped speaking (via `input_audio_buffer.speech_stopped`)
-- **THEN** the microphone animation SHALL return to idle state
-
-### Requirement: Speaker output animation
-The client SHALL display a visual animation indicating when the agent is producing audio output.
-
-#### Scenario: Agent speaking
-- **WHEN** audio is being played back from the remote WebRTC track
-- **THEN** a speaker animation SHALL be visible indicating active output
-
-#### Scenario: Agent silent
-- **WHEN** no audio is being played back
-- **THEN** the speaker animation SHALL return to idle state
-
-### Requirement: Real-time transcription display
-The client SHALL display transcriptions for both human (input) and agent (output).
-
-#### Scenario: Human transcription displayed
-- **WHEN** a transcription message with `is_final: true` and `speaker: "human"` arrives
-- **THEN** the text SHALL be displayed in the human transcription area
-
-#### Scenario: Agent transcription displayed
-- **WHEN** a transcription message with `is_final: true` and `speaker: "agent"` arrives
-- **THEN** the text SHALL be displayed in the agent transcription area
-
 ### Requirement: Debug event filtering
 The client SHALL forward OpenAI data channel events to the debug handler but SHALL filter out high-frequency `response.audio.delta` events to avoid flooding the debug panel.
 
@@ -112,9 +60,8 @@ The client SHALL forward OpenAI data channel events to the debug handler but SHA
 - **WHEN** the data channel receives a `response.audio.delta` event
 - **THEN** the event SHALL NOT be forwarded to the debug handler
 
-### Requirement: Visual design
-The voice client SHALL use a light mode design with neutral colors, minimal UI elements, and no visual elements that add rendering latency.
+## REMOVED Requirements
 
-#### Scenario: Light mode appearance
-- **WHEN** the voice client loads
-- **THEN** it SHALL render with a light background, neutral color palette, and minimal visual complexity
+### Requirement: Client-side VAD
+**Reason**: OpenAI handles voice activity detection server-side via `input_audio_buffer.speech_started/stopped` events. Client-side Silero VAD (ONNX model + WASM runtime) is no longer needed.
+**Migration**: Remove `@ricky0123/vad-web` dependency, delete ONNX model files (`silero_vad_*.onnx`) and WASM runtime assets (`ort-wasm-simd-threaded.*`), remove `use-vad.ts` and `use-microphone.ts` hooks.

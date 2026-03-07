@@ -40,13 +40,9 @@ class Settings(BaseSettings):
 
     # OpenAI Realtime
     openai_api_key: str = ""
-    openai_realtime_model: str = "gpt-4o-mini-realtime-preview"
+    openai_realtime_model: str = "gpt-4o-realtime-preview"
 
-    # WebRTC
-    stun_servers: str = "stun:stun.l.google.com:19302"
-    turn_servers: str = ""
-    turn_username: str = ""
-    turn_credential: str = ""
+    # Calls
     max_concurrent_calls: int = 50
 
     # Router registry

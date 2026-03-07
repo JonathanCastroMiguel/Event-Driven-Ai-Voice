@@ -1,12 +1,10 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { useDebugChannel } from "@/hooks/use-debug-channel";
-import { useMicrophone } from "@/hooks/use-microphone";
-import { useVAD } from "@/hooks/use-vad";
 import { useVoiceSession } from "@/hooks/use-voice-session";
 import type { TranscriptionEntry, TranscriptionMessage } from "@/lib/types";
 
@@ -29,26 +27,10 @@ export function VoiceSession() {
     callId,
     startSession,
     endSession,
-    peerConnection,
-    sendControl,
     onControlMessage,
     onDebugMessage,
     error,
   } = useVoiceSession();
-
-  const {
-    status: micStatus,
-    stream,
-    startMicrophone,
-    stopMicrophone,
-    attachToConnection,
-  } = useMicrophone();
-
-  const { isSpeaking } = useVAD({
-    stream,
-    sendControl,
-    enabled: status === "connected",
-  });
 
   const { state: debugState, handleDebugMessage } = useDebugChannel();
   const [debugEnabled, setDebugEnabled] = useState(false);
@@ -57,66 +39,65 @@ export function VoiceSession() {
     [],
   );
   const [isAgentSpeaking, setIsAgentSpeaking] = useState(false);
-  const partialRef = useRef<string>("");
+  const [isUserSpeaking, setIsUserSpeaking] = useState(false);
 
-  // Handle incoming control messages (transcriptions)
+  // Handle incoming transcription messages (translated from OpenAI events)
   const handleControlMessage = useCallback((msg: TranscriptionMessage) => {
-    if (msg.type === "transcription") {
-      if (msg.is_final) {
-        setTranscriptions((prev) => [
-          ...prev,
-          {
-            id: `${Date.now()}-agent`,
-            speaker: "agent",
-            text: msg.text,
-            timestamp: Date.now(),
-          },
-        ]);
-        partialRef.current = "";
-      } else {
-        partialRef.current = msg.text;
-      }
+    if (msg.type === "transcription" && msg.is_final) {
+      const speaker = msg.speaker ?? "agent";
+      setTranscriptions((prev) => [
+        ...prev,
+        {
+          id: `${Date.now()}-${speaker}`,
+          speaker,
+          text: msg.text,
+          timestamp: Date.now(),
+        },
+      ]);
     }
   }, []);
 
-  // Wire control and debug message handlers
+  // Handle OpenAI events for speaking indicators
+  const handleDebugForSpeaking = useCallback((event: unknown) => {
+    const e = event as Record<string, unknown>;
+    if (e.type === "input_audio_buffer.speech_started") {
+      setIsUserSpeaking(true);
+    } else if (e.type === "input_audio_buffer.speech_stopped") {
+      setIsUserSpeaking(false);
+    } else if (e.type === "response.audio.delta") {
+      setIsAgentSpeaking(true);
+    } else if (e.type === "response.audio.done") {
+      setIsAgentSpeaking(false);
+    }
+  }, []);
+
+  // Wire message handlers
   useEffect(() => {
     onControlMessage(handleControlMessage);
   }, [onControlMessage, handleControlMessage]);
 
   useEffect(() => {
-    onDebugMessage(handleDebugMessage);
-  }, [onDebugMessage, handleDebugMessage]);
+    onDebugMessage((event: unknown) => {
+      handleDebugMessage(event);
+      handleDebugForSpeaking(event);
+    });
+  }, [onDebugMessage, handleDebugMessage, handleDebugForSpeaking]);
 
   const handleStart = useCallback(async () => {
-    const audioStream = await startMicrophone();
-    if (!audioStream) return;
-
     await startSession();
-  }, [startMicrophone, startSession]);
-
-  // Attach microphone to peer connection once connected
-  useEffect(() => {
-    if (status === "connected" && peerConnection && stream) {
-      attachToConnection(peerConnection);
-    }
-  }, [status, peerConnection, stream, attachToConnection]);
+  }, [startSession]);
 
   const handleEnd = useCallback(async () => {
-    stopMicrophone();
     await endSession();
     setTranscriptions([]);
     setIsAgentSpeaking(false);
-  }, [stopMicrophone, endSession]);
+    setIsUserSpeaking(false);
+  }, [endSession]);
 
-  // Toggle debug mode — sends enable/disable on control DataChannel
+  // Toggle debug mode
   const toggleDebug = useCallback(() => {
-    setDebugEnabled((prev) => {
-      const next = !prev;
-      sendControl({ type: next ? "debug_enable" : "debug_disable" });
-      return next;
-    });
-  }, [sendControl]);
+    setDebugEnabled((prev) => !prev);
+  }, []);
 
   const isActive = status === "connected";
   const isConnecting = status === "connecting";
@@ -136,18 +117,10 @@ export function VoiceSession() {
         )}
       </div>
 
-      {/* Mic permission denied fallback */}
-      {micStatus === "denied" && (
-        <div className="text-sm text-destructive text-center px-4">
-          Microphone access denied. Please allow microphone permission in your
-          browser settings and reload the page.
-        </div>
-      )}
-
       {/* Animation indicators */}
       <div className="flex items-center justify-center gap-16">
         <div className="flex flex-col items-center gap-2">
-          <MicAnimation isActive={isActive && isSpeaking} />
+          <MicAnimation isActive={isActive && isUserSpeaking} />
           <span className="text-xs text-muted-foreground">You</span>
         </div>
         <div className="flex flex-col items-center gap-2">
@@ -159,11 +132,7 @@ export function VoiceSession() {
       {/* Start / End / Debug buttons */}
       <div className="flex items-center gap-3">
         {!isActive && !isConnecting ? (
-          <Button
-            size="lg"
-            onClick={handleStart}
-            disabled={micStatus === "denied"}
-          >
+          <Button size="lg" onClick={handleStart}>
             Start Call
           </Button>
         ) : (
