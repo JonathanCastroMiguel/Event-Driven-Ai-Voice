@@ -3,197 +3,179 @@ from uuid import uuid4
 import pytest
 
 from src.voice_runtime.agent_fsm import AgentFSM
-from src.voice_runtime.events import RequestAgentAction, RequestGuidedResponse
-from src.voice_runtime.types import AgentState, PolicyKey, RouteALabel, RouteBLabel
-
-
-# ---------------------------------------------------------------------------
-# FSM State Transitions (8.3)
-# ---------------------------------------------------------------------------
+from src.voice_runtime.types import AgentState
 
 
 class TestFSMTransitions:
-    def test_idle_to_thinking(self) -> None:
-        fsm = AgentFSM(call_id=uuid4())
-        fsm._current_generation_id = uuid4()
-        change = fsm.transition("handle_turn", ts=1000)
-        assert fsm.state == AgentState.THINKING
-        assert change is not None
-        assert change.state == "thinking"
+    """Test all valid state transitions in the simplified model-as-router FSM."""
 
-    def test_thinking_to_done(self) -> None:
+    def test_idle_to_routing(self) -> None:
         fsm = AgentFSM(call_id=uuid4())
-        fsm._current_generation_id = uuid4()
-        fsm.transition("handle_turn", ts=1000)
-        change = fsm.transition("classification_done", ts=1050)
+        gen_id = uuid4()
+        change = fsm.start_routing(agent_generation_id=gen_id, ts=1000)
+        assert fsm.state == AgentState.ROUTING
+        assert change is not None
+        assert change.state == "routing"
+
+    def test_routing_to_speaking_direct_voice(self) -> None:
+        fsm = AgentFSM(call_id=uuid4())
+        fsm.start_routing(agent_generation_id=uuid4(), ts=1000)
+        change = fsm.voice_started(ts=1050)
+        assert fsm.state == AgentState.SPEAKING
+        assert change is not None
+        assert change.state == "speaking"
+
+    def test_routing_to_waiting_tools_specialist(self) -> None:
+        fsm = AgentFSM(call_id=uuid4())
+        fsm.start_routing(agent_generation_id=uuid4(), ts=1000)
+        change = fsm.specialist_action(ts=1050)
+        assert fsm.state == AgentState.WAITING_TOOLS
+        assert change is not None
+        assert change.state == "waiting_tools"
+
+    def test_waiting_tools_to_speaking(self) -> None:
+        fsm = AgentFSM(call_id=uuid4())
+        fsm.start_routing(agent_generation_id=uuid4(), ts=1000)
+        fsm.specialist_action(ts=1050)
+        change = fsm.tool_result(ts=1100)
+        assert fsm.state == AgentState.SPEAKING
+        assert change is not None
+        assert change.state == "speaking"
+
+    def test_speaking_to_done(self) -> None:
+        fsm = AgentFSM(call_id=uuid4())
+        fsm.start_routing(agent_generation_id=uuid4(), ts=1000)
+        fsm.voice_started(ts=1050)
+        change = fsm.voice_completed(ts=1100)
+        assert fsm.state == AgentState.DONE
+        assert change is not None
+        assert change.state == "done"
+
+    def test_full_direct_voice_path(self) -> None:
+        """idle → routing → speaking → done."""
+        fsm = AgentFSM(call_id=uuid4())
+        gen_id = uuid4()
+        fsm.start_routing(agent_generation_id=gen_id, ts=1000)
+        fsm.voice_started(ts=1050)
+        fsm.voice_completed(ts=1200)
+        assert fsm.state == AgentState.DONE
+        assert fsm.current_generation_id == gen_id
+
+    def test_full_specialist_path(self) -> None:
+        """idle → routing → waiting_tools → speaking → done."""
+        fsm = AgentFSM(call_id=uuid4())
+        gen_id = uuid4()
+        fsm.start_routing(agent_generation_id=gen_id, ts=1000)
+        fsm.specialist_action(ts=1050)
+        fsm.tool_result(ts=1200)
+        fsm.voice_completed(ts=1400)
         assert fsm.state == AgentState.DONE
 
-    def test_thinking_to_cancelled(self) -> None:
-        fsm = AgentFSM(call_id=uuid4())
-        fsm._current_generation_id = uuid4()
-        fsm.transition("handle_turn", ts=1000)
-        change = fsm.transition("cancel", ts=1050)
-        assert fsm.state == AgentState.CANCELLED
 
-    def test_waiting_tools_to_cancelled(self) -> None:
-        fsm = AgentFSM(call_id=uuid4())
-        fsm._current_generation_id = uuid4()
-        fsm.transition("handle_turn", ts=1000)
-        fsm.transition("needs_tools", ts=1050)
-        change = fsm.transition("cancel", ts=1100)
-        assert fsm.state == AgentState.CANCELLED
+class TestFSMCancellation:
+    """Test cancel from all active states."""
 
-    def test_invalid_transition_raises(self) -> None:
+    def test_cancel_from_routing(self) -> None:
         fsm = AgentFSM(call_id=uuid4())
-        fsm._current_generation_id = uuid4()
-        fsm.transition("handle_turn", ts=1000)
-        fsm.transition("classification_done", ts=1050)
-        # DONE -> handle_turn is invalid
-        with pytest.raises(ValueError, match="Invalid transition"):
-            fsm.transition("handle_turn", ts=2000)
-
-    def test_cancel_from_idle_raises(self) -> None:
-        fsm = AgentFSM(call_id=uuid4())
-        # cancel() should return None since we're in IDLE (not active)
-        result = fsm.cancel(ts=1000)
-        assert result is None
-
-    def test_cancel_method_from_thinking(self) -> None:
-        fsm = AgentFSM(call_id=uuid4())
-        fsm._current_generation_id = uuid4()
-        fsm.transition("handle_turn", ts=1000)
+        fsm.start_routing(agent_generation_id=uuid4(), ts=1000)
         change = fsm.cancel(ts=1050)
         assert fsm.state == AgentState.CANCELLED
         assert change is not None
 
+    def test_cancel_from_waiting_tools(self) -> None:
+        fsm = AgentFSM(call_id=uuid4())
+        fsm.start_routing(agent_generation_id=uuid4(), ts=1000)
+        fsm.specialist_action(ts=1050)
+        change = fsm.cancel(ts=1100)
+        assert fsm.state == AgentState.CANCELLED
+        assert change is not None
+
+    def test_cancel_from_speaking(self) -> None:
+        fsm = AgentFSM(call_id=uuid4())
+        fsm.start_routing(agent_generation_id=uuid4(), ts=1000)
+        fsm.voice_started(ts=1050)
+        change = fsm.cancel(ts=1100)
+        assert fsm.state == AgentState.CANCELLED
+        assert change is not None
+
+    def test_cancel_from_idle_returns_none(self) -> None:
+        fsm = AgentFSM(call_id=uuid4())
+        result = fsm.cancel(ts=1000)
+        assert result is None
+        assert fsm.state == AgentState.IDLE
+
     def test_cancel_from_done_returns_none(self) -> None:
         fsm = AgentFSM(call_id=uuid4())
-        fsm._current_generation_id = uuid4()
-        fsm.transition("handle_turn", ts=1000)
-        fsm.transition("classification_done", ts=1050)
-        result = fsm.cancel(ts=2000)
+        fsm.start_routing(agent_generation_id=uuid4(), ts=1000)
+        fsm.voice_started(ts=1050)
+        fsm.voice_completed(ts=1100)
+        result = fsm.cancel(ts=1200)
+        assert result is None
+        assert fsm.state == AgentState.DONE
+
+    def test_cancel_from_cancelled_returns_none(self) -> None:
+        fsm = AgentFSM(call_id=uuid4())
+        fsm.start_routing(agent_generation_id=uuid4(), ts=1000)
+        fsm.cancel(ts=1050)
+        result = fsm.cancel(ts=1100)
         assert result is None
 
-    def test_reset(self) -> None:
+
+class TestFSMInvalidTransitions:
+    """Test that invalid transitions are rejected."""
+
+    def test_voice_started_from_idle_raises(self) -> None:
         fsm = AgentFSM(call_id=uuid4())
-        fsm._current_generation_id = uuid4()
-        fsm.transition("handle_turn", ts=1000)
-        fsm.transition("classification_done", ts=1050)
+        with pytest.raises(ValueError, match="Invalid transition"):
+            fsm.voice_started(ts=1000)
+
+    def test_tool_result_from_routing_raises(self) -> None:
+        fsm = AgentFSM(call_id=uuid4())
+        fsm.start_routing(agent_generation_id=uuid4(), ts=1000)
+        with pytest.raises(ValueError, match="Invalid transition"):
+            fsm.tool_result(ts=1050)
+
+    def test_voice_completed_from_routing_raises(self) -> None:
+        fsm = AgentFSM(call_id=uuid4())
+        fsm.start_routing(agent_generation_id=uuid4(), ts=1000)
+        with pytest.raises(ValueError, match="Invalid transition"):
+            fsm.voice_completed(ts=1050)
+
+    def test_start_routing_from_done_raises(self) -> None:
+        fsm = AgentFSM(call_id=uuid4())
+        fsm.start_routing(agent_generation_id=uuid4(), ts=1000)
+        fsm.voice_started(ts=1050)
+        fsm.voice_completed(ts=1100)
+        with pytest.raises(ValueError, match="Invalid transition"):
+            fsm.start_routing(agent_generation_id=uuid4(), ts=2000)
+
+    def test_specialist_action_from_speaking_raises(self) -> None:
+        fsm = AgentFSM(call_id=uuid4())
+        fsm.start_routing(agent_generation_id=uuid4(), ts=1000)
+        fsm.voice_started(ts=1050)
+        with pytest.raises(ValueError, match="Invalid transition"):
+            fsm.specialist_action(ts=1100)
+
+
+class TestFSMReset:
+    def test_reset_to_idle(self) -> None:
+        fsm = AgentFSM(call_id=uuid4())
+        fsm.start_routing(agent_generation_id=uuid4(), ts=1000)
+        fsm.voice_started(ts=1050)
+        fsm.voice_completed(ts=1100)
         fsm.reset()
         assert fsm.state == AgentState.IDLE
         assert fsm.current_generation_id is None
 
-
-# ---------------------------------------------------------------------------
-# Agent FSM Routing Integration (8.4)
-# ---------------------------------------------------------------------------
-
-
-class TestAgentFSMRouting:
-    def test_simple_emits_greeting(self) -> None:
+    def test_reset_then_new_generation(self) -> None:
         fsm = AgentFSM(call_id=uuid4())
-        gen_id = uuid4()
-        output = fsm.handle_turn(
-            agent_generation_id=gen_id,
-            route_a_label=RouteALabel.SIMPLE,
-            route_a_confidence=0.92,
-            route_b_label=None,
-            user_text="hola",
-            ts=1000,
-        )
-        assert len(output.guided_responses) == 1
-        assert output.guided_responses[0].policy_key == PolicyKey.GREETING.value
-        assert fsm.state == AgentState.DONE
+        gen1 = uuid4()
+        fsm.start_routing(agent_generation_id=gen1, ts=1000)
+        fsm.voice_started(ts=1050)
+        fsm.voice_completed(ts=1100)
+        fsm.reset()
 
-    def test_disallowed_emits_guardrail(self) -> None:
-        fsm = AgentFSM(call_id=uuid4())
-        output = fsm.handle_turn(
-            agent_generation_id=uuid4(),
-            route_a_label=RouteALabel.DISALLOWED,
-            route_a_confidence=1.0,
-            route_b_label=None,
-            user_text="idiota",
-            ts=1000,
-        )
-        assert len(output.guided_responses) == 1
-        assert output.guided_responses[0].policy_key == PolicyKey.GUARDRAIL_DISALLOWED.value
-
-    def test_out_of_scope_emits_guardrail(self) -> None:
-        fsm = AgentFSM(call_id=uuid4())
-        output = fsm.handle_turn(
-            agent_generation_id=uuid4(),
-            route_a_label=RouteALabel.OUT_OF_SCOPE,
-            route_a_confidence=0.85,
-            route_b_label=None,
-            user_text="qué tiempo hace",
-            ts=1000,
-        )
-        assert output.guided_responses[0].policy_key == PolicyKey.GUARDRAIL_OUT_OF_SCOPE.value
-
-    def test_domain_billing_emits_agent_action(self) -> None:
-        fsm = AgentFSM(call_id=uuid4())
-        output = fsm.handle_turn(
-            agent_generation_id=uuid4(),
-            route_a_label=RouteALabel.DOMAIN,
-            route_a_confidence=0.85,
-            route_b_label=RouteBLabel.BILLING,
-            user_text="mi factura está mal",
-            ts=1000,
-        )
-        assert len(output.agent_actions) == 1
-        assert output.agent_actions[0].specialist == "billing"
-        assert len(output.guided_responses) == 0
-
-    def test_domain_support_emits_agent_action(self) -> None:
-        fsm = AgentFSM(call_id=uuid4())
-        output = fsm.handle_turn(
-            agent_generation_id=uuid4(),
-            route_a_label=RouteALabel.DOMAIN,
-            route_a_confidence=0.82,
-            route_b_label=RouteBLabel.SUPPORT,
-            user_text="mi internet no funciona",
-            ts=1000,
-        )
-        assert output.agent_actions[0].specialist == "support"
-
-    def test_ambiguous_domain_emits_clarify(self) -> None:
-        fsm = AgentFSM(call_id=uuid4())
-        output = fsm.handle_turn(
-            agent_generation_id=uuid4(),
-            route_a_label=RouteALabel.DOMAIN,
-            route_a_confidence=0.72,
-            route_b_label=None,  # ambiguous
-            user_text="tengo un problema",
-            ts=1000,
-        )
-        assert len(output.guided_responses) == 1
-        assert output.guided_responses[0].policy_key == PolicyKey.CLARIFY_DEPARTMENT.value
-        assert len(output.agent_actions) == 0
-
-    def test_handle_turn_produces_state_changes(self) -> None:
-        fsm = AgentFSM(call_id=uuid4())
-        output = fsm.handle_turn(
-            agent_generation_id=uuid4(),
-            route_a_label=RouteALabel.SIMPLE,
-            route_a_confidence=0.92,
-            route_b_label=None,
-            user_text="hola",
-            ts=1000,
-        )
-        # Should have THINKING + DONE state changes
-        assert len(output.state_changes) == 2
-        assert output.state_changes[0].state == "thinking"
-        assert output.state_changes[1].state == "done"
-
-    def test_each_specialist_routed(self) -> None:
-        for specialist in RouteBLabel:
-            fsm = AgentFSM(call_id=uuid4())
-            output = fsm.handle_turn(
-                agent_generation_id=uuid4(),
-                route_a_label=RouteALabel.DOMAIN,
-                route_a_confidence=0.85,
-                route_b_label=specialist,
-                user_text="test",
-                ts=1000,
-            )
-            assert output.agent_actions[0].specialist == specialist.value
+        gen2 = uuid4()
+        fsm.start_routing(agent_generation_id=gen2, ts=2000)
+        assert fsm.state == AgentState.ROUTING
+        assert fsm.current_generation_id == gen2

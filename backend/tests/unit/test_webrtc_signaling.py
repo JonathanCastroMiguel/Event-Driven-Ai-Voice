@@ -15,7 +15,7 @@ from src.api.routes.calls import (
     CallSessionEntry,
     _get_policies,
     _sessions,
-    set_shared_router_and_policies,
+    set_shared_dependencies,
 )
 from src.routing.policies import PoliciesRegistry
 from src.voice_runtime.agent_fsm import AgentFSM
@@ -312,7 +312,7 @@ class TestPoliciesFallback:
             base_system="Custom system.",
             policies={k.value: f"Custom {k.value}" for k in PolicyKey},
         )
-        set_shared_router_and_policies(MagicMock(), custom)
+        set_shared_dependencies(MagicMock(), custom)
         try:
             policies = _get_policies()
             assert policies.base_system == "Custom system."
@@ -320,7 +320,7 @@ class TestPoliciesFallback:
             # Restore to None to not affect other tests
             import src.api.routes.calls as calls_module
             calls_module._shared_policies = None
-            calls_module._shared_router = None
+            calls_module._shared_router_prompt_builder = None
 
 
 # ---------------------------------------------------------------------------
@@ -359,7 +359,7 @@ class TestCallSessionEntry:
             turn_manager=tm,
             agent_fsm=fsm,
             tool_executor=te,
-            router=None,
+            router_prompt_builder=None,
             policies=policies,
         )
         bridge = OpenAIRealtimeEventBridge(call_id=call_id)

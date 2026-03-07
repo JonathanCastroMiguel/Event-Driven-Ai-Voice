@@ -11,7 +11,7 @@ class TurnEntry:
 
     seq: int
     user_text: str
-    route_a_label: str
+    route_a_label: str | None = None
     policy_key: str | None = None
     specialist: str | None = None
 

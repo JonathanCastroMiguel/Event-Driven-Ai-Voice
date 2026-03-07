@@ -21,13 +21,8 @@ def _make_coordinator(**kwargs) -> Coordinator:
     from src.voice_runtime.agent_fsm import AgentFSM
     from src.voice_runtime.tool_executor import ToolExecutor
     from src.voice_runtime.turn_manager import TurnManager
-    from src.routing.router import Router
 
     call_id = kwargs.get("call_id", uuid4())
-
-    router = kwargs.get("router") or MagicMock(spec=Router)
-    if isinstance(router, MagicMock):
-        router.classify = AsyncMock()
 
     policies = kwargs.get("policies") or MagicMock()
     if isinstance(policies, MagicMock):
@@ -39,7 +34,7 @@ def _make_coordinator(**kwargs) -> Coordinator:
         turn_manager=TurnManager(call_id),
         agent_fsm=AgentFSM(call_id),
         tool_executor=MagicMock(spec=ToolExecutor),
-        router=router,
+        router_prompt_builder=None,
         policies=policies,
     )
 

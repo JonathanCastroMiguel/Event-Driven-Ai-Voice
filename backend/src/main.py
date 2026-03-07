@@ -70,11 +70,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.models_loaded = True
     logger.info("embedding_model_loaded_and_centroids_computed")
 
-    # 5b. Wire shared router and policies for call sessions
-    from src.api.routes.calls import set_shared_router_and_policies
+    # 5b. Load model-as-router prompt template
+    from src.routing.model_router import RouterPromptBuilder, load_router_prompt
 
-    set_shared_router_and_policies(router, policies)
-    logger.info("shared_router_and_policies_wired")
+    router_prompt_template = load_router_prompt(settings.router_registry_path)
+    router_prompt_builder = RouterPromptBuilder(router_prompt_template)
+    app.state.router_prompt_builder = router_prompt_builder
+    logger.info("router_prompt_builder_loaded")
+
+    # 5c. Wire shared dependencies for call sessions
+    from src.api.routes.calls import set_shared_dependencies
+
+    set_shared_dependencies(router_prompt_builder, policies)
+    logger.info("shared_dependencies_wired")
 
     # 6. Store repositories for coordinator usage
     from src.infrastructure.repositories import (

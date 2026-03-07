@@ -1,14 +1,14 @@
-"""Unit tests for Coordinator (tasks 10.1–10.8)."""
+"""Unit tests for Coordinator (model-as-router architecture)."""
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID, uuid4
 
 import pytest
 
+from src.routing.model_router import RouterPromptBuilder, RouterPromptTemplate
 from src.routing.policies import PoliciesRegistry
-from src.routing.router import Router, RoutingResult
 from src.voice_runtime.agent_fsm import AgentFSM
 from src.voice_runtime.coordinator import Coordinator
 from src.voice_runtime.events import (
@@ -17,14 +17,11 @@ from src.voice_runtime.events import (
     RealtimeVoiceCancel,
     RealtimeVoiceStart,
 )
-from src.voice_runtime.state import CoordinatorRuntimeState
 from src.voice_runtime.tool_executor import ToolExecutor
 from src.voice_runtime.turn_manager import TurnManager
 from src.voice_runtime.types import (
+    AgentState,
     EventSource,
-    PolicyKey,
-    RouteALabel,
-    RouteBLabel,
 )
 
 
@@ -37,1105 +34,422 @@ def _make_policies() -> PoliciesRegistry:
     return PoliciesRegistry(
         base_system="You are a helpful agent.",
         policies={
-            k.value: f"Instructions for {k.value}" for k in PolicyKey
+            "greeting": "Instructions for greeting",
+            "handoff_offer": "Instructions for handoff_offer",
+            "guardrail_disallowed": "Instructions for guardrail_disallowed",
+            "guardrail_out_of_scope": "Instructions for guardrail_out_of_scope",
+            "clarify_department": "Instructions for clarify_department",
         },
     )
 
 
-def _make_router(
-    route_a: RouteALabel = RouteALabel.SIMPLE,
-    confidence: float = 0.95,
-    route_b: RouteBLabel | None = None,
-) -> Router:
-    mock = MagicMock(spec=Router)
-    mock.classify = AsyncMock(
-        return_value=RoutingResult(
-            route_a_label=route_a,
-            route_a_confidence=confidence,
-            route_b_label=route_b,
-        )
+def _make_router_prompt_builder() -> RouterPromptBuilder:
+    template = RouterPromptTemplate(
+        identity="You are a call center agent.",
+        decision_rules="Decide how to help.",
+        departments="sales, billing, support, retention",
+        guardrails="Be polite.",
+        language_instruction="Respond in the same language.",
     )
-    return mock
+    return RouterPromptBuilder(template)
 
 
 def _make_coordinator(
-    router: Router | None = None,
-    seen_events: object | None = None,
-    tool_cache: object | None = None,
-    turn_repo: object | None = None,
-    agent_gen_repo: object | None = None,
-    voice_gen_repo: object | None = None,
-    llm_context_window: int = 3,
+    call_id: UUID | None = None,
+    router_prompt_builder: RouterPromptBuilder | None = None,
+    turn_repo: object = None,
+    agent_gen_repo: object = None,
+    voice_gen_repo: object = None,
 ) -> Coordinator:
-    call_id = uuid4()
+    cid = call_id or uuid4()
     return Coordinator(
-        call_id=call_id,
-        turn_manager=TurnManager(call_id),
-        agent_fsm=AgentFSM(call_id),
-        tool_executor=MagicMock(spec=ToolExecutor),
-        router=router or _make_router(),
+        call_id=cid,
+        turn_manager=TurnManager(call_id=cid),
+        agent_fsm=AgentFSM(call_id=cid),
+        tool_executor=ToolExecutor(),
+        router_prompt_builder=router_prompt_builder or _make_router_prompt_builder(),
         policies=_make_policies(),
-        seen_events=seen_events,
-        tool_cache=tool_cache,
         turn_repo=turn_repo,
         agent_gen_repo=agent_gen_repo,
         voice_gen_repo=voice_gen_repo,
-        llm_context_window=llm_context_window,
     )
 
 
 def _envelope(
-    call_id: UUID | None = None,
-    event_type: str = "speech_started",
+    event_type: str,
+    call_id: UUID,
+    ts: int = 1000,
     payload: dict | None = None,
-    event_id: UUID | None = None,
+    source: EventSource = EventSource.REALTIME,
 ) -> EventEnvelope:
     return EventEnvelope(
-        event_id=event_id or uuid4(),
-        call_id=call_id or uuid4(),
-        ts=1000,
+        event_id=uuid4(),
+        call_id=call_id,
+        ts=ts,
         type=event_type,
         payload=payload or {},
-        source=EventSource.REALTIME,
+        source=source,
     )
 
 
 # ---------------------------------------------------------------------------
-# 10.1 CoordinatorRuntimeState
+# Audio committed handler (5.7)
 # ---------------------------------------------------------------------------
 
 
-class TestCoordinatorRuntimeState:
-    def test_initial_state(self) -> None:
-        cid = uuid4()
-        state = CoordinatorRuntimeState(call_id=cid)
-        assert state.active_turn_id is None
-        assert state.active_agent_generation_id is None
-        assert state.active_voice_generation_id is None
-        assert len(state.cancelled_agent_generations) == 0
-        assert len(state.cancelled_voice_generations) == 0
-
-    def test_cancel_active_generation(self) -> None:
-        state = CoordinatorRuntimeState(call_id=uuid4())
-        gen_id = uuid4()
-        state.active_agent_generation_id = gen_id
-        returned = state.cancel_active_generation()
-        assert returned == gen_id
-        assert state.active_agent_generation_id is None
-        assert state.is_generation_cancelled(gen_id)
-
-    def test_cancel_active_generation_none(self) -> None:
-        state = CoordinatorRuntimeState(call_id=uuid4())
-        assert state.cancel_active_generation() is None
-
-    def test_cancel_active_voice(self) -> None:
-        state = CoordinatorRuntimeState(call_id=uuid4())
-        vid = uuid4()
-        state.active_voice_generation_id = vid
-        returned = state.cancel_active_voice()
-        assert returned == vid
-        assert state.active_voice_generation_id is None
-        assert state.is_voice_cancelled(vid)
-
-    def test_cancel_active_voice_none(self) -> None:
-        state = CoordinatorRuntimeState(call_id=uuid4())
-        assert state.cancel_active_voice() is None
-
-    def test_is_generation_cancelled(self) -> None:
-        state = CoordinatorRuntimeState(call_id=uuid4())
-        gid = uuid4()
-        assert not state.is_generation_cancelled(gid)
-        state.cancelled_agent_generations.add(gid)
-        assert state.is_generation_cancelled(gid)
-
-
-# ---------------------------------------------------------------------------
-# 10.7 Idempotency
-# ---------------------------------------------------------------------------
-
-
-class TestIdempotency:
+class TestAudioCommitted:
     @pytest.mark.asyncio
-    async def test_duplicate_event_ignored(self) -> None:
+    async def test_audio_committed_emits_voice_start(self) -> None:
+        """audio_committed should finalize turn and emit voice start with router prompt."""
         coord = _make_coordinator()
-        eid = uuid4()
-        env1 = _envelope(event_id=eid, event_type="speech_started")
-        env2 = _envelope(event_id=eid, event_type="speech_started")
+        cid = coord._call_id
 
-        await coord.handle_event(env1)
-        events_after_first = coord.drain_output_events()
+        # First, open a turn via speech_started
+        await coord.handle_event(_envelope("speech_started", cid, ts=1000))
+        # Then commit audio
+        await coord.handle_event(_envelope("audio_committed", cid, ts=1500))
 
-        await coord.handle_event(env2)
-        events_after_second = coord.drain_output_events()
-        assert len(events_after_second) == 0  # duplicate ignored
+        events = coord.drain_output_events()
+        assert len(events) == 1
+        assert isinstance(events[0], RealtimeVoiceStart)
+        # The prompt should be the response.create payload dict
+        assert isinstance(events[0].prompt, dict)
+        assert events[0].prompt["type"] == "response.create"
 
     @pytest.mark.asyncio
-    async def test_different_event_ids_both_processed(self) -> None:
+    async def test_audio_committed_transitions_fsm_to_routing(self) -> None:
         coord = _make_coordinator()
-        env1 = _envelope(event_type="speech_started")
-        env2 = _envelope(event_type="speech_started")
+        cid = coord._call_id
 
-        await coord.handle_event(env1)
-        await coord.handle_event(env2)
-        # Both processed — no assertion on count, just no crash
+        await coord.handle_event(_envelope("speech_started", cid, ts=1000))
+        await coord.handle_event(_envelope("audio_committed", cid, ts=1500))
 
-    @pytest.mark.asyncio
-    async def test_redis_dedup_used_when_available(self) -> None:
-        mock_seen = AsyncMock()
-        mock_seen.add = AsyncMock(return_value=True)  # newly added
-        coord = _make_coordinator(seen_events=mock_seen)
-        env = _envelope(event_type="speech_started")
-        await coord.handle_event(env)
-        mock_seen.add.assert_called_once()
+        assert coord._agent_fsm.state == AgentState.ROUTING
 
     @pytest.mark.asyncio
-    async def test_redis_dedup_fallback_on_error(self) -> None:
-        mock_seen = AsyncMock()
-        mock_seen.add = AsyncMock(side_effect=Exception("redis down"))
-        coord = _make_coordinator(seen_events=mock_seen)
-        env = _envelope(event_type="speech_started")
-        # Should not raise — falls back to in-memory
-        await coord.handle_event(env)
+    async def test_audio_committed_sets_active_turn(self) -> None:
+        coord = _make_coordinator()
+        cid = coord._call_id
+
+        await coord.handle_event(_envelope("speech_started", cid, ts=1000))
+        await coord.handle_event(_envelope("audio_committed", cid, ts=1500))
+
+        assert coord.state.active_turn_id is not None
+        assert coord.state.active_agent_generation_id is not None
+        assert coord.state.active_voice_generation_id is not None
+
+    @pytest.mark.asyncio
+    async def test_audio_committed_without_speech_ignored(self) -> None:
+        """audio_committed without prior speech_started produces no events."""
+        coord = _make_coordinator()
+        cid = coord._call_id
+
+        await coord.handle_event(_envelope("audio_committed", cid, ts=1000))
+
+        events = coord.drain_output_events()
+        assert len(events) == 0
+
+    @pytest.mark.asyncio
+    async def test_first_turn_no_history_in_prompt(self) -> None:
+        """First turn should have no input messages in the response.create payload."""
+        coord = _make_coordinator()
+        cid = coord._call_id
+
+        await coord.handle_event(_envelope("speech_started", cid, ts=1000))
+        await coord.handle_event(_envelope("audio_committed", cid, ts=1500))
+
+        events = coord.drain_output_events()
+        payload = events[0].prompt
+        # No input since conversation buffer is empty
+        assert "input" not in payload.get("response", {})
+
+    @pytest.mark.asyncio
+    async def test_second_turn_includes_history(self) -> None:
+        """After transcript_final arrives, subsequent turns should include history."""
+        coord = _make_coordinator()
+        cid = coord._call_id
+
+        # Turn 1
+        await coord.handle_event(_envelope("speech_started", cid, ts=1000))
+        await coord.handle_event(_envelope("audio_committed", cid, ts=1500))
+        coord.drain_output_events()
+
+        # Transcript arrives async
+        await coord.handle_event(
+            _envelope("transcript_final", cid, ts=1700, payload={"text": "hola"})
+        )
+
+        # FSM needs reset for next turn
+        coord._agent_fsm.voice_started(ts=1800)
+        coord._agent_fsm.voice_completed(ts=1900)
+        coord._agent_fsm.reset()
+
+        # Turn 2
+        await coord.handle_event(_envelope("speech_started", cid, ts=2000))
+        await coord.handle_event(_envelope("audio_committed", cid, ts=2500))
+
+        events = coord.drain_output_events()
+        voice_starts = [e for e in events if isinstance(e, RealtimeVoiceStart)]
+        assert len(voice_starts) == 1
+        payload = voice_starts[0].prompt
+        # Should have input messages from conversation history
+        assert "input" in payload.get("response", {})
 
 
 # ---------------------------------------------------------------------------
-# 10.4 Barge-in handling
+# Transcript final — async logging only (5.9)
+# ---------------------------------------------------------------------------
+
+
+class TestTranscriptFinalLogging:
+    @pytest.mark.asyncio
+    async def test_transcript_final_no_routing(self) -> None:
+        """transcript_final should NOT emit any voice start or routing events."""
+        coord = _make_coordinator()
+        cid = coord._call_id
+
+        await coord.handle_event(_envelope("speech_started", cid, ts=1000))
+        await coord.handle_event(
+            _envelope("transcript_final", cid, ts=1200, payload={"text": "hola"})
+        )
+
+        events = coord.drain_output_events()
+        # No voice start events from transcript_final
+        assert len(events) == 0
+
+    @pytest.mark.asyncio
+    async def test_transcript_final_stores_in_turn_manager(self) -> None:
+        coord = _make_coordinator()
+        cid = coord._call_id
+
+        await coord.handle_event(_envelope("speech_started", cid, ts=1000))
+        await coord.handle_event(
+            _envelope("transcript_final", cid, ts=1200, payload={"text": "mi factura"})
+        )
+
+        assert coord._turn_manager.current_transcript == "mi factura"
+
+    @pytest.mark.asyncio
+    async def test_transcript_final_appends_to_buffer(self) -> None:
+        """transcript_final should add to conversation buffer for future turns."""
+        coord = _make_coordinator()
+        cid = coord._call_id
+
+        # Open a turn and commit it
+        await coord.handle_event(_envelope("speech_started", cid, ts=1000))
+        await coord.handle_event(_envelope("audio_committed", cid, ts=1500))
+        coord.drain_output_events()
+
+        # Transcript arrives
+        await coord.handle_event(
+            _envelope("transcript_final", cid, ts=1700, payload={"text": "hola"})
+        )
+
+        # Buffer should have the entry (user + assistant pair)
+        messages = coord._conversation_buffer.format_messages()
+        assert len(messages) == 2  # user + assistant
+        assert messages[0]["role"] == "user"
+        assert messages[0]["content"] == "hola"
+
+
+# ---------------------------------------------------------------------------
+# Model router action — specialist dispatch (5.8)
+# ---------------------------------------------------------------------------
+
+
+class TestModelRouterAction:
+    @pytest.mark.asyncio
+    async def test_model_router_action_emits_specialist_voice(self) -> None:
+        """model_router_action should trigger specialist tool and emit voice start."""
+        coord = _make_coordinator()
+        cid = coord._call_id
+
+        # Setup: open turn, commit, enter routing state
+        await coord.handle_event(_envelope("speech_started", cid, ts=1000))
+        await coord.handle_event(_envelope("audio_committed", cid, ts=1500))
+        coord.drain_output_events()  # drain the router voice start
+
+        # Simulate model_router_action
+        await coord.handle_event(
+            _envelope(
+                "model_router_action",
+                cid,
+                ts=2000,
+                payload={"department": "billing", "summary": "factura incorrecta"},
+            )
+        )
+
+        events = coord.drain_output_events()
+        # Should emit specialist voice start
+        voice_starts = [e for e in events if isinstance(e, RealtimeVoiceStart)]
+        assert len(voice_starts) >= 1
+
+    @pytest.mark.asyncio
+    async def test_model_router_action_fsm_transitions(self) -> None:
+        """FSM should go routing → waiting_tools → speaking."""
+        coord = _make_coordinator()
+        cid = coord._call_id
+
+        await coord.handle_event(_envelope("speech_started", cid, ts=1000))
+        await coord.handle_event(_envelope("audio_committed", cid, ts=1500))
+        coord.drain_output_events()
+
+        assert coord._agent_fsm.state == AgentState.ROUTING
+
+        await coord.handle_event(
+            _envelope(
+                "model_router_action",
+                cid,
+                ts=2000,
+                payload={"department": "billing", "summary": "test"},
+            )
+        )
+
+        # After tool execution and voice emission, FSM should be in SPEAKING
+        assert coord._agent_fsm.state == AgentState.SPEAKING
+
+    @pytest.mark.asyncio
+    async def test_model_router_action_cancelled_gen_ignored(self) -> None:
+        """Late model_router_action for cancelled generation should be ignored."""
+        coord = _make_coordinator()
+        cid = coord._call_id
+
+        await coord.handle_event(_envelope("speech_started", cid, ts=1000))
+        await coord.handle_event(_envelope("audio_committed", cid, ts=1500))
+        coord.drain_output_events()
+
+        # Cancel the generation
+        gen_id = coord.state.active_agent_generation_id
+        coord.state.cancel_active_generation()
+
+        await coord.handle_event(
+            _envelope(
+                "model_router_action",
+                cid,
+                ts=2000,
+                payload={"department": "billing", "summary": "test"},
+            )
+        )
+
+        events = coord.drain_output_events()
+        assert len(events) == 0
+
+
+# ---------------------------------------------------------------------------
+# Barge-in handling
 # ---------------------------------------------------------------------------
 
 
 class TestBargeIn:
     @pytest.mark.asyncio
-    async def test_barge_in_cancels_active_voice(self) -> None:
+    async def test_barge_in_cancels_voice_and_generation(self) -> None:
         coord = _make_coordinator()
-        voice_id = uuid4()
-        coord.state.active_voice_generation_id = voice_id
+        cid = coord._call_id
 
-        env = _envelope(call_id=coord._call_id, event_type="speech_started")
-        await coord.handle_event(env)
+        # Start and commit a turn
+        await coord.handle_event(_envelope("speech_started", cid, ts=1000))
+        await coord.handle_event(_envelope("audio_committed", cid, ts=1500))
+        coord.drain_output_events()
+
+        # Barge in with new speech
+        await coord.handle_event(_envelope("speech_started", cid, ts=2000))
 
         events = coord.drain_output_events()
-        voice_cancels = [e for e in events if isinstance(e, RealtimeVoiceCancel)]
-        assert len(voice_cancels) == 1
-        assert voice_cancels[0].voice_generation_id == voice_id
-        assert voice_cancels[0].reason == "barge_in"
+        cancel_events = [e for e in events if isinstance(e, (RealtimeVoiceCancel, CancelAgentGeneration))]
+        assert len(cancel_events) >= 1
 
     @pytest.mark.asyncio
-    async def test_barge_in_cancels_active_generation(self) -> None:
+    async def test_barge_in_resets_fsm(self) -> None:
         coord = _make_coordinator()
-        gen_id = uuid4()
-        coord.state.active_agent_generation_id = gen_id
+        cid = coord._call_id
 
-        env = _envelope(call_id=coord._call_id, event_type="speech_started")
-        await coord.handle_event(env)
+        await coord.handle_event(_envelope("speech_started", cid, ts=1000))
+        await coord.handle_event(_envelope("audio_committed", cid, ts=1500))
+        coord.drain_output_events()
 
-        events = coord.drain_output_events()
-        gen_cancels = [e for e in events if isinstance(e, CancelAgentGeneration)]
-        assert len(gen_cancels) == 1
-        assert gen_cancels[0].agent_generation_id == gen_id
-        assert gen_cancels[0].reason == "barge_in"
+        # Barge in
+        await coord.handle_event(_envelope("speech_started", cid, ts=2000))
 
-    @pytest.mark.asyncio
-    async def test_barge_in_adds_to_cancelled_sets(self) -> None:
-        coord = _make_coordinator()
-        gen_id = uuid4()
-        voice_id = uuid4()
-        coord.state.active_agent_generation_id = gen_id
-        coord.state.active_voice_generation_id = voice_id
-
-        env = _envelope(call_id=coord._call_id, event_type="speech_started")
-        await coord.handle_event(env)
-
-        assert coord.state.is_generation_cancelled(gen_id)
-        assert coord.state.is_voice_cancelled(voice_id)
-
-    @pytest.mark.asyncio
-    async def test_barge_in_resets_agent_fsm(self) -> None:
-        coord = _make_coordinator()
-        gen_id = uuid4()
-        coord.state.active_agent_generation_id = gen_id
-        # Put FSM in THINKING state
-        coord._agent_fsm._state = coord._agent_fsm.state.__class__("thinking")
-        coord._agent_fsm._current_generation_id = gen_id
-
-        env = _envelope(call_id=coord._call_id, event_type="speech_started")
-        await coord.handle_event(env)
-
-        from src.voice_runtime.types import AgentState
+        # FSM should be reset to IDLE after cancellation
         assert coord._agent_fsm.state == AgentState.IDLE
 
-    @pytest.mark.asyncio
-    async def test_barge_in_no_active_voice_no_cancel(self) -> None:
-        coord = _make_coordinator()
-        env = _envelope(call_id=coord._call_id, event_type="speech_started")
-        await coord.handle_event(env)
 
+# ---------------------------------------------------------------------------
+# Voice completed
+# ---------------------------------------------------------------------------
+
+
+class TestVoiceCompleted:
+    @pytest.mark.asyncio
+    async def test_voice_completed_transitions_fsm_to_done(self) -> None:
+        coord = _make_coordinator()
+        cid = coord._call_id
+
+        await coord.handle_event(_envelope("speech_started", cid, ts=1000))
+        await coord.handle_event(_envelope("audio_committed", cid, ts=1500))
         events = coord.drain_output_events()
-        assert len([e for e in events if isinstance(e, RealtimeVoiceCancel)]) == 0
-        assert len([e for e in events if isinstance(e, CancelAgentGeneration)]) == 0
 
+        # Simulate direct voice: routing → speaking
+        coord._agent_fsm.voice_started(ts=1600)
 
-# ---------------------------------------------------------------------------
-# 10.3 Turn lifecycle orchestration
-# ---------------------------------------------------------------------------
+        voice_gen_id = events[0].voice_generation_id
 
-
-class TestTurnLifecycle:
-    @pytest.mark.asyncio
-    async def test_transcript_final_triggers_routing(self) -> None:
-        router = _make_router(route_a=RouteALabel.SIMPLE)
-        coord = _make_coordinator(router=router)
-
-        # Speech started -> transcript_final -> should finalize turn and route
-        speech = _envelope(call_id=coord._call_id, event_type="speech_started")
-        await coord.handle_event(speech)
-
-        transcript = _envelope(
-            call_id=coord._call_id,
-            event_type="transcript_final",
-            payload={"text": "hola buenos días"},
-        )
-        with patch("src.routing.language.detect_language", return_value="es"):
-            await coord.handle_event(transcript)
-
-        router.classify.assert_called_once_with(
-            "hola buenos días", "es", enriched_text=None, llm_context=None
-        )
-
-    @pytest.mark.asyncio
-    async def test_simple_turn_emits_voice_start(self) -> None:
-        router = _make_router(route_a=RouteALabel.SIMPLE)
-        coord = _make_coordinator(router=router)
-
-        speech = _envelope(call_id=coord._call_id, event_type="speech_started")
-        await coord.handle_event(speech)
-        coord.drain_output_events()  # clear
-
-        transcript = _envelope(
-            call_id=coord._call_id,
-            event_type="transcript_final",
-            payload={"text": "hola"},
-        )
-        with patch("src.routing.language.detect_language", return_value="es"):
-            await coord.handle_event(transcript)
-
-        events = coord.drain_output_events()
-        voice_starts = [e for e in events if isinstance(e, RealtimeVoiceStart)]
-        assert len(voice_starts) == 1
-        # Prompt should be a list of message dicts (guided response)
-        assert isinstance(voice_starts[0].prompt, list)
-
-    @pytest.mark.asyncio
-    async def test_domain_route_b_emits_specialist_voice(self) -> None:
-        router = _make_router(
-            route_a=RouteALabel.DOMAIN,
-            route_b=RouteBLabel.BILLING,
-        )
-        coord = _make_coordinator(router=router)
-
-        speech = _envelope(call_id=coord._call_id, event_type="speech_started")
-        await coord.handle_event(speech)
-        coord.drain_output_events()
-
-        transcript = _envelope(
-            call_id=coord._call_id,
-            event_type="transcript_final",
-            payload={"text": "tengo un problema con mi factura"},
-        )
-        with patch("src.routing.language.detect_language", return_value="es"):
-            await coord.handle_event(transcript)
-
-        events = coord.drain_output_events()
-        voice_starts = [e for e in events if isinstance(e, RealtimeVoiceStart)]
-        assert len(voice_starts) >= 1
-        # At least one should reference the specialist
-        specialist_events = [
-            e for e in voice_starts if isinstance(e.prompt, str) and "billing" in e.prompt
-        ]
-        assert len(specialist_events) >= 1
-
-    @pytest.mark.asyncio
-    async def test_disallowed_emits_guardrail_response(self) -> None:
-        router = _make_router(route_a=RouteALabel.DISALLOWED)
-        coord = _make_coordinator(router=router)
-
-        speech = _envelope(call_id=coord._call_id, event_type="speech_started")
-        await coord.handle_event(speech)
-        coord.drain_output_events()
-
-        transcript = _envelope(
-            call_id=coord._call_id,
-            event_type="transcript_final",
-            payload={"text": "maldita sea"},
-        )
-        with patch("src.routing.language.detect_language", return_value="es"):
-            await coord.handle_event(transcript)
-
-        events = coord.drain_output_events()
-        voice_starts = [e for e in events if isinstance(e, RealtimeVoiceStart)]
-        assert len(voice_starts) == 1
-
-    @pytest.mark.asyncio
-    async def test_rapid_successive_turns_cancel_previous(self) -> None:
-        router = _make_router(route_a=RouteALabel.SIMPLE)
-        coord = _make_coordinator(router=router)
-
-        # First turn
-        speech1 = _envelope(call_id=coord._call_id, event_type="speech_started")
-        await coord.handle_event(speech1)
-        transcript1 = _envelope(
-            call_id=coord._call_id,
-            event_type="transcript_final",
-            payload={"text": "hola"},
-        )
-        with patch("src.routing.language.detect_language", return_value="es"):
-            await coord.handle_event(transcript1)
-
-        first_gen_id = coord.state.active_agent_generation_id
-        coord.drain_output_events()
-
-        # Second turn — should cancel the first generation
-        speech2 = _envelope(call_id=coord._call_id, event_type="speech_started")
-        await coord.handle_event(speech2)
-        transcript2 = _envelope(
-            call_id=coord._call_id,
-            event_type="transcript_final",
-            payload={"text": "buenos días"},
-        )
-        with patch("src.routing.language.detect_language", return_value="es"):
-            await coord.handle_event(transcript2)
-
-        # The second turn should have a different generation ID
-        second_gen_id = coord.state.active_agent_generation_id
-        assert second_gen_id != first_gen_id
-
-
-# ---------------------------------------------------------------------------
-# 10.5 Prompt construction
-# ---------------------------------------------------------------------------
-
-
-class TestPromptConstruction:
-    @pytest.mark.asyncio
-    async def test_guided_response_includes_system_and_policy(self) -> None:
-        router = _make_router(route_a=RouteALabel.SIMPLE)
-        coord = _make_coordinator(router=router)
-
-        speech = _envelope(call_id=coord._call_id, event_type="speech_started")
-        await coord.handle_event(speech)
-        coord.drain_output_events()
-
-        transcript = _envelope(
-            call_id=coord._call_id,
-            event_type="transcript_final",
-            payload={"text": "hola"},
-        )
-        with patch("src.routing.language.detect_language", return_value="es"):
-            await coord.handle_event(transcript)
-
-        events = coord.drain_output_events()
-        voice_starts = [e for e in events if isinstance(e, RealtimeVoiceStart)]
-        assert len(voice_starts) == 1
-        prompt = voice_starts[0].prompt
-        assert isinstance(prompt, list)
-        # System message with base_system
-        assert prompt[0]["role"] == "system"
-        assert "helpful agent" in prompt[0]["content"]
-        # Policy instructions
-        assert prompt[1]["role"] == "system"
-        assert "greeting" in prompt[1]["content"]
-        # User text
-        assert prompt[2]["role"] == "user"
-        assert prompt[2]["content"] == "hola"
-
-    @pytest.mark.asyncio
-    async def test_invalid_policy_key_falls_back(self) -> None:
-        coord = _make_coordinator()
-        env = _envelope(
-            call_id=coord._call_id,
-            event_type="request_guided_response",
-            payload={
-                "agent_generation_id": str(uuid4()),
-                "policy_key": "invalid_key",
-                "user_text": "test",
-            },
-        )
-        # Should not raise — falls back to CLARIFY_DEPARTMENT
-        await coord.handle_event(env)
-        events = coord.drain_output_events()
-        voice_starts = [e for e in events if isinstance(e, RealtimeVoiceStart)]
-        assert len(voice_starts) == 1
-
-
-# ---------------------------------------------------------------------------
-# 10.8 Late result handling
-# ---------------------------------------------------------------------------
-
-
-class TestLateResultHandling:
-    @pytest.mark.asyncio
-    async def test_late_tool_result_ignored(self) -> None:
-        coord = _make_coordinator()
-        gen_id = uuid4()
-        coord.state.cancelled_agent_generations.add(gen_id)
-
-        env = _envelope(
-            call_id=coord._call_id,
-            event_type="tool_result",
-            payload={"agent_generation_id": str(gen_id)},
-        )
-        await coord.handle_event(env)
-        # No crash, no output events
-        assert len(coord.drain_output_events()) == 0
-
-    @pytest.mark.asyncio
-    async def test_late_voice_completed_ignored(self) -> None:
-        coord = _make_coordinator()
-        voice_id = uuid4()
-        coord.state.cancelled_voice_generations.add(voice_id)
-
-        env = _envelope(
-            call_id=coord._call_id,
-            event_type="voice_generation_completed",
-            payload={"voice_generation_id": str(voice_id)},
-        )
-        await coord.handle_event(env)
-        # Voice state should remain unchanged
-        assert coord.state.active_voice_generation_id is None
-
-    @pytest.mark.asyncio
-    async def test_late_voice_error_ignored(self) -> None:
-        coord = _make_coordinator()
-        voice_id = uuid4()
-        coord.state.cancelled_voice_generations.add(voice_id)
-
-        env = _envelope(
-            call_id=coord._call_id,
-            event_type="voice_generation_error",
-            payload={"voice_generation_id": str(voice_id), "error": "timeout"},
-        )
-        await coord.handle_event(env)
-
-    @pytest.mark.asyncio
-    async def test_late_guided_response_ignored(self) -> None:
-        coord = _make_coordinator()
-        gen_id = uuid4()
-        coord.state.cancelled_agent_generations.add(gen_id)
-
-        env = _envelope(
-            call_id=coord._call_id,
-            event_type="request_guided_response",
-            payload={
-                "agent_generation_id": str(gen_id),
-                "policy_key": "greeting",
-                "user_text": "hola",
-            },
-        )
-        await coord.handle_event(env)
-        assert len(coord.drain_output_events()) == 0
-
-    @pytest.mark.asyncio
-    async def test_late_agent_action_ignored(self) -> None:
-        coord = _make_coordinator()
-        gen_id = uuid4()
-        coord.state.cancelled_agent_generations.add(gen_id)
-
-        env = _envelope(
-            call_id=coord._call_id,
-            event_type="request_agent_action",
-            payload={
-                "agent_generation_id": str(gen_id),
-                "specialist": "billing",
-                "user_text": "factura",
-            },
-        )
-        await coord.handle_event(env)
-        assert len(coord.drain_output_events()) == 0
-
-
-# ---------------------------------------------------------------------------
-# 10.2 Event dispatch
-# ---------------------------------------------------------------------------
-
-
-class TestEventDispatch:
-    @pytest.mark.asyncio
-    async def test_unknown_event_type_ignored(self) -> None:
-        coord = _make_coordinator()
-        env = _envelope(event_type="unknown_type_xyz")
-        await coord.handle_event(env)
-        assert len(coord.drain_output_events()) == 0
-
-    @pytest.mark.asyncio
-    async def test_voice_completed_clears_active_voice(self) -> None:
-        coord = _make_coordinator()
-        voice_id = uuid4()
-        coord.state.active_voice_generation_id = voice_id
-
-        env = _envelope(
-            call_id=coord._call_id,
-            event_type="voice_generation_completed",
-            payload={"voice_generation_id": str(voice_id)},
-        )
-        await coord.handle_event(env)
-        assert coord.state.active_voice_generation_id is None
-
-    @pytest.mark.asyncio
-    async def test_voice_error_clears_active_voice(self) -> None:
-        coord = _make_coordinator()
-        voice_id = uuid4()
-        coord.state.active_voice_generation_id = voice_id
-
-        env = _envelope(
-            call_id=coord._call_id,
-            event_type="voice_generation_error",
-            payload={"voice_generation_id": str(voice_id), "error": "fail"},
-        )
-        await coord.handle_event(env)
-        assert coord.state.active_voice_generation_id is None
-
-
-# ---------------------------------------------------------------------------
-# drain_output_events
-# ---------------------------------------------------------------------------
-
-
-class TestDrainOutputEvents:
-    def test_drain_returns_and_clears(self) -> None:
-        coord = _make_coordinator()
-        # Manually push an event
-        coord._output_events.append(
-            RealtimeVoiceCancel(
-                call_id=coord._call_id,
-                voice_generation_id=uuid4(),
-                reason="test",
-                ts=1000,
+        await coord.handle_event(
+            _envelope(
+                "voice_generation_completed",
+                cid,
+                ts=2000,
+                payload={"voice_generation_id": str(voice_gen_id)},
             )
         )
-        events = coord.drain_output_events()
-        assert len(events) == 1
-        assert len(coord.drain_output_events()) == 0
+
+        assert coord._agent_fsm.state == AgentState.DONE
 
 
 # ---------------------------------------------------------------------------
-# 10.9 Persistence wiring
+# Persistence wiring
 # ---------------------------------------------------------------------------
 
 
 class TestPersistenceWiring:
     @pytest.mark.asyncio
-    async def test_turn_finalized_inserts_turn(self) -> None:
-        turn_repo = AsyncMock()
-        agent_gen_repo = AsyncMock()
-        router = _make_router(route_a=RouteALabel.SIMPLE)
-        coord = _make_coordinator(
-            router=router, turn_repo=turn_repo, agent_gen_repo=agent_gen_repo
-        )
+    async def test_turn_persisted_on_committed(self) -> None:
+        turn_repo = MagicMock()
+        turn_repo.insert = AsyncMock()
+        turn_repo.update = AsyncMock()
 
-        speech = _envelope(call_id=coord._call_id, event_type="speech_started")
-        await coord.handle_event(speech)
+        coord = _make_coordinator(turn_repo=turn_repo)
+        cid = coord._call_id
 
-        transcript = _envelope(
-            call_id=coord._call_id,
-            event_type="transcript_final",
-            payload={"text": "hola"},
-        )
-        with patch("src.routing.language.detect_language", return_value="es"):
-            await coord.handle_event(transcript)
+        await coord.handle_event(_envelope("speech_started", cid, ts=1000))
+        await coord.handle_event(_envelope("audio_committed", cid, ts=1500))
 
         turn_repo.insert.assert_called_once()
-        turn_entity = turn_repo.insert.call_args[0][0]
-        assert turn_entity.text_final == "hola"
-        assert turn_entity.language == "es"
 
     @pytest.mark.asyncio
-    async def test_turn_finalized_inserts_agent_generation(self) -> None:
-        agent_gen_repo = AsyncMock()
-        router = _make_router(route_a=RouteALabel.SIMPLE)
-        coord = _make_coordinator(router=router, agent_gen_repo=agent_gen_repo)
+    async def test_agent_gen_persisted_on_committed(self) -> None:
+        agent_gen_repo = MagicMock()
+        agent_gen_repo.insert = AsyncMock()
 
-        speech = _envelope(call_id=coord._call_id, event_type="speech_started")
-        await coord.handle_event(speech)
+        coord = _make_coordinator(agent_gen_repo=agent_gen_repo)
+        cid = coord._call_id
 
-        transcript = _envelope(
-            call_id=coord._call_id,
-            event_type="transcript_final",
-            payload={"text": "hola"},
-        )
-        with patch("src.routing.language.detect_language", return_value="es"):
-            await coord.handle_event(transcript)
+        await coord.handle_event(_envelope("speech_started", cid, ts=1000))
+        await coord.handle_event(_envelope("audio_committed", cid, ts=1500))
 
         agent_gen_repo.insert.assert_called_once()
-        gen_entity = agent_gen_repo.insert.call_args[0][0]
-        assert gen_entity.route_a_label == "simple"
-
-    @pytest.mark.asyncio
-    async def test_guided_response_inserts_voice_generation(self) -> None:
-        voice_gen_repo = AsyncMock()
-        router = _make_router(route_a=RouteALabel.SIMPLE)
-        coord = _make_coordinator(router=router, voice_gen_repo=voice_gen_repo)
-
-        speech = _envelope(call_id=coord._call_id, event_type="speech_started")
-        await coord.handle_event(speech)
-
-        transcript = _envelope(
-            call_id=coord._call_id,
-            event_type="transcript_final",
-            payload={"text": "hola"},
-        )
-        with patch("src.routing.language.detect_language", return_value="es"):
-            await coord.handle_event(transcript)
-
-        voice_gen_repo.insert.assert_called_once()
-        voice_entity = voice_gen_repo.insert.call_args[0][0]
-        assert voice_entity.state.value == "starting"
-
-    @pytest.mark.asyncio
-    async def test_voice_completed_updates_voice_generation(self) -> None:
-        voice_gen_repo = AsyncMock()
-        coord = _make_coordinator(voice_gen_repo=voice_gen_repo)
-        voice_id = uuid4()
-        coord.state.active_voice_generation_id = voice_id
-        coord.state.active_turn_id = uuid4()
-        coord.state.active_agent_generation_id = uuid4()
-
-        env = _envelope(
-            call_id=coord._call_id,
-            event_type="voice_generation_completed",
-            payload={"voice_generation_id": str(voice_id)},
-        )
-        await coord.handle_event(env)
-
-        voice_gen_repo.update.assert_called_once()
-        updated = voice_gen_repo.update.call_args[0][0]
-        assert updated.state.value == "completed"
-
-    @pytest.mark.asyncio
-    async def test_voice_error_updates_voice_generation(self) -> None:
-        voice_gen_repo = AsyncMock()
-        coord = _make_coordinator(voice_gen_repo=voice_gen_repo)
-        voice_id = uuid4()
-        coord.state.active_voice_generation_id = voice_id
-        coord.state.active_turn_id = uuid4()
-        coord.state.active_agent_generation_id = uuid4()
-
-        env = _envelope(
-            call_id=coord._call_id,
-            event_type="voice_generation_error",
-            payload={"voice_generation_id": str(voice_id), "error": "timeout"},
-        )
-        await coord.handle_event(env)
-
-        voice_gen_repo.update.assert_called_once()
-        updated = voice_gen_repo.update.call_args[0][0]
-        assert updated.state.value == "error"
-        assert updated.error == "timeout"
-
-    @pytest.mark.asyncio
-    async def test_rapid_turns_updates_cancelled_generation(self) -> None:
-        agent_gen_repo = AsyncMock()
-        router = _make_router(route_a=RouteALabel.SIMPLE)
-        coord = _make_coordinator(router=router, agent_gen_repo=agent_gen_repo)
-
-        # First turn
-        speech1 = _envelope(call_id=coord._call_id, event_type="speech_started")
-        await coord.handle_event(speech1)
-        transcript1 = _envelope(
-            call_id=coord._call_id,
-            event_type="transcript_final",
-            payload={"text": "hola"},
-        )
-        with patch("src.routing.language.detect_language", return_value="es"):
-            await coord.handle_event(transcript1)
-
-        # Second turn triggers cancellation of first
-        speech2 = _envelope(call_id=coord._call_id, event_type="speech_started")
-        await coord.handle_event(speech2)
-        transcript2 = _envelope(
-            call_id=coord._call_id,
-            event_type="transcript_final",
-            payload={"text": "adiós"},
-        )
-        with patch("src.routing.language.detect_language", return_value="es"):
-            await coord.handle_event(transcript2)
-
-        # Should have 2 inserts + 1 update (cancellation via barge-in)
-        assert agent_gen_repo.insert.call_count == 2
-        agent_gen_repo.update.assert_called_once()
-        cancelled = agent_gen_repo.update.call_args[0][0]
-        assert cancelled.state.value == "cancelled"
-        assert cancelled.cancel_reason == "barge_in"
-
-# ---------------------------------------------------------------------------
-# 5.1–5.5 Multi-turn conversation buffer integration
-# ---------------------------------------------------------------------------
-
-
-class TestMultiTurnConversationBuffer:
-    @pytest.mark.asyncio
-    async def test_first_turn_prompt_no_history(self) -> None:
-        """5.1: First turn (empty buffer) produces [system, policy, user]."""
-        router = _make_router(route_a=RouteALabel.SIMPLE)
-        coord = _make_coordinator(router=router)
-
-        speech = _envelope(call_id=coord._call_id, event_type="speech_started")
-        await coord.handle_event(speech)
-        coord.drain_output_events()
-
-        transcript = _envelope(
-            call_id=coord._call_id,
-            event_type="transcript_final",
-            payload={"text": "hola"},
-        )
-        with patch("src.routing.language.detect_language", return_value="es"):
-            await coord.handle_event(transcript)
-
-        events = coord.drain_output_events()
-        voice_starts = [e for e in events if isinstance(e, RealtimeVoiceStart)]
-        assert len(voice_starts) == 1
-        prompt = voice_starts[0].prompt
-        assert len(prompt) == 3  # system, policy, user — no history
-        assert prompt[0]["role"] == "system"
-        assert prompt[1]["role"] == "system"
-        assert prompt[2]["role"] == "user"
-        assert prompt[2]["content"] == "hola"
-
-    @pytest.mark.asyncio
-    async def test_second_turn_includes_history(self) -> None:
-        """5.2: Second turn includes history from buffer."""
-        router = _make_router(route_a=RouteALabel.SIMPLE)
-        coord = _make_coordinator(router=router)
-
-        # First turn
-        speech1 = _envelope(call_id=coord._call_id, event_type="speech_started")
-        await coord.handle_event(speech1)
-        transcript1 = _envelope(
-            call_id=coord._call_id,
-            event_type="transcript_final",
-            payload={"text": "hola"},
-        )
-        with patch("src.routing.language.detect_language", return_value="es"):
-            await coord.handle_event(transcript1)
-        coord.drain_output_events()
-
-        # Second turn
-        speech2 = _envelope(call_id=coord._call_id, event_type="speech_started")
-        await coord.handle_event(speech2)
-        coord.drain_output_events()
-        transcript2 = _envelope(
-            call_id=coord._call_id,
-            event_type="transcript_final",
-            payload={"text": "mi factura"},
-        )
-        with patch("src.routing.language.detect_language", return_value="es"):
-            await coord.handle_event(transcript2)
-
-        events = coord.drain_output_events()
-        voice_starts = [e for e in events if isinstance(e, RealtimeVoiceStart)]
-        assert len(voice_starts) == 1
-        prompt = voice_starts[0].prompt
-        # [system, policy, history_user, history_assistant, user]
-        assert len(prompt) == 5
-        assert prompt[2]["role"] == "user"
-        assert prompt[2]["content"] == "hola"
-        assert prompt[3]["role"] == "assistant"
-        assert prompt[-1]["role"] == "user"
-        assert prompt[-1]["content"] == "mi factura"
-
-    @pytest.mark.asyncio
-    async def test_barge_in_turn_not_in_buffer(self) -> None:
-        """5.3: Cancelled turn (barge-in before voice start) not in buffer."""
-        router = _make_router(route_a=RouteALabel.SIMPLE)
-        coord = _make_coordinator(router=router)
-
-        # First turn — completes successfully
-        speech1 = _envelope(call_id=coord._call_id, event_type="speech_started")
-        await coord.handle_event(speech1)
-        transcript1 = _envelope(
-            call_id=coord._call_id,
-            event_type="transcript_final",
-            payload={"text": "hola"},
-        )
-        with patch("src.routing.language.detect_language", return_value="es"):
-            await coord.handle_event(transcript1)
-        coord.drain_output_events()
-
-        # Barge-in: speech_started cancels the active voice
-        speech2 = _envelope(call_id=coord._call_id, event_type="speech_started")
-        await coord.handle_event(speech2)
-        coord.drain_output_events()
-
-        # New turn after barge-in
-        transcript2 = _envelope(
-            call_id=coord._call_id,
-            event_type="transcript_final",
-            payload={"text": "adiós"},
-        )
-        with patch("src.routing.language.detect_language", return_value="es"):
-            await coord.handle_event(transcript2)
-
-        events = coord.drain_output_events()
-        voice_starts = [e for e in events if isinstance(e, RealtimeVoiceStart)]
-        assert len(voice_starts) == 1
-        prompt = voice_starts[0].prompt
-        # History should contain "hola" from first turn, current is "adiós"
-        assert prompt[-1]["content"] == "adiós"
-        # First turn's history is present
-        history_users = [m for m in prompt if m["role"] == "user"]
-        assert len(history_users) == 2  # history "hola" + current "adiós"
-
-    @pytest.mark.asyncio
-    async def test_three_turns_accumulate_history(self) -> None:
-        """5.4: Three consecutive turns accumulate correct history."""
-        router = _make_router(route_a=RouteALabel.SIMPLE)
-        coord = _make_coordinator(router=router)
-
-        for i, text in enumerate(["uno", "dos", "tres"]):
-            speech = _envelope(call_id=coord._call_id, event_type="speech_started")
-            await coord.handle_event(speech)
-            if i > 0:
-                coord.drain_output_events()  # clear barge-in cancels
-            transcript = _envelope(
-                call_id=coord._call_id,
-                event_type="transcript_final",
-                payload={"text": text},
-            )
-            with patch("src.routing.language.detect_language", return_value="es"):
-                await coord.handle_event(transcript)
-            if i < 2:
-                coord.drain_output_events()
-
-        events = coord.drain_output_events()
-        voice_starts = [e for e in events if isinstance(e, RealtimeVoiceStart)]
-        assert len(voice_starts) == 1
-        prompt = voice_starts[0].prompt
-        # system, policy, history(uno), assistant, history(dos), assistant, user(tres)
-        assert prompt[-1]["content"] == "tres"
-        user_msgs = [m for m in prompt if m["role"] == "user"]
-        assert [m["content"] for m in user_msgs] == ["uno", "dos", "tres"]
-
-    @pytest.mark.asyncio
-    async def test_buffer_respects_max_history_turns(self) -> None:
-        """5.5: Buffer respects max_history_turns setting."""
-        router = _make_router(route_a=RouteALabel.SIMPLE)
-        coord = _make_coordinator(router=router)
-        # Override buffer with max_turns=2
-        from src.voice_runtime.conversation_buffer import ConversationBuffer
-
-        coord._conversation_buffer = ConversationBuffer(max_turns=2, max_chars=10000)
-
-        for i, text in enumerate(["uno", "dos", "tres"]):
-            speech = _envelope(call_id=coord._call_id, event_type="speech_started")
-            await coord.handle_event(speech)
-            if i > 0:
-                coord.drain_output_events()
-            transcript = _envelope(
-                call_id=coord._call_id,
-                event_type="transcript_final",
-                payload={"text": text},
-            )
-            with patch("src.routing.language.detect_language", return_value="es"):
-                await coord.handle_event(transcript)
-            if i < 2:
-                coord.drain_output_events()
-
-        events = coord.drain_output_events()
-        voice_starts = [e for e in events if isinstance(e, RealtimeVoiceStart)]
-        prompt = voice_starts[0].prompt
-        # Only 2 history turns (dos + tres's own entry not yet in buffer at prompt time)
-        # At prompt time for "tres", buffer has [uno, dos] -> max_turns=2 keeps both
-        # After voice start, "tres" is appended -> buffer becomes [dos, tres]
-        user_msgs = [m for m in prompt if m["role"] == "user"]
-        assert len(user_msgs) == 3  # history(uno, dos) + current(tres)
-
 
     @pytest.mark.asyncio
     async def test_persistence_error_does_not_crash(self) -> None:
-        turn_repo = AsyncMock()
-        turn_repo.insert = AsyncMock(side_effect=Exception("db down"))
-        router = _make_router(route_a=RouteALabel.SIMPLE)
-        coord = _make_coordinator(router=router, turn_repo=turn_repo)
+        turn_repo = MagicMock()
+        turn_repo.insert = AsyncMock(side_effect=Exception("db error"))
 
-        speech = _envelope(call_id=coord._call_id, event_type="speech_started")
-        await coord.handle_event(speech)
+        coord = _make_coordinator(turn_repo=turn_repo)
+        cid = coord._call_id
 
-        transcript = _envelope(
-            call_id=coord._call_id,
-            event_type="transcript_final",
-            payload={"text": "hola"},
-        )
-        with patch("src.routing.language.detect_language", return_value="es"):
-            await coord.handle_event(transcript)
+        # Should not raise
+        await coord.handle_event(_envelope("speech_started", cid, ts=1000))
+        await coord.handle_event(_envelope("audio_committed", cid, ts=1500))
 
-        # Should not crash — persistence is fire-and-forget
         events = coord.drain_output_events()
-        assert len(events) >= 1  # Voice start still emitted
-
-
-# ---------------------------------------------------------------------------
-# Context-Aware Routing Integration Tests
-# ---------------------------------------------------------------------------
-
-
-class TestContextAwareRouting:
-    """7.1-7.3 — Coordinator builds enriched routing inputs."""
-
-    @pytest.mark.asyncio
-    async def test_short_followup_passes_enriched_text(self) -> None:
-        """7.1 — Short follow-up after a prior turn passes enriched text to router."""
-        router = _make_router(route_a=RouteALabel.SIMPLE)
-        coord = _make_coordinator(router=router)
-
-        # Turn 1: long text (establishes history)
-        speech1 = _envelope(call_id=coord._call_id, event_type="speech_started")
-        await coord.handle_event(speech1)
-        t1 = _envelope(
-            call_id=coord._call_id,
-            event_type="transcript_final",
-            payload={"text": "tengo un problema con mi factura"},
-        )
-        with patch("src.routing.language.detect_language", return_value="es"):
-            await coord.handle_event(t1)
-        coord.drain_output_events()
-
-        # Turn 2: short follow-up
-        speech2 = _envelope(call_id=coord._call_id, event_type="speech_started")
-        await coord.handle_event(speech2)
-        coord.drain_output_events()
-        t2 = _envelope(
-            call_id=coord._call_id,
-            event_type="transcript_final",
-            payload={"text": "de este mes"},
-        )
-        with patch("src.routing.language.detect_language", return_value="es"):
-            await coord.handle_event(t2)
-
-        # Router should have been called with enriched text on 2nd turn
-        assert router.classify.call_count == 2
-        second_call = router.classify.call_args_list[1]
-        assert second_call.kwargs["enriched_text"] == "tengo un problema con mi factura. de este mes"
-        assert "turn[-1] user: tengo un problema con mi factura" in second_call.kwargs["llm_context"]
-
-    @pytest.mark.asyncio
-    async def test_first_turn_no_enrichment(self) -> None:
-        """7.2 — First turn of call has no enrichment."""
-        router = _make_router(route_a=RouteALabel.SIMPLE)
-        coord = _make_coordinator(router=router)
-
-        speech = _envelope(call_id=coord._call_id, event_type="speech_started")
-        await coord.handle_event(speech)
-        t1 = _envelope(
-            call_id=coord._call_id,
-            event_type="transcript_final",
-            payload={"text": "hola buenos días"},
-        )
-        with patch("src.routing.language.detect_language", return_value="es"):
-            await coord.handle_event(t1)
-
-        router.classify.assert_called_once_with(
-            "hola buenos días", "es", enriched_text=None, llm_context=None
-        )
-
-    @pytest.mark.asyncio
-    async def test_long_text_no_enriched_but_has_llm_context(self) -> None:
-        """7.3 — Long text does not enrich but still passes llm_context."""
-        router = _make_router(route_a=RouteALabel.SIMPLE)
-        coord = _make_coordinator(router=router)
-
-        # Turn 1
-        speech1 = _envelope(call_id=coord._call_id, event_type="speech_started")
-        await coord.handle_event(speech1)
-        t1 = _envelope(
-            call_id=coord._call_id,
-            event_type="transcript_final",
-            payload={"text": "hola"},
-        )
-        with patch("src.routing.language.detect_language", return_value="es"):
-            await coord.handle_event(t1)
-        coord.drain_output_events()
-
-        # Turn 2: long text (>= 20 chars)
-        speech2 = _envelope(call_id=coord._call_id, event_type="speech_started")
-        await coord.handle_event(speech2)
-        coord.drain_output_events()
-        t2 = _envelope(
-            call_id=coord._call_id,
-            event_type="transcript_final",
-            payload={"text": "quiero cambiar mi plan de datos a uno más barato"},
-        )
-        with patch("src.routing.language.detect_language", return_value="es"):
-            await coord.handle_event(t2)
-
-        second_call = router.classify.call_args_list[1]
-        assert second_call.kwargs["enriched_text"] is None
-        assert second_call.kwargs["llm_context"] is not None
-        assert "turn[-1] user: hola" in second_call.kwargs["llm_context"]
-
-
-# ---------------------------------------------------------------------------
-# LLM Fallback History Tests (llm-fallback-history change)
-# ---------------------------------------------------------------------------
-
-
-class TestLLMFallbackHistory:
-    """6.1-6.2 — Coordinator passes llm_context_window and multi-turn context."""
-
-    def test_coordinator_passes_llm_context_window(self) -> None:
-        """6.1 — Coordinator passes llm_context_window to RoutingContextBuilder."""
-        coord = _make_coordinator(llm_context_window=2)
-        assert coord._routing_context_builder._llm_context_window == 2
-
-    def test_coordinator_default_llm_context_window(self) -> None:
-        """6.1b — Default llm_context_window is 3."""
-        coord = _make_coordinator()
-        assert coord._routing_context_builder._llm_context_window == 3
-
-    @pytest.mark.asyncio
-    async def test_multi_turn_llm_context_on_third_turn(self) -> None:
-        """6.2 — Multi-turn llm_context reaches Router.classify on 3rd turn."""
-        router = _make_router(route_a=RouteALabel.SIMPLE)
-        coord = _make_coordinator(router=router, llm_context_window=3)
-
-        # Turn 1
-        s1 = _envelope(call_id=coord._call_id, event_type="speech_started")
-        await coord.handle_event(s1)
-        t1 = _envelope(
-            call_id=coord._call_id,
-            event_type="transcript_final",
-            payload={"text": "mi factura"},
-        )
-        with patch("src.routing.language.detect_language", return_value="es"):
-            await coord.handle_event(t1)
-        coord.drain_output_events()
-
-        # Turn 2
-        s2 = _envelope(call_id=coord._call_id, event_type="speech_started")
-        await coord.handle_event(s2)
-        coord.drain_output_events()
-        t2 = _envelope(
-            call_id=coord._call_id,
-            event_type="transcript_final",
-            payload={"text": "no me llega el recibo"},
-        )
-        with patch("src.routing.language.detect_language", return_value="es"):
-            await coord.handle_event(t2)
-        coord.drain_output_events()
-
-        # Turn 3
-        s3 = _envelope(call_id=coord._call_id, event_type="speech_started")
-        await coord.handle_event(s3)
-        coord.drain_output_events()
-        t3 = _envelope(
-            call_id=coord._call_id,
-            event_type="transcript_final",
-            payload={"text": "de este mes"},
-        )
-        with patch("src.routing.language.detect_language", return_value="es"):
-            await coord.handle_event(t3)
-
-        assert router.classify.call_count == 3
-        third_call = router.classify.call_args_list[2]
-        llm_ctx = third_call.kwargs["llm_context"]
-        assert llm_ctx is not None
-        assert "turn[-2] user: mi factura" in llm_ctx
-        assert "turn[-1] user: no me llega el recibo" in llm_ctx
-        assert llm_ctx.startswith("language=es")
+        assert len(events) == 1  # Voice start still emitted
