@@ -96,8 +96,8 @@ class TestDirectRouteDebugFlow:
 
         stages = debug.stages()
         assert "route_result" in stages  # Retroactive for direct route
-        assert "generation_start" in stages  # Retroactive for direct route
-        assert "generation_finish" in stages
+        # generation_start no longer emitted from backend (now audio_playback_start from frontend)
+        assert "generation_finish" in stages  # Fallback when no audio_playback_end from frontend
 
 
 # ---------------------------------------------------------------------------

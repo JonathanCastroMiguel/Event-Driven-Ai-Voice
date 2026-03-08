@@ -19,7 +19,7 @@ from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 from src.config import settings
-from src.routing.model_router import RouterPromptBuilder
+from src.routing.model_router import ROUTE_TOOL_DEFINITION, RouterPromptBuilder
 from src.routing.policies import PoliciesRegistry
 from src.voice_runtime.agent_fsm import AgentFSM
 from src.voice_runtime.coordinator import Coordinator
@@ -317,6 +317,8 @@ async def events_ws(websocket: WebSocket, call_id: UUID) -> None:
                 "create_response": False,
                 "silence_duration_ms": settings.vad_silence_duration_ms,
             },
+            "tools": [ROUTE_TOOL_DEFINITION],
+            "tool_choice": "auto",
         },
     }
     await entry.bridge.send_to_frontend(session_update)
@@ -337,6 +339,13 @@ async def events_ws(websocket: WebSocket, call_id: UUID) -> None:
                 continue
             if msg_type == "debug_disable":
                 entry.coordinator.set_debug_enabled(False)
+                continue
+            if msg_type == "client_debug_event":
+                await entry.coordinator.handle_client_debug_event(
+                    stage=str(data.get("stage", "")),
+                    turn_id=str(data.get("turn_id", "")),
+                    ts=int(data.get("ts", 0)),
+                )
                 continue
 
             await entry.bridge.handle_frontend_event(data)

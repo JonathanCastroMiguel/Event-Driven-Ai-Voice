@@ -12,7 +12,6 @@ Architecture:
 
 from __future__ import annotations
 
-import asyncio
 import time
 from typing import Any, Callable, Coroutine
 from uuid import UUID, uuid4
@@ -20,7 +19,7 @@ from uuid import UUID, uuid4
 import orjson
 import structlog
 
-from src.routing.model_router import parse_model_action
+from src.routing.model_router import parse_function_call_action
 from src.voice_runtime.events import (
     EventEnvelope,
     RealtimeVoiceCancel,
@@ -36,7 +35,7 @@ class OpenAIRealtimeEventBridge:
 
     Implements the RealtimeClient protocol:
     - on_event() → registers callback for translated EventEnvelopes
-    - send_voice_start() → session.update + response.create (sent to frontend)
+    - send_voice_start() → response.create (sent to frontend)
     - send_voice_cancel() → response.cancel (sent to frontend)
     - close() → teardown
     """
@@ -52,6 +51,8 @@ class OpenAIRealtimeEventBridge:
         self._response_transcript_buffer: str = ""
         self._response_create_sent_ms: int = 0
         self._response_created_ms: int = 0
+        self._current_response_source: str = "router"
+        self._function_call_received: bool = False
 
     # ------------------------------------------------------------------
     # RealtimeClient protocol: on_event
@@ -102,53 +103,30 @@ class OpenAIRealtimeEventBridge:
 
         self._active_voice_generation_id = event.voice_generation_id
         self._response_create_sent_ms = _now_ms()
+        self._response_created_ms = 0
+        self._current_response_source = event.response_source
 
         if isinstance(event.prompt, dict):
             # Already a complete response.create payload from RouterPromptBuilder
             resp = event.prompt.get("response", {})
             instructions = resp.get("instructions", "")
             has_history = "Conversation history:" in instructions
+            has_tools = bool(resp.get("tools"))
             logger.info(
                 "bridge_sending_response_create",
                 call_id=str(self._call_id),
                 prompt_type="dict",
                 has_history=has_history,
+                has_tools=has_tools,
                 instructions_len=len(instructions),
             )
             await self.send_to_frontend(event.prompt)
-        elif isinstance(event.prompt, list):
-            system_parts: list[str] = []
-            user_text = ""
-            for msg in event.prompt:
-                if msg.get("role") == "system":
-                    system_parts.append(str(msg.get("content", "")))
-                elif msg.get("role") == "user":
-                    user_text = str(msg.get("content", ""))
-
-            instructions = "\n\n".join(system_parts)
-
+        else:
             response_create: dict[str, Any] = {
                 "type": "response.create",
                 "response": {
                     "modalities": ["text", "audio"],
-                    "instructions": instructions,
-                },
-            }
-            if user_text:
-                response_create["response"]["input"] = [
-                    {
-                        "type": "message",
-                        "role": "user",
-                        "content": [{"type": "input_text", "text": user_text}],
-                    }
-                ]
-            await self.send_to_frontend(response_create)
-        else:
-            response_create = {
-                "type": "response.create",
-                "response": {
-                    "modalities": ["text", "audio"],
-                    "instructions": event.prompt,
+                    "instructions": event.prompt if isinstance(event.prompt, str) else "",
                 },
             }
             await self.send_to_frontend(response_create)
@@ -238,6 +216,7 @@ class OpenAIRealtimeEventBridge:
         elif event_type == "response.created":
             self._response_transcript_buffer = ""
             self._response_created_ms = _now_ms()
+            self._function_call_received = False
             send_to_created_ms = self._response_created_ms - self._response_create_sent_ms if self._response_create_sent_ms else 0
             logger.info(
                 "bridge_response_created",
@@ -245,18 +224,52 @@ class OpenAIRealtimeEventBridge:
                 response_id=data.get("response", {}).get("id"),
                 send_to_created_ms=send_to_created_ms,
             )
+            payload: dict[str, Any] = {
+                "response_source": self._current_response_source,
+            }
+            if send_to_created_ms:
+                payload["send_to_created_ms"] = send_to_created_ms
             envelope = EventEnvelope(
                 event_id=uuid4(),
                 call_id=self._call_id,
                 ts=_now_ms(),
                 type="response_created",
-                payload={"send_to_created_ms": send_to_created_ms},
+                payload=payload,
                 source=EventSource.REALTIME,
             )
 
         elif event_type == "response.audio_transcript.delta":
             delta = str(data.get("delta", ""))
             self._response_transcript_buffer += delta
+
+        elif event_type == "response.function_call_arguments.done":
+            # The model called route_to_specialist — extract routing action.
+            # This is never vocalized (separate channel from audio).
+            fn_name = str(data.get("name", ""))
+            fn_args = str(data.get("arguments", ""))
+            logger.info(
+                "bridge_function_call_received",
+                call_id=str(self._call_id),
+                function_name=fn_name,
+                arguments=fn_args[:200],
+            )
+            action = parse_function_call_action(fn_name, fn_args)
+            if action is not None:
+                self._function_call_received = True
+                voice_id = self._active_voice_generation_id
+                self._active_voice_generation_id = None
+                envelope = EventEnvelope(
+                    event_id=uuid4(),
+                    call_id=self._call_id,
+                    ts=_now_ms(),
+                    type="model_router_action",
+                    payload={
+                        "department": action.department.value,
+                        "summary": action.summary,
+                        "filler_text": self._response_transcript_buffer.strip(),
+                    },
+                    source=EventSource.REALTIME,
+                )
 
         elif event_type == "conversation.item.input_audio_transcription.completed":
             transcript = str(data.get("transcript", "")).strip()
@@ -275,6 +288,7 @@ class OpenAIRealtimeEventBridge:
             now = _now_ms()
             created_to_done_ms = now - self._response_created_ms if self._response_created_ms else 0
             total_response_ms = now - self._response_create_sent_ms if self._response_create_sent_ms else 0
+            response_status = data.get("response", {}).get("status", "completed")
             logger.info(
                 "bridge_response_done",
                 call_id=str(self._call_id),
@@ -282,35 +296,48 @@ class OpenAIRealtimeEventBridge:
                 transcript_preview=self._response_transcript_buffer[:100],
                 created_to_done_ms=created_to_done_ms,
                 total_response_ms=total_response_ms,
+                status=response_status,
+                function_call_received=self._function_call_received,
             )
             voice_id = self._active_voice_generation_id
             transcript = self._response_transcript_buffer
             self._response_transcript_buffer = ""
 
-            action = parse_model_action(transcript) if transcript else None
-            if action is not None:
-                envelope = EventEnvelope(
-                    event_id=uuid4(),
-                    call_id=self._call_id,
-                    ts=_now_ms(),
-                    type="model_router_action",
-                    payload={
-                        "department": action.department.value,
-                        "summary": action.summary,
-                    },
-                    source=EventSource.REALTIME,
-                )
-                self._active_voice_generation_id = None
+            if self._function_call_received:
+                # Routing was dispatched via function call.
+                # Emit voice_generation_completed with the filler transcript.
+                if voice_id is not None:
+                    vgc_payload: dict[str, Any] = {
+                        "voice_generation_id": str(voice_id),
+                        "transcript": transcript.strip(),
+                        "response_source": self._current_response_source,
+                    }
+                    if created_to_done_ms:
+                        vgc_payload["created_to_done_ms"] = created_to_done_ms
+                    envelope = EventEnvelope(
+                        event_id=uuid4(),
+                        call_id=self._call_id,
+                        ts=_now_ms(),
+                        type="voice_generation_completed",
+                        payload=vgc_payload,
+                        source=EventSource.REALTIME,
+                    )
+                    self._active_voice_generation_id = None
             elif voice_id is not None:
+                # Normal direct response (no function call).
+                vgc_payload = {
+                    "voice_generation_id": str(voice_id),
+                    "transcript": transcript,
+                    "response_source": self._current_response_source,
+                }
+                if created_to_done_ms:
+                    vgc_payload["created_to_done_ms"] = created_to_done_ms
                 envelope = EventEnvelope(
                     event_id=uuid4(),
                     call_id=self._call_id,
                     ts=_now_ms(),
                     type="voice_generation_completed",
-                    payload={
-                        "voice_generation_id": str(voice_id),
-                        "transcript": transcript,
-                    },
+                    payload=vgc_payload,
                     source=EventSource.REALTIME,
                 )
                 self._active_voice_generation_id = None

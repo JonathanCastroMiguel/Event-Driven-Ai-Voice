@@ -348,3 +348,154 @@ class TestBargeInStage:
         assert barge["type"] == "debug_event"
         # Barge-in shares the same turn_id
         assert barge["turn_id"] == received[0]["turn_id"]
+
+
+# ---------------------------------------------------------------------------
+# Specialist processing from response_source
+# ---------------------------------------------------------------------------
+
+
+class TestSpecialistProcessing:
+    @pytest.mark.asyncio
+    async def test_specialist_processing_emitted_for_specialist_source(self) -> None:
+        """When response_source=='specialist', emit specialist_processing instead of model_processing."""
+        coord = _make_coordinator()
+        coord.set_debug_enabled(True)
+        received: list[dict] = []
+
+        async def debug_cb(event: dict) -> None:
+            received.append(event)
+
+        coord.set_debug_callback(debug_cb)
+
+        await coord._send_debug("speech_start")
+
+        # Simulate response_created with specialist source
+        from src.voice_runtime.events import EventEnvelope
+        from src.voice_runtime.types import EventSource
+
+        envelope = EventEnvelope(
+            event_id=uuid4(),
+            call_id=coord._call_id,
+            ts=1000,
+            type="response_created",
+            payload={"response_source": "specialist", "send_to_created_ms": 42},
+            source=EventSource.REALTIME,
+        )
+        await coord.handle_event(envelope)
+
+        specialist_events = [e for e in received if e["stage"] == "specialist_processing"]
+        assert len(specialist_events) == 1
+        assert specialist_events[0]["send_to_created_ms"] == 42
+
+    @pytest.mark.asyncio
+    async def test_model_processing_emitted_for_router_source(self) -> None:
+        """When response_source=='router', emit model_processing as before."""
+        coord = _make_coordinator()
+        coord.set_debug_enabled(True)
+        received: list[dict] = []
+
+        async def debug_cb(event: dict) -> None:
+            received.append(event)
+
+        coord.set_debug_callback(debug_cb)
+
+        await coord._send_debug("speech_start")
+
+        from src.voice_runtime.events import EventEnvelope
+        from src.voice_runtime.types import EventSource
+
+        envelope = EventEnvelope(
+            event_id=uuid4(),
+            call_id=coord._call_id,
+            ts=1000,
+            type="response_created",
+            payload={"response_source": "router"},
+            source=EventSource.REALTIME,
+        )
+        await coord.handle_event(envelope)
+
+        model_events = [e for e in received if e["stage"] == "model_processing"]
+        assert len(model_events) == 1
+
+
+# ---------------------------------------------------------------------------
+# Client debug events
+# ---------------------------------------------------------------------------
+
+
+class TestClientDebugEvents:
+    @pytest.mark.asyncio
+    async def test_handle_client_debug_event_emits_through_pipeline(self) -> None:
+        """handle_client_debug_event calls _send_debug with the stage."""
+        coord = _make_coordinator()
+        coord.set_debug_enabled(True)
+        received: list[dict] = []
+
+        async def debug_cb(event: dict) -> None:
+            received.append(event)
+
+        coord.set_debug_callback(debug_cb)
+
+        await coord._send_debug("speech_start")
+        turn_id = received[0]["turn_id"]
+
+        await coord.handle_client_debug_event(
+            stage="audio_playback_start",
+            turn_id=turn_id,
+            ts=1000,
+        )
+
+        playback_events = [e for e in received if e["stage"] == "audio_playback_start"]
+        assert len(playback_events) == 1
+
+    @pytest.mark.asyncio
+    async def test_audio_playback_end_sets_flag(self) -> None:
+        """audio_playback_end sets _debug_audio_playback_end_received."""
+        coord = _make_coordinator()
+        coord.set_debug_enabled(True)
+
+        async def debug_cb(event: dict) -> None:
+            pass
+
+        coord.set_debug_callback(debug_cb)
+
+        assert coord._debug_audio_playback_end_received is False
+
+        await coord.handle_client_debug_event(
+            stage="audio_playback_end",
+            turn_id="test",
+            ts=1000,
+        )
+
+        assert coord._debug_audio_playback_end_received is True
+
+    @pytest.mark.asyncio
+    async def test_flags_reset_on_speech_start(self) -> None:
+        """speech_start resets debug flags."""
+        coord = _make_coordinator()
+        coord.set_debug_enabled(True)
+
+        async def debug_cb(event: dict) -> None:
+            pass
+
+        coord.set_debug_callback(debug_cb)
+
+        coord._debug_route_result_emitted = True
+        coord._debug_audio_playback_end_received = True
+
+        from src.voice_runtime.events import EventEnvelope
+        from src.voice_runtime.types import EventSource
+
+        envelope = EventEnvelope(
+            event_id=uuid4(),
+            call_id=coord._call_id,
+            ts=1000,
+            type="speech_started",
+            payload={},
+            source=EventSource.REALTIME,
+        )
+        await coord.handle_event(envelope)
+
+        assert coord._debug_route_result_emitted is False
+        assert coord._debug_audio_playback_end_received is False

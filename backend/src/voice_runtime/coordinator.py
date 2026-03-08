@@ -92,6 +92,8 @@ class Coordinator:
         self._debug_turn_id: UUID | None = None
         self._debug_turn_start_ms: int = 0
         self._debug_last_stage_ms: int = 0
+        self._debug_route_result_emitted: bool = False
+        self._debug_audio_playback_end_received: bool = False
         self._output_callback: Callable[
             [RealtimeVoiceStart | RealtimeVoiceCancel | CancelAgentGeneration],
             Coroutine[Any, Any, None],
@@ -194,6 +196,16 @@ class Coordinator:
 
         await self._emit_debug(event)
 
+    async def handle_client_debug_event(self, stage: str, turn_id: str, ts: int) -> None:
+        """Handle a debug event sent from the frontend (e.g., audio playback timing).
+
+        The event is integrated into the server-side debug pipeline with proper
+        delta_ms/total_ms relative to the current turn.
+        """
+        if stage == "audio_playback_end":
+            self._debug_audio_playback_end_received = True
+        await self._send_debug(stage)
+
     # ------------------------------------------------------------------
     # Persistence helpers
     # ------------------------------------------------------------------
@@ -262,7 +274,18 @@ class Coordinator:
                 case "model_router_action":
                     await self._on_model_router_action(envelope)
                 case "response_created":
-                    await self._send_debug("model_processing")
+                    response_source = envelope.payload.get("response_source", "router")
+                    send_to_created_ms = envelope.payload.get("send_to_created_ms")
+                    if response_source == "specialist":
+                        kwargs: dict[str, int] = {}
+                        if send_to_created_ms is not None:
+                            kwargs["send_to_created_ms"] = send_to_created_ms
+                        await self._send_debug("specialist_processing", **kwargs)
+                    else:
+                        kwargs = {}
+                        if send_to_created_ms is not None:
+                            kwargs["send_to_created_ms"] = send_to_created_ms
+                        await self._send_debug("model_processing", **kwargs)
                 case "voice_generation_completed":
                     await self._on_voice_completed(envelope)
                 case "voice_generation_error":
@@ -293,6 +316,8 @@ class Coordinator:
         )
 
         # Debug: speech_start (assigns new turn_id, resets timing)
+        self._debug_route_result_emitted = False
+        self._debug_audio_playback_end_received = False
         await self._send_debug("speech_start")
 
         # Cancel active voice if any (record barge-in metric)
@@ -685,15 +710,40 @@ class Coordinator:
         voice_gen_id = uuid4()
         s.active_voice_generation_id = voice_gen_id
 
-        # Build specialist response prompt
+        # Build specialist response prompt as dict (like router prompt)
+        # so history is embedded in instructions and sent correctly
         history = self._conversation_buffer.format_messages()
         tool_payload_str = str(tool_result.payload) if tool_result.ok else "Tool unavailable"
-        specialist_prompt: list[dict[str, str]] = [
-            {"role": "system", "content": self._policies.base_system},
-            {"role": "system", "content": f"The user needs help with {department}. Tool result: {tool_payload_str}"},
-            *history,
-            {"role": "user", "content": summary},
+
+        instructions_parts: list[str] = [
+            self._policies.base_system.strip(),
+            f"The user needs help with {department}. Tool result: {tool_payload_str}",
+            (
+                "IMPORTANT: Respond in the same language the customer used in the conversation history. "
+                "If the customer spoke Spanish, respond in Spanish. If English, respond in English. "
+                "The summary below is always in English for internal routing — ignore its language "
+                "and match the customer's language instead."
+            ),
         ]
+
+        if history:
+            history_lines: list[str] = []
+            for msg in history:
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                label = "User" if role == "user" else "Assistant"
+                history_lines.append(f"{label}: {content}")
+            instructions_parts.append("Conversation history:\n" + "\n".join(history_lines))
+
+        instructions_parts.append(f"Customer request: {summary}")
+
+        specialist_prompt: dict[str, Any] = {
+            "type": "response.create",
+            "response": {
+                "modalities": ["text", "audio"],
+                "instructions": "\n\n".join(instructions_parts),
+            },
+        }
 
         await self._emit_output(
             RealtimeVoiceStart(
@@ -702,6 +752,7 @@ class Coordinator:
                 voice_generation_id=voice_gen_id,
                 prompt=specialist_prompt,
                 ts=envelope.ts,
+                response_source="specialist",
             )
         )
 
@@ -773,15 +824,21 @@ class Coordinator:
                 )
             elif self._agent_fsm.state == AgentState.ROUTING:
                 # Direct route: model spoke directly (no specialist action)
-                # Emit route_result + generation_start retroactively
-                await self._send_debug("route_result", label="direct", route_type="direct")
-                await self._send_debug("generation_start")
+                response_source = envelope.payload.get("response_source", "router")
+                if response_source == "router" and not self._debug_route_result_emitted:
+                    await self._send_debug("route_result", label="direct", route_type="direct")
+                    self._debug_route_result_emitted = True
                 # Transition routing → speaking → done
                 self._agent_fsm.voice_started(envelope.ts)
                 self._agent_fsm.voice_completed(envelope.ts)
 
-            # Debug: generation_finish (both direct and delegate)
-            await self._send_debug("generation_finish")
+            # Debug: generation_finish (fallback — skip if frontend audio_playback_end already arrived)
+            if not self._debug_audio_playback_end_received:
+                created_to_done_ms = envelope.payload.get("created_to_done_ms")
+                finish_kwargs: dict[str, int] = {}
+                if created_to_done_ms is not None:
+                    finish_kwargs["created_to_done_ms"] = created_to_done_ms
+                await self._send_debug("generation_finish", **finish_kwargs)
 
             # Persist voice generation update
             if self._voice_gen_repo is not None:

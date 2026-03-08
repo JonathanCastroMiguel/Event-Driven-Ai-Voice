@@ -169,7 +169,7 @@ export function VoiceSession() {
 
       {/* Debug panel (lazy-loaded, only when toggled) — breaks out of parent max-w */}
       {debugEnabled && (
-        <div className="w-[calc(100vw-2rem)] max-w-7xl">
+        <div className="w-[90vw]">
           <DebugPanel turns={debugState.turns} />
         </div>
       )}

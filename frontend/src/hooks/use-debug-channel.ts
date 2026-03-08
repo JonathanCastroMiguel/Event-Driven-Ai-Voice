@@ -10,6 +10,8 @@ export interface DebugStage {
   ts: number;
   label?: string;
   route_type?: "direct" | "delegate";
+  send_to_created_ms?: number;
+  created_to_done_ms?: number;
 }
 
 /** A complete turn timeline with main and optional specialist sub-flow. */
@@ -78,6 +80,10 @@ export function useDebugChannel(): UseDebugChannelReturn {
     if (msg.label !== undefined) stageEntry.label = String(msg.label);
     if (msg.route_type !== undefined)
       stageEntry.route_type = msg.route_type as "direct" | "delegate";
+    if (msg.send_to_created_ms !== undefined)
+      stageEntry.send_to_created_ms = Number(msg.send_to_created_ms);
+    if (msg.created_to_done_ms !== undefined)
+      stageEntry.created_to_done_ms = Number(msg.created_to_done_ms);
 
     setState((prev) => {
       const turns = [...prev.turns];

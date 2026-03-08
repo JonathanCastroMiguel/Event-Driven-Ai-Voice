@@ -9,11 +9,13 @@ const STAGE_LABELS: Record<string, string> = {
   speech_stop: "Speech Stop",
   audio_committed: "Audio Committed",
   prompt_sent: "Prompt Sent",
-  model_processing: "Model Processing",
+  model_processing: "Model Inference",
   route_result: "Route Result",
   fill_silence: "Fill Silence",
   generation_start: "Gen Start",
   generation_finish: "Gen Finish",
+  audio_playback_start: "Audio Start",
+  audio_playback_end: "Audio End",
   barge_in: "Barge In",
   specialist_sent: "Specialist Sent",
   specialist_processing: "Specialist Processing",
@@ -21,8 +23,11 @@ const STAGE_LABELS: Record<string, string> = {
 };
 
 function stageLabel(stage: DebugStage): string {
-  if (stage.stage === "route_result" && stage.label) {
-    return `${stage.label} (${stage.route_type ?? "direct"})`;
+  if (stage.stage === "route_result") {
+    if (stage.route_type === "delegate" && stage.label) {
+      return `Delegate \u2192 ${stage.label}`;
+    }
+    return "Direct Response";
   }
   return STAGE_LABELS[stage.stage] ?? stage.stage;
 }
@@ -33,7 +38,14 @@ function deltaColor(delta_ms: number): string {
   return "border-red-500 bg-red-500/10";
 }
 
+function bridgeTimingLabel(stage: DebugStage): string | null {
+  if (stage.send_to_created_ms !== undefined) return `bridge: ${stage.send_to_created_ms}ms`;
+  if (stage.created_to_done_ms !== undefined) return `bridge: ${stage.created_to_done_ms}ms`;
+  return null;
+}
+
 function StageBox({ stage, isBarge }: { stage: DebugStage; isBarge?: boolean }) {
+  const bridgeTiming = bridgeTimingLabel(stage);
   return (
     <div
       className={cn(
@@ -49,6 +61,9 @@ function StageBox({ stage, isBarge }: { stage: DebugStage; isBarge?: boolean }) 
       <span className="text-muted-foreground">
         +{stage.delta_ms}ms / {stage.total_ms}ms
       </span>
+      {bridgeTiming && (
+        <span className="text-blue-500/70">{bridgeTiming}</span>
+      )}
     </div>
   );
 }
@@ -58,6 +73,36 @@ function Arrow() {
     <span className="text-muted-foreground text-xs shrink-0 mx-1">
       &rarr;
     </span>
+  );
+}
+
+/** Compute silence duration: Speech Stop → Audio Start (ms). */
+function computeSilenceMs(stages: DebugStage[]): number | null {
+  const speechStop = stages.find((s) => s.stage === "speech_stop");
+  const audioStart = stages.find((s) => s.stage === "audio_playback_start");
+  if (!speechStop || !audioStart) return null;
+  return audioStart.ts - speechStop.ts;
+}
+
+function silenceColor(ms: number): string {
+  if (ms < 500) return "text-green-600";
+  if (ms < 1000) return "text-yellow-600";
+  return "text-red-600";
+}
+
+function SilenceBanner({ stages }: { stages: DebugStage[] }) {
+  const silenceMs = computeSilenceMs(stages);
+  if (silenceMs === null) return null;
+  return (
+    <div className="flex items-center gap-2 mb-1 text-[11px] font-mono">
+      <span className="text-muted-foreground">Response time:</span>
+      <span className={cn("font-bold", silenceColor(silenceMs))}>
+        {silenceMs}ms
+      </span>
+      <span className="text-muted-foreground/60">
+        (Speech Stop → Audio Start)
+      </span>
+    </div>
   );
 }
 
@@ -77,6 +122,7 @@ export function TurnTimeline({ turn }: TurnTimelineProps) {
 
     return (
       <div className="space-y-1">
+        <SilenceBanner stages={turn.stages} />
         {/* Main row: stages up to route_result, then fill_silence + generation */}
         <div className="flex items-center overflow-x-auto gap-1 pb-1">
           {beforeRoute.map((s, i) => (
@@ -109,13 +155,16 @@ export function TurnTimeline({ turn }: TurnTimelineProps) {
 
   // Single row for direct routes
   return (
-    <div className="flex items-center overflow-x-auto gap-1">
+    <div>
+      <SilenceBanner stages={turn.stages} />
+      <div className="flex items-center overflow-x-auto gap-1">
       {turn.stages.map((s, i) => (
         <span key={i} className="flex items-center gap-1">
           {i > 0 && <Arrow />}
           <StageBox stage={s} isBarge={s.stage === "barge_in"} />
         </span>
       ))}
+      </div>
     </div>
   );
 }
