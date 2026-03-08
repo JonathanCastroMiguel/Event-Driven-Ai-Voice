@@ -20,7 +20,7 @@ Detailed documentation of the Event-Driven Voice Runtime: actors, events, proces
 - [5. Model-as-Router Architecture](#5-model-as-router-architecture)
   - [5.1 RouterPromptBuilder](#51-routerpromptbuilder)
   - [5.2 RouterPromptTemplate](#52-routerprompttemplate)
-  - [5.3 parse_model_action](#53-parse_model_action)
+  - [5.3 Function Call Routing via parse_function_call_action](#53-function-call-routing-via-parse_function_call_action)
   - [5.4 Embedding Pipeline (Analytics Only)](#54-embedding-pipeline-analytics-only)
   - [5.5 Router Registry](#55-router-registry)
   - [5.6 Language Detection](#56-language-detection)
@@ -73,7 +73,7 @@ Coordinator (CallSession)
     ↔ Agent FSM            (state tracking: IDLE→ROUTING→SPEAKING→...)
     ↔ ToolExecutor         (tool execution)
     ↔ RouterPromptBuilder  (builds response.create payloads for model-as-router)
-    ↔ RealtimeEventBridge   (OpenAI Realtime API commands + JSON action detection)
+    ↔ RealtimeEventBridge   (OpenAI Realtime API commands + function call routing)
 ```
 
 The browser receives OpenAI events via WebRTC data channel for UI display (transcriptions, speaking indicators). The backend receives the same events via a server-side WebSocket, translates them to EventEnvelopes, and feeds them to the Coordinator for model-as-router dispatch and response control.
@@ -288,7 +288,7 @@ The Coordinator is the central orchestrator for a single call. One `Coordinator`
 |---|---|---|
 | `speech_started` | `_on_speech_started` | Barge-in: cancel active voice + generation + filler. Forward to TurnManager |
 | `audio_committed` | `_on_audio_committed` | **Primary turn trigger**: finalizes turn via TurnManager, builds router prompt via `RouterPromptBuilder`, emits `response.create` to the Realtime model. The model classifies intent AND responds in a single inference |
-| `model_router_action` | `_on_model_router_action` | Handles specialist JSON actions returned by the model (e.g., `{"action":"specialist","department":"billing","summary":"..."}`) — dispatches to specialist agent |
+| `model_router_action` | `_on_model_router_action` | Handles `route_to_specialist` function calls from the model — dispatches to specialist agent with department, summary, and filler text |
 | `transcript_final` | `_on_transcript_final` | **Async logging only**: persists transcript text to DB, appends to conversation buffer, emits debug display. No longer triggers routing or turn finalization |
 | `request_guided_response` | `_on_request_guided_response` | Build prompt from policy, emit `RealtimeVoiceStart` |
 | `request_agent_action` | `_on_request_agent_action` | Emit specialist voice start (optionally with filler) |
@@ -318,7 +318,7 @@ On the first turn the buffer is empty, so the prompt is `[system, policy, user]`
 
 **Conversation Buffer** (`backend/src/voice_runtime/conversation_buffer.py`): A `ConversationBuffer` instance is created per call alongside `CoordinatorRuntimeState`. It accumulates `TurnEntry` records (frozen dataclass: `seq`, `user_text`, `route_a_label`, `policy_key`, `specialist`) after each successful `RealtimeVoiceStart` emission. Cancelled turns (barge-in) are never appended. The buffer enforces two bounds: `max_turns` (sliding window, default 10) and `max_chars` (character budget on total `user_text`, default 2000). `format_messages()` returns alternating `user`/`assistant` messages where assistant content is `[{policy_key}] Guided response` or `[{route_a_label}] Specialist: {specialist}`.
 
-**Model-as-Router Pattern**: Instead of running an embedding classification pipeline, the Coordinator uses `RouterPromptBuilder` to construct a `response.create` payload containing a structured router prompt (from `RouterPromptTemplate`) plus conversation history formatted via `format_history()` (from `backend/src/routing/context.py`). The Realtime model classifies intent AND responds in a single inference. For simple intents (~60-70% of turns), the model speaks directly. For specialist routing, the model returns a JSON action `{"action":"specialist","department":"billing","summary":"..."}` which the bridge detects and emits as a `model_router_action` event.
+**Model-as-Router Pattern**: Instead of running an embedding classification pipeline, the Coordinator uses `RouterPromptBuilder` to construct a `response.create` payload containing a structured router prompt (from `RouterPromptTemplate`) plus conversation history formatted via `format_history()` (from `backend/src/routing/context.py`). The Realtime model classifies intent AND responds in a single inference. For simple intents (~60-70% of turns), the model speaks directly. For specialist routing, the model speaks a natural filler AND calls `route_to_specialist()` as a function call (never vocalized), which the bridge detects via `response.function_call_arguments.done` and emits as a `model_router_action` event.
 
 **Routing context** (`backend/src/routing/context.py`): The `format_history()` function replaces the former `RoutingContextBuilder` class. It formats conversation buffer entries into a simple history string included in the router prompt, enabling the model to reason about conversational continuity.
 
@@ -399,7 +399,7 @@ DONE, CANCELLED, ERROR are terminal states
 
 **Two response modes:**
 1. **Direct voice (~60-70%)**: Model speaks directly for simple intents. Flow: IDLE → ROUTING → SPEAKING → DONE
-2. **JSON action**: Model returns `{"action":"specialist","department":"billing","summary":"..."}`. Flow: IDLE → ROUTING → WAITING_TOOLS → SPEAKING → DONE
+2. **Function call routing**: Model speaks filler AND calls `route_to_specialist()`. Flow: IDLE → ROUTING → WAITING_TOOLS → SPEAKING → DONE
 
 **Output**: `AgentFSMOutput` dataclass containing `state_changes`, `guided_responses`, and `agent_actions` lists.
 
@@ -441,7 +441,7 @@ The original architecture used a **multi-step embedding classification pipeline*
 | **Context** | Limited enrichment window for short texts | Full conversation history in every prompt |
 | **Maintenance** | Training examples, thresholds, centroid calibration | Single YAML prompt template |
 | **Ambiguity handling** | Confidence thresholds + `clarify_department` policy | Model asks clarification naturally in conversation |
-| **Code complexity** | 6 classification steps, 3 fallback layers | 1 prompt builder, 1 JSON action parser |
+| **Code complexity** | 6 classification steps, 3 fallback layers | 1 prompt builder, 1 function call parser |
 
 The embedding pipeline is preserved for offline analytics (A/B comparison, confidence distribution analysis) and as a potential degraded-mode fallback.
 
@@ -901,7 +901,7 @@ User says "tengo un problema con mi factura" (turn 1), "no me llega el recibo" (
 === Turn 1: "tengo un problema con mi factura" ===
 1. speech_started → audio_committed
 2. RouterPromptBuilder.build(history=[]) → response.create with router prompt
-3. Model → JSON action: {"action":"specialist","department":"billing","summary":"..."}
+3. Model → speaks filler + calls route_to_specialist(department="billing", summary="...")
 4. transcript_final arrives async → buffer.append(TurnEntry(seq=1, ...))
 
 === Turn 2: "no me llega el recibo" ===
@@ -1031,7 +1031,7 @@ model_router_action_received:
   call_id, department, summary, agent_generation_id
 ```
 
-For direct voice responses (no JSON action), no additional log is emitted — the model speaks directly and the existing `voice_generation_completed` log covers it.
+For direct voice responses (no function call), no additional log is emitted — the model speaks directly and the existing `voice_generation_completed` log covers it.
 
 > **Note**: The legacy `routing_decision` structured log (with `route_a_label`, `route_a_score`, `route_b_label`, `route_b_score`, `margin`, `short_circuit`, `fallback_used`) is no longer emitted on the hot path. It remains available in the offline analytics pipeline.
 

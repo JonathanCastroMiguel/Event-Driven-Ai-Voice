@@ -18,19 +18,19 @@ On receiving `audio_committed` (translated from `input_audio_buffer.committed`),
 - **THEN** the Coordinator SHALL build the router prompt with an empty input array (no conversation history)
 
 ### Requirement: Model router response handling
-The Coordinator SHALL handle two response modes from the Realtime model: (a) direct voice response (model speaks the answer) and (b) JSON action (model returns specialist routing instruction). On receiving `model_router_action` from the Bridge, the Coordinator SHALL dispatch specialist tool execution. On receiving `voice_generation_completed` (direct voice), the Coordinator SHALL finalize the turn normally.
+The Coordinator SHALL handle two response modes from the Realtime model: (a) direct voice response (model speaks the answer) and (b) function call routing (model speaks a filler AND calls `route_to_specialist()`). On receiving `model_router_action` from the Bridge (triggered by `response.function_call_arguments.done`), the Coordinator SHALL dispatch specialist tool execution. On receiving `voice_generation_completed` (direct voice), the Coordinator SHALL finalize the turn normally.
 
 #### Scenario: Direct voice response completes
-- **WHEN** the Bridge emits `voice_generation_completed` (model spoke directly)
+- **WHEN** the Bridge emits `voice_generation_completed` (model spoke directly, no function call)
 - **THEN** the Coordinator SHALL clear `active_voice_generation_id`, finalize the agent generation as completed, and append the turn to the conversation buffer
 
-#### Scenario: JSON action triggers specialist tool
-- **WHEN** the Bridge emits `model_router_action` with `department="billing"` and `summary="billing issue"`
-- **THEN** the Coordinator SHALL dispatch tool execution for the billing specialist, optionally emit a filler voice, and on tool result emit a final `realtime_voice_start` with the specialist response
+#### Scenario: Function call triggers specialist tool
+- **WHEN** the Bridge emits `model_router_action` with `department="billing"` and `summary="billing issue"` (from `route_to_specialist` function call)
+- **THEN** the Coordinator SHALL dispatch tool execution for the billing specialist. The model's filler audio plays naturally while the function call is processed — no separate filler emission needed since the model speaks the filler simultaneously with the function call.
 
-#### Scenario: JSON action with filler strategy
-- **WHEN** a `model_router_action` is received and filler strategy is enabled
-- **THEN** the Coordinator SHALL emit a filler `realtime_voice_start` before dispatching tool execution
+#### Scenario: Specialist prompt with language instruction
+- **WHEN** a specialist tool result is ready and conversation history exists
+- **THEN** the Coordinator SHALL build the specialist prompt as a `response.create` dict with conversation history and language instruction embedded in `instructions`, ensuring the specialist responds in the customer's language
 
 ### Requirement: Barge-in handling
 On receiving `speech_started` while `active_voice_generation_id` is set, the Coordinator SHALL: (1) emit `realtime_voice_cancel(active_voice_generation_id)`, (2) emit `cancel_agent_generation(active_agent_generation_id)`, (3) add both IDs to their respective cancelled sets, (4) forward the event to TurnManager.
@@ -100,3 +100,47 @@ When the router prompt is not available and the Coordinator falls back to a defa
 #### Scenario: Fallback with history
 - **WHEN** the Coordinator uses the fallback prompt path with existing conversation history
 - **THEN** the `response.create` payload SHALL contain history in `instructions` and MUST NOT contain a `response.input` field
+
+### Requirement: Client debug event integration
+
+The Coordinator SHALL receive `client_debug_event` messages forwarded from the WebSocket handler and integrate them into the debug pipeline.
+
+#### Scenario: Audio playback start from frontend
+- **WHEN** a `client_debug_event` with `stage="audio_playback_start"` arrives
+- **THEN** the Coordinator SHALL call `_send_debug("audio_playback_start")` with proper `delta_ms`/`total_ms` relative to `_debug_turn_start_ms`
+
+#### Scenario: Audio playback end from frontend
+- **WHEN** a `client_debug_event` with `stage="audio_playback_end"` arrives
+- **THEN** the Coordinator SHALL call `_send_debug("audio_playback_end")` and set `_debug_audio_playback_end_received = True`
+
+#### Scenario: Fallback generation_finish when frontend event missing
+- **WHEN** `_on_voice_completed` fires and `_debug_audio_playback_end_received` is False (barge-in, disconnect)
+- **THEN** the Coordinator SHALL emit `_send_debug("generation_finish")` as a fallback
+
+### Requirement: Bridge timing data in debug events
+
+The Coordinator SHALL read timing metrics from EventEnvelope payloads and forward them in debug events.
+
+#### Scenario: Model processing with bridge timing
+- **WHEN** `response_created` payload includes `send_to_created_ms` and `response_source`
+- **THEN** the Coordinator SHALL emit `_send_debug("model_processing", send_to_created_ms=...)` for router responses, or `_send_debug("specialist_processing")` for specialist responses
+
+#### Scenario: Generation finish with bridge timing
+- **WHEN** `voice_generation_completed` payload includes `created_to_done_ms`
+- **THEN** the Coordinator SHALL pass `created_to_done_ms` as an extra field in the debug event
+
+### Requirement: Direct route result at response.done
+
+On `voice_generation_completed` for router responses with no prior `model_router_action`, the Coordinator SHALL emit `_send_debug("route_result", label="direct", route_type="direct")`. The Coordinator SHALL NOT emit `generation_start` from the backend — this now comes from the frontend as `audio_playback_start`.
+
+#### Scenario: Direct route result emitted
+- **WHEN** `voice_generation_completed` arrives with `response_source="router"` and no function call was received
+- **THEN** the Coordinator SHALL emit `route_result(direct)` and set `_debug_route_result_emitted = True`
+
+### Requirement: Specialist prompt as dict with embedded history
+
+The Coordinator SHALL build specialist prompts as a `response.create` dict (not list) with conversation history and language instruction embedded in the `instructions` field.
+
+#### Scenario: Specialist responds in customer's language
+- **WHEN** the customer spoke Spanish and a specialist tool result is ready
+- **THEN** the specialist `response.create` payload SHALL include: base system prompt, department context, tool result, language instruction ("Respond in the same language the customer used"), and conversation history — all in the `instructions` field
