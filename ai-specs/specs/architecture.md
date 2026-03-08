@@ -455,7 +455,9 @@ The Realtime voice model serves as the primary router. Instead of a multi-step e
 
 `RouterPromptBuilder` constructs `response.create` payloads for the Realtime API. It combines:
 1. A `RouterPromptTemplate` (loaded from YAML) containing the system instructions for routing behavior
-2. Conversation history formatted via `format_history()` from `context.py`
+2. Conversation history embedded as text within the `instructions` field (appended after the system prompt as a `Conversation history:` section)
+
+**Important**: History is embedded in `instructions` (not `response.input`) to preserve OpenAI's native conversation context, which includes the current turn's committed audio buffer. Using `response.input` would override the native context and cause the model to ignore the user's current speech.
 
 The resulting payload is sent as a `response.create` message to OpenAI. The model reads the router prompt, classifies the user's intent, and either:
 - **Speaks directly** (~60-70% of turns): For simple intents (greetings, guardrails, general questions), the model generates a voice response inline
@@ -469,7 +471,7 @@ YAML-defined prompt template that instructs the Realtime model on:
 - Available departments and their descriptions
 - When to speak directly vs. return a JSON action
 - Guardrail rules (disallowed content, out-of-scope handling)
-- Response style and language guidelines
+- Response style and dynamic language guidelines (respond in the customer's language)
 
 Loaded at startup and injected into `RouterPromptBuilder`.
 
@@ -645,7 +647,7 @@ Browser ←WebSocket→ Backend (event forwarding, both directions)
 | `response.failed` | `type="voice_generation_error"` |
 
 **Output event translation (Coordinator → OpenAI):**
-- `send_voice_start(RealtimeVoiceStart)` with message array → single `response.create` with `instructions` (combined system messages) and `input` (user message). No per-turn `session.update` — instructions are passed inline to avoid the ~500ms round-trip.
+- `send_voice_start(RealtimeVoiceStart)` with dict payload (from RouterPromptBuilder) → sent directly as `response.create` with conversation history embedded in `instructions`. No `response.input` — preserves OpenAI's native conversation context (current turn audio). No per-turn `session.update` — instructions are passed inline to avoid the ~500ms round-trip.
 - `send_voice_start(RealtimeVoiceStart)` with string prompt → `response.create` (filler/simple response)
 - `send_voice_cancel(RealtimeVoiceCancel)` → `response.cancel`
 
@@ -660,7 +662,7 @@ The backend acts as a **SDP signaling proxy**, **session lifecycle manager**, an
    - Input: `bridge.on_event(coordinator.handle_event)` — OpenAI events reach the Coordinator
    - Output: `coordinator.set_output_callback(fn)` — Coordinator commands (RealtimeVoiceStart, RealtimeVoiceCancel) are dispatched to `bridge.send_voice_start()` / `bridge.send_voice_cancel()`
 2. `POST /calls/{call_id}/offer` performs a **two-step SDP exchange** with OpenAI:
-   - Step 1: `POST /v1/realtime/sessions` with session config (model, modalities, `input_audio_transcription`, `turn_detection` with `create_response: false`) → returns an ephemeral key
+   - Step 1: `POST /v1/realtime/sessions` with session config (model, modalities, `input_audio_transcription` with Whisper auto-language-detection, `turn_detection` with `create_response: false`) → returns an ephemeral key
    - Step 2: `POST /v1/realtime` with the ephemeral key and SDP offer → returns the SDP answer
    - The server API key is only used for the sessions call — the ephemeral key is used for the SDP exchange, so the API key is never exposed to the browser
 3. `WS /calls/{call_id}/events` establishes bidirectional event forwarding:

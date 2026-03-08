@@ -1,5 +1,3 @@
-## ADDED Requirements
-
 ### Requirement: Router prompt template definition
 The model-router SHALL define a router system prompt template stored in `router_registry/v1/router_prompt.yaml`. The template SHALL contain sections for: (1) base system identity (call center agent persona), (2) router decision rules (when to speak directly vs. return JSON), (3) department definitions (sales, billing, support, retention), (4) guardrail rules (disallowed content, out-of-scope topics), (5) language instruction (respond in same language as user).
 
@@ -45,20 +43,26 @@ The JSON action returned by the model for specialist routing SHALL conform to th
 - **WHEN** the model returns text that starts with `{` but is not valid JSON
 - **THEN** the parser SHALL treat the response as a direct voice response and log a warning for prompt tuning
 
-### Requirement: Router prompt builder
-The model-router SHALL provide a `RouterPromptBuilder` that constructs the full router prompt from the template and dynamic conversation context. The builder SHALL accept conversation history (from ConversationBuffer) and format it as message pairs for the `input` array of `response.create`.
+### Requirement: RouterPromptBuilder builds response.create payloads
 
-#### Scenario: First turn (no history)
-- **WHEN** the conversation buffer is empty
-- **THEN** the builder SHALL return a `response.create` payload with `instructions` set to the router prompt template and an empty `input` array
+The RouterPromptBuilder SHALL embed conversation history as text within the `instructions` field of the `response.create` payload. The payload MUST NOT include a `response.input` field, as this overrides OpenAI's native conversation context (including committed audio from the current turn).
 
-#### Scenario: Subsequent turn with history
-- **WHEN** the conversation buffer contains 2 prior turns with user texts "hola" and "quiero ver mi factura"
-- **THEN** the builder SHALL return a `response.create` payload with `instructions` set to the router prompt template and `input` containing the prior turns as user/assistant message pairs
+History format in instructions:
+```
+Conversation history:
+User: <text>
+Assistant: <text>
+...
+```
 
-#### Scenario: History truncation
-- **WHEN** the conversation buffer contains more turns than `max_history_turns`
-- **THEN** the builder SHALL include only the most recent N turns (governed by buffer limits) in the `input` array
+#### Scenario: Build with no history
+- **WHEN** `build_response_create` is called with an empty history list
+- **THEN** the payload SHALL contain only `instructions` (system prompt) with no `Conversation history:` section and no `input` field
+
+#### Scenario: Build with multi-turn history
+- **WHEN** `build_response_create` is called with a history list of user/assistant messages
+- **THEN** the payload `instructions` SHALL contain the system prompt followed by a `Conversation history:` section with all turns formatted as `User: <text>` / `Assistant: <text>`
+- **AND** the payload MUST NOT contain a `response.input` field
 
 ### Requirement: JSON action parser
 The model-router SHALL provide a `parse_model_action` function that takes accumulated response transcript text and determines whether it is a valid JSON action or a direct voice response.
@@ -74,3 +78,15 @@ The model-router SHALL provide a `parse_model_action` function that takes accumu
 #### Scenario: JSON with wrong schema
 - **WHEN** the accumulated transcript is `{"type": "something_else", "data": 123}`
 - **THEN** `parse_model_action` SHALL return `None` and log a warning
+
+### Requirement: Router prompt supports dynamic language
+
+The router prompt `language_instruction` section SHALL instruct the model to respond in the same language the customer is speaking, rather than forcing a single language.
+
+#### Scenario: Customer speaks Spanish
+- **WHEN** the customer speaks in Spanish
+- **THEN** the model SHALL respond in Spanish
+
+#### Scenario: Customer speaks English
+- **WHEN** the customer speaks in English
+- **THEN** the model SHALL respond in English

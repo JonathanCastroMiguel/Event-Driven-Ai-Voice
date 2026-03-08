@@ -1,5 +1,3 @@
-## ADDED Requirements
-
 ### Requirement: Audio committed event translation
 The Bridge SHALL translate `input_audio_buffer.committed` events from OpenAI into Coordinator EventEnvelopes with `type="audio_committed"` and `source=EventSource.REALTIME`.
 
@@ -33,8 +31,6 @@ The Bridge SHALL maintain a `_response_transcript_buffer` (string) that accumula
 - **WHEN** a new `response.created` event arrives
 - **THEN** the Bridge SHALL clear the `_response_transcript_buffer` to empty string
 
-## MODIFIED Requirements
-
 ### Requirement: OpenAI event to EventEnvelope translation (input direction)
 The bridge SHALL translate incoming OpenAI Realtime events into Coordinator EventEnvelopes. The following event types SHALL be translated: `input_audio_buffer.speech_started` → `speech_started`, `input_audio_buffer.speech_stopped` → `speech_stopped`, `input_audio_buffer.committed` → `audio_committed`, `conversation.item.input_audio_transcription.completed` → `transcript_final`, `response.done` → `voice_generation_completed` OR `model_router_action` (depending on JSON action detection), `response.failed` → `voice_generation_error`.
 
@@ -60,3 +56,30 @@ The one-time `session.update` sent on WebSocket connection SHALL include `silenc
 #### Scenario: Session update with default silence duration
 - **WHEN** no `VAD_SILENCE_DURATION_MS` environment variable is set
 - **THEN** the `session.update` SHALL include `turn_detection.silence_duration_ms: 500`
+
+### Requirement: OpenAI round-trip timing
+
+The bridge SHALL measure and log timing for the OpenAI Realtime API round-trip:
+- `send_to_created_ms`: time from sending `response.create` to receiving `response.created`
+- `created_to_done_ms`: time from `response.created` to `response.done`
+- `total_response_ms`: time from sending `response.create` to `response.done`
+
+#### Scenario: Response timing logged
+- **WHEN** a response cycle completes (response.create sent → response.done received)
+- **THEN** structured logs SHALL include `send_to_created_ms`, `created_to_done_ms`, and `total_response_ms`
+
+### Requirement: Agent transcript in voice_generation_completed
+
+The bridge SHALL include the accumulated response transcript in the `voice_generation_completed` event payload, enabling the conversation buffer to store agent responses.
+
+#### Scenario: Transcript included in completion event
+- **WHEN** `response.done` is received with a non-empty transcript buffer
+- **THEN** the `voice_generation_completed` EventEnvelope payload SHALL include `transcript` with the full response text
+
+### Requirement: Bridge handles dict prompt with history detection
+
+When `send_voice_start` receives a dict prompt (from RouterPromptBuilder), the bridge SHALL log whether conversation history is present by checking for `Conversation history:` in the instructions field.
+
+#### Scenario: Dict prompt with history
+- **WHEN** `send_voice_start` receives a dict prompt containing `Conversation history:` in instructions
+- **THEN** the bridge SHALL log `has_history=True` and `instructions_len`
