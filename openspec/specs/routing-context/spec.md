@@ -1,74 +1,38 @@
-## ADDED Requirements
+## MODIFIED Requirements
+
+### Requirement: Conversation history formatter for router prompt
+The `RoutingContextBuilder` SHALL be simplified to format conversation history from the `ConversationBuffer` as message pairs suitable for the `input` array of `response.create`. It SHALL NOT produce enriched text for embedding classification or LLM fallback context. The builder SHALL accept `max_history_turns` (from buffer limits) and format prior turns as user/assistant message pairs.
+
+#### Scenario: Format history with 2 prior turns
+- **WHEN** the conversation buffer contains 2 entries with user texts "hola" and "quiero ver mi factura"
+- **THEN** the builder SHALL return a list of message dicts: `[{"role": "user", "content": "hola"}, {"role": "assistant", "content": "<response_summary>"}, {"role": "user", "content": "quiero ver mi factura"}, {"role": "assistant", "content": "<response_summary>"}]`
+
+#### Scenario: Empty buffer returns empty list
+- **WHEN** the conversation buffer is empty (first turn)
+- **THEN** the builder SHALL return an empty list
+
+#### Scenario: History respects buffer limits
+- **WHEN** the buffer has been truncated to `max_turns` entries
+- **THEN** the builder SHALL format only the entries present in the buffer (no additional truncation)
+
+## REMOVED Requirements
 
 ### Requirement: Routing context builder produces enriched classification inputs
-The `RoutingContextBuilder` SHALL read from the `ConversationBuffer` and produce two outputs: (a) enriched text for embedding classification and (b) a context string for LLM fallback. The builder SHALL be instantiated with `routing_short_text_chars` (default: 20) and `routing_context_window` (default: 1).
-
-#### Scenario: Short follow-up text enriched with previous turn
-- **WHEN** the current `user_text` has fewer than `routing_short_text_chars` characters AND the conversation buffer contains at least one entry
-- **THEN** the builder SHALL return `enriched_text` as `"{prev_user_text}. {current_text}"` using the most recent buffer entry's `user_text`
-
-#### Scenario: Long self-contained text not enriched
-- **WHEN** the current `user_text` has `routing_short_text_chars` or more characters
-- **THEN** the builder SHALL return `enriched_text` as `None` (no enrichment)
-
-#### Scenario: Empty buffer produces no enrichment
-- **WHEN** the conversation buffer is empty (first turn of the call)
-- **THEN** the builder SHALL return `enriched_text` as `None` and `llm_context` as `None`
+**Reason**: Embedding-based routing is replaced by model-as-router. The builder no longer needs to produce enriched text for embedding classification or structured LLM fallback context. The Realtime model classifies directly from audio.
+**Migration**: Use the simplified `format_history` method for conversation context in the router prompt.
 
 ### Requirement: LLM context window independent from embedding context window
-The `RoutingContextBuilder` SHALL accept a separate `llm_context_window` parameter (default: 3) controlling how many prior turns are included in the `llm_context` output. This is independent of `routing_context_window` which controls embedding enrichment only.
-
-#### Scenario: Builder instantiated with both window sizes
-- **WHEN** the builder is created with `context_window=1` and `llm_context_window=3`
-- **THEN** it SHALL use 1 entry for embedding enrichment and up to 3 entries for LLM context
-
-#### Scenario: LLM context window defaults to 3
-- **WHEN** `llm_context_window` is not explicitly provided
-- **THEN** the builder SHALL default to `llm_context_window=3`
+**Reason**: No separate embedding and LLM context windows needed. The model receives conversation history directly — no distinction between embedding enrichment and LLM fallback context.
+**Migration**: Single `max_history_turns` parameter from ConversationBuffer governs history length.
 
 ### Requirement: LLM fallback context includes previous turn
-The `RoutingContextBuilder` SHALL always produce an `llm_context` string when the conversation buffer is non-empty, regardless of the short text threshold. The `llm_context` SHALL include up to `llm_context_window` prior turns in a structured multi-turn format with labeled turn entries.
-
-#### Scenario: LLM context with 3 prior turns
-- **WHEN** the conversation buffer contains 3+ entries with `user_text` values `["mi factura", "no me llega", "y ahora tampoco"]` and routes `["billing", "billing", "billing"]` AND `llm_context_window` is 3 AND current `user_text` is "de este mes" AND `language` is "es"
-- **THEN** the builder SHALL return `llm_context` as:
-```
-language=es
-turn[-3] user: mi factura
-turn[-3] route: billing
-turn[-2] user: no me llega
-turn[-2] route: billing
-turn[-1] user: y ahora tampoco
-turn[-1] route: billing
-```
-
-#### Scenario: LLM context with fewer turns than window
-- **WHEN** the conversation buffer contains 1 entry with `user_text="mi factura"` and `route_a_label="domain"` AND `llm_context_window` is 3
-- **THEN** the builder SHALL return `llm_context` with only 1 turn block (no padding):
-```
-language=es
-turn[-1] user: mi factura
-turn[-1] route: domain
-```
-
-#### Scenario: LLM context is None on first turn
-- **WHEN** the conversation buffer is empty
-- **THEN** the builder SHALL return `llm_context` as `None`
-
-#### Scenario: LLM context with window of 1 matches legacy format
-- **WHEN** `llm_context_window` is 1 AND the buffer contains entries
-- **THEN** the builder SHALL return a single-turn `llm_context` with the same information as the multi-turn format (1 turn block)
+**Reason**: LLM fallback is removed. The Realtime model is the only classifier.
+**Migration**: Conversation history is included in the router prompt's `input` array directly.
 
 ### Requirement: Original user text preserved
-The `RoutingContextBuilder` SHALL NOT modify the original `user_text`. The enriched outputs are for classification only — prompt construction and buffer storage SHALL continue using the original text.
-
-#### Scenario: Enriched text does not replace original
-- **WHEN** the builder produces `enriched_text = "mi factura. de este mes"`
-- **THEN** the original `user_text` "de este mes" SHALL be used for prompt construction, buffer append, and logging
+**Reason**: Still true conceptually but the requirement is moot — there is no enriched text that could replace the original. The buffer stores original text as before.
+**Migration**: No action needed.
 
 ### Requirement: Context window respects configuration
-The `RoutingContextBuilder` SHALL use only the most recent N entries from the buffer for embedding enrichment, where N equals `routing_context_window`. For LLM context, it SHALL use the most recent M entries, where M equals `llm_context_window`.
-
-#### Scenario: Context window of 1 for embeddings, 3 for LLM
-- **WHEN** `routing_context_window` is 1 AND `llm_context_window` is 3 AND the buffer contains entries for turns 1, 2, 3, 4, 5
-- **THEN** the builder SHALL use only entry 5 (most recent) for embedding enrichment AND entries 3, 4, 5 for LLM context
+**Reason**: The separate `routing_context_window` and `llm_context_window` parameters are removed. History is governed by `ConversationBuffer.max_turns` only.
+**Migration**: Use `max_history_turns` configuration for history length.

@@ -1,96 +1,62 @@
 ## ADDED Requirements
 
-### Requirement: WebSocket connection lifecycle
-The RealtimeEventBridge SHALL open a persistent WebSocket connection to `wss://api.openai.com/v1/realtime?model={model}` using the server-side OpenAI API key. The connection SHALL be opened during SDP exchange and closed when the call ends.
+### Requirement: Audio committed event translation
+The Bridge SHALL translate `input_audio_buffer.committed` events from OpenAI into Coordinator EventEnvelopes with `type="audio_committed"` and `source=EventSource.REALTIME`.
 
-#### Scenario: WebSocket opened during SDP exchange
-- **WHEN** the SDP offer is successfully proxied to OpenAI
-- **THEN** the bridge SHALL open a WebSocket connection to the OpenAI Realtime API using the same model
+#### Scenario: Audio committed event received
+- **WHEN** the data channel forwards an `input_audio_buffer.committed` event from OpenAI
+- **THEN** the Bridge SHALL emit an EventEnvelope with `type="audio_committed"`, a new `event_id`, and the current timestamp
 
-#### Scenario: WebSocket closed on call end
-- **WHEN** `DELETE /calls/{call_id}` is called
-- **THEN** the bridge SHALL close the WebSocket connection and stop the event listener task
+### Requirement: JSON action detection from model response
+The Bridge SHALL accumulate text from `response.audio_transcript.delta` events during an active voice generation. On `response.done`, if the accumulated transcript is a valid JSON action (parsed by `parse_model_action`), the Bridge SHALL emit a `model_router_action` EventEnvelope instead of `voice_generation_completed`.
 
-#### Scenario: WebSocket connection failure
-- **WHEN** the WebSocket connection to OpenAI fails or is rejected
-- **THEN** the bridge SHALL log the error and the call SHALL continue without Coordinator integration (degraded mode)
+#### Scenario: Model responds with JSON action
+- **WHEN** the accumulated transcript from `response.audio_transcript.delta` events is `{"action": "specialist", "department": "billing", "summary": "billing issue"}` and `response.done` fires
+- **THEN** the Bridge SHALL emit an EventEnvelope with `type="model_router_action"` and `payload={"department": "billing", "summary": "billing issue"}`, and SHALL NOT emit `voice_generation_completed`
 
-#### Scenario: WebSocket disconnection during call
-- **WHEN** the WebSocket connection drops unexpectedly
-- **THEN** the bridge SHALL attempt reconnection with exponential backoff (100ms, 200ms, 400ms, max 5s) up to 3 attempts
+#### Scenario: Model responds with direct voice
+- **WHEN** the accumulated transcript is "Buenos días, ¿en qué puedo ayudarle?" and `response.done` fires
+- **THEN** the Bridge SHALL emit `voice_generation_completed` normally (no JSON action detected)
 
-### Requirement: RealtimeClient protocol implementation
-The RealtimeEventBridge SHALL implement the `RealtimeClient` protocol defined in `realtime_client.py`, providing `send_voice_start()`, `send_voice_cancel()`, `on_event()`, and `close()` methods.
+#### Scenario: Malformed JSON falls back to voice completed
+- **WHEN** the accumulated transcript starts with `{` but fails JSON parsing and `response.done` fires
+- **THEN** the Bridge SHALL emit `voice_generation_completed`, log a warning, and reset the transcript accumulator
 
-#### Scenario: send_voice_start translates to OpenAI commands
-- **WHEN** the Coordinator emits a `RealtimeVoiceStart` event with a prompt
-- **THEN** the bridge SHALL send a `session.update` message to OpenAI with the system instructions from the prompt, followed by a `response.create` message to trigger the agent response
+### Requirement: Transcript accumulation for action detection
+The Bridge SHALL maintain a `_response_transcript_buffer` (string) that accumulates text from `response.audio_transcript.delta` events. The buffer SHALL be reset on each new `response.created` event.
 
-#### Scenario: send_voice_cancel translates to response.cancel
-- **WHEN** the Coordinator emits a `RealtimeVoiceCancel` event
-- **THEN** the bridge SHALL send a `response.cancel` message to OpenAI
+#### Scenario: Transcript accumulated across deltas
+- **WHEN** three `response.audio_transcript.delta` events arrive with text "{ ", "\"action\":", " \"specialist\"}"
+- **THEN** the Bridge SHALL accumulate the full text `{"action": "specialist"}` in the buffer
 
-#### Scenario: on_event callback registration
-- **WHEN** the Coordinator registers an event callback via `on_event()`
-- **THEN** the bridge SHALL invoke this callback for every translated EventEnvelope from OpenAI
+#### Scenario: Buffer reset on new response
+- **WHEN** a new `response.created` event arrives
+- **THEN** the Bridge SHALL clear the `_response_transcript_buffer` to empty string
+
+## MODIFIED Requirements
 
 ### Requirement: OpenAI event to EventEnvelope translation (input direction)
-The bridge SHALL translate incoming OpenAI Realtime WebSocket events into Coordinator EventEnvelopes.
+The bridge SHALL translate incoming OpenAI Realtime events into Coordinator EventEnvelopes. The following event types SHALL be translated: `input_audio_buffer.speech_started` → `speech_started`, `input_audio_buffer.speech_stopped` → `speech_stopped`, `input_audio_buffer.committed` → `audio_committed`, `conversation.item.input_audio_transcription.completed` → `transcript_final`, `response.done` → `voice_generation_completed` OR `model_router_action` (depending on JSON action detection), `response.failed` → `voice_generation_error`.
 
-#### Scenario: Speech started event translation
-- **WHEN** the WebSocket receives an `input_audio_buffer.speech_started` event
-- **THEN** the bridge SHALL emit an EventEnvelope with `type="speech_started"` and `source=EventSource.REALTIME`
+#### Scenario: Committed event translation
+- **WHEN** the data channel forwards `input_audio_buffer.committed`
+- **THEN** the Bridge SHALL emit an EventEnvelope with `type="audio_committed"` and `source=EventSource.REALTIME`
 
-#### Scenario: Speech stopped event translation
-- **WHEN** the WebSocket receives an `input_audio_buffer.speech_stopped` event
-- **THEN** the bridge SHALL emit an EventEnvelope with `type="speech_stopped"` and `source=EventSource.REALTIME`
+#### Scenario: Response done with JSON action
+- **WHEN** `response.done` fires and the accumulated transcript is a valid JSON action
+- **THEN** the Bridge SHALL emit `model_router_action` instead of `voice_generation_completed`
 
-#### Scenario: Transcription completed event translation
-- **WHEN** the WebSocket receives a `conversation.item.input_audio_transcription.completed` event with a non-empty transcript
-- **THEN** the bridge SHALL emit an EventEnvelope with `type="transcript_final"`, `payload={"text": "<transcript>"}`, and `source=EventSource.REALTIME`
+#### Scenario: Response done without JSON action
+- **WHEN** `response.done` fires and the accumulated transcript is not JSON
+- **THEN** the Bridge SHALL emit `voice_generation_completed` as before
 
-#### Scenario: Empty transcription ignored
-- **WHEN** the WebSocket receives a `conversation.item.input_audio_transcription.completed` event with an empty or whitespace-only transcript
-- **THEN** the bridge SHALL NOT emit any EventEnvelope
+### Requirement: Server VAD configuration in session update
+The one-time `session.update` sent on WebSocket connection SHALL include `silence_duration_ms` in the `turn_detection` configuration. The value SHALL be configurable via the `VAD_SILENCE_DURATION_MS` environment variable (default: 500).
 
-#### Scenario: Response done event translation
-- **WHEN** the WebSocket receives a `response.done` event
-- **THEN** the bridge SHALL emit an EventEnvelope with `type="voice_generation_completed"` containing the active `voice_generation_id`
+#### Scenario: Session update with custom silence duration
+- **WHEN** `VAD_SILENCE_DURATION_MS=300` is set in the environment
+- **THEN** the `session.update` SHALL include `turn_detection.silence_duration_ms: 300`
 
-#### Scenario: Response failed event translation
-- **WHEN** the WebSocket receives a `response.failed` event
-- **THEN** the bridge SHALL emit an EventEnvelope with `type="voice_generation_error"` containing the error details
-
-### Requirement: Coordinator output to OpenAI translation (output direction)
-The bridge SHALL translate Coordinator output events into OpenAI Realtime API messages and send them to the frontend via WebSocket. The `send_to_frontend()` method SHALL be public to allow external callers (e.g., `calls.py` for session.update) to send messages through the bridge.
-
-#### Scenario: send_to_frontend is publicly accessible
-- **WHEN** external code (e.g., the WebSocket endpoint in `calls.py`) needs to send a message to the frontend
-- **THEN** it SHALL call `bridge.send_to_frontend(data)` directly (public method, not prefixed with underscore)
-
-#### Scenario: Prompt with message array sent as response.create
-- **WHEN** `send_voice_start()` is called with a prompt containing a message array (system + user messages)
-- **THEN** the bridge SHALL send a single `response.create` with `instructions` set to the combined system messages and `input` containing the user message
-
-#### Scenario: Simple string prompt sent as response.create
-- **WHEN** `send_voice_start()` is called with a simple string prompt (e.g., filler)
-- **THEN** the bridge SHALL send a `response.create` with the string as the instruction
-
-#### Scenario: Voice cancel sent as response.cancel
-- **WHEN** `send_voice_cancel()` is called
-- **THEN** the bridge SHALL send `{"type": "response.cancel"}` to the frontend
-
-### Requirement: Event listener task
-The bridge SHALL run a background asyncio task that continuously reads from the WebSocket and dispatches translated events to the registered callback.
-
-#### Scenario: Listener started on connection
-- **WHEN** the WebSocket connection is established
-- **THEN** the bridge SHALL start a background task reading WebSocket messages in a loop
-
-#### Scenario: Listener stopped on close
-- **WHEN** `close()` is called
-- **THEN** the bridge SHALL cancel the listener task and close the WebSocket
-
-#### Scenario: Malformed message handling
-- **WHEN** the WebSocket receives a message that cannot be parsed as JSON
-- **THEN** the bridge SHALL log a warning and continue listening
+#### Scenario: Session update with default silence duration
+- **WHEN** no `VAD_SILENCE_DURATION_MS` environment variable is set
+- **THEN** the `session.update` SHALL include `turn_detection.silence_duration_ms: 500`

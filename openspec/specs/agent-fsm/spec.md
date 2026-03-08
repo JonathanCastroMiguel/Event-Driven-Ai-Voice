@@ -1,120 +1,62 @@
-## ADDED Requirements
+## MODIFIED Requirements
 
 ### Requirement: Agent FSM states and transitions
-The Agent FSM SHALL implement the following states: `idle`, `thinking`, `waiting_tools`, `waiting_voice`, `done`, `cancelled`, `error`. Transitions SHALL be defined as a dict mapping and enforced — invalid transitions SHALL raise an error.
+The Agent FSM SHALL implement the following states: `idle`, `routing`, `speaking`, `waiting_tools`, `done`, `cancelled`, `error`. Transitions SHALL be defined as a dict mapping and enforced — invalid transitions SHALL raise an error.
 
-#### Scenario: Valid state transition
-- **WHEN** Agent FSM is in `idle` state and receives `handle_turn`
-- **THEN** it SHALL transition to `thinking` and emit `agent_state_changed(state="thinking")`
+#### Scenario: Routing state on audio committed
+- **WHEN** Agent FSM is in `idle` state and receives `start_routing`
+- **THEN** it SHALL transition to `routing` and emit `agent_state_changed(state="routing")`
 
-#### Scenario: Invalid state transition rejected
-- **WHEN** Agent FSM is in `done` state and receives `handle_turn`
-- **THEN** it SHALL raise an error and log the invalid transition attempt
+#### Scenario: Direct voice response from routing
+- **WHEN** Agent FSM is in `routing` state and receives `voice_started` (model is speaking directly)
+- **THEN** it SHALL transition to `speaking`
+
+#### Scenario: Specialist action from routing
+- **WHEN** Agent FSM is in `routing` state and receives `specialist_action`
+- **THEN** it SHALL transition to `waiting_tools`
+
+#### Scenario: Tool result received
+- **WHEN** Agent FSM is in `waiting_tools` state and receives `tool_result`
+- **THEN** it SHALL transition to `speaking` (specialist response being generated)
+
+#### Scenario: Voice generation completed
+- **WHEN** Agent FSM is in `speaking` state and receives `voice_completed`
+- **THEN** it SHALL transition to `done`
 
 #### Scenario: Cancellation from any active state
-- **WHEN** Agent FSM receives `cancel_agent_generation` while in `thinking` or `waiting_tools`
+- **WHEN** Agent FSM receives `cancel` while in `routing`, `speaking`, or `waiting_tools`
 - **THEN** it SHALL transition to `cancelled` and stop all processing for that generation
 
+#### Scenario: Invalid state transition rejected
+- **WHEN** Agent FSM is in `done` state and receives `start_routing`
+- **THEN** it SHALL raise an error and log the invalid transition attempt
+
+## REMOVED Requirements
+
 ### Requirement: Route A classification (intent level 1)
-The Agent FSM SHALL classify user text into one of four Route A labels: `simple`, `disallowed`, `out_of_scope`, `domain`. Classification uses embedding cosine similarity against pre-computed centroids.
-
-#### Scenario: High-confidence simple intent
-- **WHEN** user says "hola" and embedding similarity to `simple` centroid >= 0.85
-- **THEN** Agent FSM SHALL emit `request_guided_response(policy_key="greeting")`
-
-#### Scenario: Disallowed intent via lexicon match
-- **WHEN** user text contains a word from the disallowed lexicon (e.g., "idiota")
-- **THEN** Agent FSM SHALL classify as `disallowed` without running embeddings and emit `request_guided_response(policy_key="guardrail_disallowed")`
-
-#### Scenario: Out-of-scope intent
-- **WHEN** user asks "who will win the election" and embedding similarity to `out_of_scope` >= 0.82
-- **THEN** Agent FSM SHALL emit `request_guided_response(policy_key="guardrail_out_of_scope")`
-
-#### Scenario: Domain intent passes to Route B
-- **WHEN** user says "tengo un problema con mi factura" and embedding similarity to `domain` >= 0.78
-- **THEN** Agent FSM SHALL proceed to Route B classification
+**Reason**: Replaced by model-as-router architecture. The Realtime voice model performs classification and response in a single inference via the router prompt. Embedding-based Route A classification is no longer needed on the hot path.
+**Migration**: Classification is performed by the router prompt in `response.create`. The model decides whether to speak directly (simple/disallowed/out_of_scope) or return a JSON action (domain→specialist).
 
 ### Requirement: Route B classification (specialist routing)
-For `domain` intents, the Agent FSM SHALL classify into specialist departments: `sales`, `billing`, `support`, `retention`. Classification uses embedding similarity against Route B centroids.
-
-#### Scenario: High-confidence billing route
-- **WHEN** Route B embedding similarity to `billing` >= 0.82
-- **THEN** Agent FSM SHALL emit `request_agent_action(specialist="billing")`
-
-#### Scenario: Ambiguous Route B (low margin)
-- **WHEN** top-1 Route B score minus top-2 score < 0.05
-- **THEN** Agent FSM SHALL emit `request_guided_response(policy_key="clarify_department")`
+**Reason**: Replaced by model-as-router. The model returns `{"action": "specialist", "department": "<name>"}` directly, eliminating the need for a second embedding classification pass.
+**Migration**: Department routing is embedded in the router prompt. The model specifies the department in its JSON action response.
 
 ### Requirement: Short utterance handling
-For utterances with normalized length <= 5 characters, the Agent FSM SHALL first check the short utterance registry. If matched, classify as `simple` regardless of embedding score.
-
-#### Scenario: Short greeting matched
-- **WHEN** user says "hola" (4 chars) and it matches `short_utterances/es.yaml` greetings list
-- **THEN** Agent FSM SHALL classify as `simple` without running embeddings
-
-#### Scenario: Short non-matching utterance
-- **WHEN** user says "cobro" (5 chars) but it is not in short utterances
-- **THEN** Agent FSM SHALL proceed with normal embedding classification
+**Reason**: No longer needed. The model handles short utterances natively — no need for a separate registry to short-circuit embedding classification.
+**Migration**: The router prompt handles greetings and short utterances as direct voice responses.
 
 ### Requirement: 3rd-party LLM fallback for ambiguous classification
-When Route A or Route B confidence is below the high threshold AND the margin between top-2 classes < 0.05, the Agent FSM SHALL invoke a 3rd-party LLM via async HTTP for classification (temperature 0, structured JSON output). When `llm_context` is provided (non-None), the LLM fallback prompt SHALL include structured multi-turn conversation history, enabling the LLM to reason about follow-up intent across 2-3 prior turns.
-
-#### Scenario: LLM fallback invoked
-- **WHEN** Route A embedding scores are `domain=0.72, simple=0.70` (both below threshold, margin=0.02)
-- **THEN** Agent FSM SHALL call the 3rd-party LLM for classification and use the LLM result
-
-#### Scenario: LLM fallback with multi-turn conversation context
-- **WHEN** Route A is ambiguous AND `llm_context` contains 2 prior turns:
-```
-language=es
-turn[-2] user: tengo un problema con mi factura
-turn[-2] route: billing
-turn[-1] user: no me llega el recibo
-turn[-1] route: billing
-```
-- **THEN** the LLM fallback prompt SHALL include the full multi-turn context so the LLM can reason that the current ambiguous text relates to the billing domain
-
-#### Scenario: LLM fallback with single prior turn
-- **WHEN** Route A is ambiguous AND `llm_context` contains only 1 prior turn (buffer has 1 entry)
-- **THEN** the LLM fallback prompt SHALL include the single turn context block
-
-#### Scenario: LLM fallback without conversation context
-- **WHEN** Route A is ambiguous AND `llm_context` is `None` (first turn)
-- **THEN** the LLM fallback prompt SHALL use only `language={lang}` as context, matching current behavior
-
-#### Scenario: LLM fallback timeout
-- **WHEN** 3rd-party LLM call exceeds 2s timeout
-- **THEN** Agent FSM SHALL use the best embedding result as-is and log the timeout
-
-#### Scenario: LLM fallback disabled
-- **WHEN** `thresholds.yaml` has `fallback.enable_microllm: false`
-- **THEN** Agent FSM SHALL always use embedding results, never calling the LLM
+**Reason**: No longer needed. The Realtime voice model is the classifier — there is no ambiguous embedding score to trigger a fallback.
+**Migration**: The model's classification is final. If routing accuracy needs improvement, the router prompt is tuned.
 
 ### Requirement: Language detection
-The Agent FSM SHALL detect the language of user text using fasttext before classification. Detected language SHALL determine which locale-specific examples (centroids) to use.
-
-#### Scenario: Spanish detected
-- **WHEN** user text is "quiero darme de baja" and fasttext detects `es`
-- **THEN** routing SHALL use `es.yaml` centroids (with `base.yaml` fallback)
-
-#### Scenario: Unsupported language
-- **WHEN** fasttext detects a language not in `thresholds.yaml` `language.supported`
-- **THEN** routing SHALL fall back to the default language centroids
+**Reason**: Removed from hot path. The Realtime voice model handles multilingual intent natively. Language detection is no longer needed before classification.
+**Migration**: The router prompt instructs the model to respond in the same language as the user. No explicit language detection step required.
 
 ### Requirement: Classification pipeline order
-The Agent FSM SHALL classify in this exact order: (1) detect language, (2) check disallowed lexicon, (3) check short utterances, (4) embedding Route A, (5) if domain: embedding Route B, (6) if ambiguous: LLM fallback.
-
-#### Scenario: Lexicon match short-circuits pipeline
-- **WHEN** user text matches a disallowed lexicon entry
-- **THEN** classification SHALL stop at step 2 — no embeddings or LLM called
-
-#### Scenario: Full pipeline for ambiguous domain intent
-- **WHEN** user text is complex and Route B is ambiguous
-- **THEN** all 6 steps SHALL execute in order, with LLM fallback as the final classification step
+**Reason**: The 6-step classification pipeline (language → lexicon → short utterances → Route A → Route B → LLM fallback) is replaced by a single model inference via the router prompt.
+**Migration**: The entire pipeline is replaced by `response.create` with the router prompt. The model performs classification and response in one step.
 
 ### Requirement: Agent FSM does not execute tools or speak
-The Agent FSM SHALL NOT directly execute tools, call the Realtime API, or generate final response text. It SHALL only emit intent/routing events to the Coordinator.
-
-#### Scenario: Agent emits routing event only
-- **WHEN** Agent FSM classifies an intent as `billing`
-- **THEN** it SHALL emit `request_agent_action(specialist="billing")` and NOT call any tool or Realtime API
+**Reason**: Requirement text updated — the FSM still does not execute tools or speak directly, but it no longer emits routing events based on embedding classification. The FSM tracks lifecycle states only.
+**Migration**: FSM emits state transitions (`routing`, `speaking`, `waiting_tools`, `done`) instead of `request_guided_response` and `request_agent_action`.
