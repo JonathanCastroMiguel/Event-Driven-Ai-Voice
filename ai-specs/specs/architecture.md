@@ -38,7 +38,7 @@ Detailed documentation of the Event-Driven Voice Runtime: actors, events, proces
   - [8.2 Domain Route: Specialist Agent](#82-domain-route-specialist-agent)
   - [8.3 Barge-In During Voice Output](#83-barge-in-during-voice-output)
   - [8.4 Guardrail: Disallowed Content](#84-guardrail-disallowed-content)
-  - [8.5 Ambiguous Route B: Clarify Department](#85-ambiguous-route-b-clarify-department)
+  - [8.5 Ambiguous Intent: Clarify Department](#85-ambiguous-intent-clarify-department)
   - [8.6 Multi-Turn Conversation with History](#86-multi-turn-conversation-with-history)
   - [8.7 Context-Aware Routing: Short Follow-Up](#87-context-aware-routing-short-follow-up)
 - [9. Observability](#9-observability)
@@ -76,7 +76,7 @@ Coordinator (CallSession)
     ↔ RealtimeEventBridge   (OpenAI Realtime API commands + JSON action detection)
 ```
 
-The browser receives OpenAI events via WebRTC data channel for UI display (transcriptions, speaking indicators). The backend receives the same events via a server-side WebSocket, translates them to EventEnvelopes, and feeds them to the Coordinator for routing, classification, and response control.
+The browser receives OpenAI events via WebRTC data channel for UI display (transcriptions, speaking indicators). The backend receives the same events via a server-side WebSocket, translates them to EventEnvelopes, and feeds them to the Coordinator for model-as-router dispatch and response control.
 
 The Coordinator is the **single orchestrator** — it receives all events, delegates to actors, manages cancellation, idempotency, and emits voice output commands.
 
@@ -427,7 +427,27 @@ Executes tools with whitelist validation, Redis caching, timeout, and cancellati
 
 ## 5. Model-as-Router Architecture
 
-The Realtime voice model now serves as the primary router. Instead of a multi-step embedding classification pipeline, the model classifies intent AND responds in a **single inference** via `response.create` with a structured router prompt. This eliminates the embedding classification latency from the hot path.
+### Why the change
+
+The original architecture used a **multi-step embedding classification pipeline** on the hot path: language detection → lexicon check → sentence-transformer embedding → cosine similarity against centroids → optional LLM fallback. This pipeline added **200-500ms of latency** to every turn before the model could even begin responding. Moreover, it required maintaining training examples, confidence thresholds, and centroid calibration — a significant operational burden.
+
+### What we gain
+
+| Dimension | Before (Embedding Pipeline) | After (Model-as-Router) |
+|---|---|---|
+| **Latency** | 200-500ms classification + model response time | Single inference — classification and response are simultaneous |
+| **Turn trigger** | `transcript_final` (waits for Whisper transcription) | `audio_committed` (server VAD, 300ms silence) — saves 200-500ms Whisper latency |
+| **Accuracy** | Cosine similarity against static centroids | LLM reasoning over full conversation context |
+| **Context** | Limited enrichment window for short texts | Full conversation history in every prompt |
+| **Maintenance** | Training examples, thresholds, centroid calibration | Single YAML prompt template |
+| **Ambiguity handling** | Confidence thresholds + `clarify_department` policy | Model asks clarification naturally in conversation |
+| **Code complexity** | 6 classification steps, 3 fallback layers | 1 prompt builder, 1 JSON action parser |
+
+The embedding pipeline is preserved for offline analytics (A/B comparison, confidence distribution analysis) and as a potential degraded-mode fallback.
+
+### How it works
+
+The Realtime voice model serves as the primary router. Instead of a multi-step embedding classification pipeline, the model classifies intent AND responds in a **single inference** via `response.create` with a structured router prompt. This eliminates the embedding classification latency from the hot path.
 
 ### 5.1 RouterPromptBuilder
 
@@ -636,7 +656,7 @@ Browser ←WebSocket→ Backend (event forwarding, both directions)
 The backend acts as a **SDP signaling proxy**, **session lifecycle manager**, and **event forwarding hub**. It does NOT process audio or manage WebRTC peer connections. The browser connects directly to OpenAI via WebRTC for audio. Events flow through the backend via WebSocket for Coordinator integration.
 
 **Session lifecycle:**
-1. `POST /calls` creates a full runtime actor stack: Coordinator, TurnManager, AgentFSM, ToolExecutor, and RealtimeEventBridge. The bridge is wired to the Coordinator bidirectionally:
+1. `POST /calls` creates a full runtime actor stack: Coordinator, TurnManager, AgentFSM, ToolExecutor, RouterPromptBuilder, and RealtimeEventBridge. The bridge is wired to the Coordinator bidirectionally:
    - Input: `bridge.on_event(coordinator.handle_event)` — OpenAI events reach the Coordinator
    - Output: `coordinator.set_output_callback(fn)` — Coordinator commands (RealtimeVoiceStart, RealtimeVoiceCancel) are dispatched to `bridge.send_voice_start()` / `bridge.send_voice_cancel()`
 2. `POST /calls/{call_id}/offer` performs a **two-step SDP exchange** with OpenAI:
@@ -644,14 +664,14 @@ The backend acts as a **SDP signaling proxy**, **session lifecycle manager**, an
    - Step 2: `POST /v1/realtime` with the ephemeral key and SDP offer → returns the SDP answer
    - The server API key is only used for the sessions call — the ephemeral key is used for the SDP exchange, so the API key is never exposed to the browser
 3. `WS /calls/{call_id}/events` establishes bidirectional event forwarding:
-   - On connection: sends a one-time `session.update` via the bridge to configure transcription (`whisper-1`) and disable auto-response (`create_response: false`). The `/v1/realtime/sessions` endpoint does NOT reliably apply these settings, so the explicit `session.update` is required.
+   - On connection: sends a one-time `session.update` via the bridge to configure transcription (`whisper-1`), disable auto-response (`create_response: false`), and set server VAD `silence_duration_ms` (default: 300ms). The `/v1/realtime/sessions` endpoint does NOT reliably apply these settings, so the explicit `session.update` is required.
    - Receive loop: forwards browser-sent OpenAI data channel events to `bridge.handle_frontend_event()`
    - On disconnect: clears the frontend WebSocket reference via `bridge.set_frontend_ws(None)`
 4. `DELETE /calls/{call_id}` closes the bridge and removes the session.
 
-**In-memory session registry**: `_sessions: dict[UUID, CallSessionEntry]` tracks active calls. Each `CallSessionEntry` holds: `coordinator`, `turn_manager`, `agent_fsm`, `tool_executor`, `bridge`.
+**In-memory session registry**: `_sessions: dict[UUID, CallSessionEntry]` tracks active calls. Each `CallSessionEntry` holds: `coordinator`, `turn_manager`, `agent_fsm`, `tool_executor`, `bridge`, `router_prompt_builder`.
 
-**Shared singletons**: `Router` and `PoliciesRegistry` are set at app startup via `set_shared_router_and_policies()` (called in `main.py` lifespan). If not initialized, a stub `PoliciesRegistry` with default policies is used (logs `policies_not_initialized_using_stubs` warning).
+**Shared singletons**: `RouterPromptBuilder`, `Router` (analytics), and `PoliciesRegistry` are set at app startup via `set_shared_dependencies()` (called in `main.py` lifespan). If not initialized, a stub `PoliciesRegistry` with default policies is used (logs `policies_not_initialized_using_stubs` warning).
 
 **Endpoints:**
 
@@ -666,6 +686,7 @@ The backend acts as a **SDP signaling proxy**, **session lifecycle manager**, an
 - `OPENAI_API_KEY`: Required for session creation (Step 1 of SDP exchange)
 - `OPENAI_REALTIME_MODEL`: Model to use (default: `gpt-4o-realtime-preview`)
 - `MAX_CONCURRENT_CALLS`: Session limit (default: 50)
+- `VAD_SILENCE_DURATION_MS`: Server VAD silence threshold (default: 300)
 
 ---
 
@@ -801,50 +822,35 @@ User has a multi-turn conversation: "hola" → "mi factura" → "¿cuánto debo?
 
 ```
 === Turn 1: "hola" ===
-1. speech_started → transcript_final("hola")
-2. Router.classify → SIMPLE → AgentFSM → RequestGuidedResponse(policy_key="greeting")
-3. Coordinator._on_request_guided_response():
-   a. buffer.format_messages() → [] (empty, first turn)
-   b. Build prompt: [system: base, system: greeting_policy, user: "hola"]
-   c. Emit RealtimeVoiceStart
-   d. buffer.append(TurnEntry(seq=1, user_text="hola", route_a_label="greeting", policy_key="greeting"))
-4. Voice plays → voice_generation_completed
+1. speech_started → audio_committed
+2. Coordinator._on_audio_committed():
+   a. RouterPromptBuilder.build(history=[]) → response.create with router prompt
+   b. Model speaks greeting directly (simple intent)
+3. transcript_final("hola") → async: persist + append to buffer
+4. voice_generation_completed → DONE
 
 === Turn 2: "mi factura" ===
-5. speech_started (barge-in: cancels turn 1 voice) → transcript_final("mi factura")
-6. Router.classify → DOMAIN, route_b=BILLING → AgentFSM → RequestAgentAction(specialist="billing")
-7. Coordinator._on_request_agent_action():
-   a. Emit RealtimeVoiceStart(prompt="Specialist: billing. User said: mi factura")
-   b. buffer.append(TurnEntry(seq=2, user_text="mi factura", route_a_label="domain", specialist="billing"))
-8. Voice plays → voice_generation_completed
+5. speech_started (barge-in: cancels turn 1 voice) → audio_committed
+6. Coordinator._on_audio_committed():
+   a. RouterPromptBuilder.build(history=[turn 1]) → response.create with conversation context
+   b. Model returns JSON: {"action":"specialist","department":"billing","summary":"..."}
+7. Bridge detects JSON → model_router_action event
+8. Coordinator._on_model_router_action() → dispatch to billing specialist
+9. transcript_final("mi factura") → async: persist + append to buffer
 
 === Turn 3: "¿cuánto debo?" ===
-9.  speech_started → transcript_final("¿cuánto debo?")
-10. Router.classify("¿cuánto debo?", "es") → SIMPLE (classified in isolation)
-    → AgentFSM → RequestGuidedResponse(policy_key="greeting")
-11. Coordinator._on_request_guided_response():
-    a. buffer.format_messages() → [
-         {role: "user", content: "hola"},
-         {role: "assistant", content: "[greeting] Guided response"},
-         {role: "user", content: "mi factura"},
-         {role: "assistant", content: "[domain] Specialist: billing"}
-       ]
-    b. Build prompt: [
-         system: base,
-         system: greeting_policy,
-         user: "hola",                                    ← history
-         assistant: "[greeting] Guided response",          ← history
-         user: "mi factura",                               ← history
-         assistant: "[domain] Specialist: billing",        ← history
-         user: "¿cuánto debo?"                             ← current turn
-       ]
-    c. Emit RealtimeVoiceStart — LLM sees full conversation context
-    d. buffer.append(TurnEntry(seq=3, ...))
+10. speech_started → audio_committed
+11. Coordinator._on_audio_committed():
+    a. RouterPromptBuilder.build(history=[turn 1, turn 2]) → response.create
+    b. Model sees full conversation context in router prompt
+    c. Model recognizes this is a billing follow-up → returns specialist action or speaks directly
+12. transcript_final("¿cuánto debo?") → async: persist + append to buffer
 ```
 
 **Key behaviors:**
-- The router classifies with **context-aware enrichment**: short follow-up texts (< 20 chars) get enriched with the previous turn's text for embedding classification. The LLM fallback also receives conversation context when triggered. See [8.7](#87-context-aware-routing-short-follow-up) for details.
-- `TurnEntry` is appended **after** `RealtimeVoiceStart` emission — cancelled turns never enter the buffer.
+- The model-as-router sees **full conversation history** in the router prompt, enabling natural multi-turn reasoning without separate embedding enrichment.
+- `audio_committed` triggers routing immediately — transcript arrives async and is used only for logging and buffer updates.
+- `TurnEntry` is appended **after** transcript arrives — cancelled turns never enter the buffer.
 - Buffer pruning (max 10 turns, max 2000 chars of `user_text`) ensures bounded prompt growth.
 
 ### 8.7 Context-Aware Routing: Short Follow-Up
@@ -853,54 +859,32 @@ User says "tengo un problema con mi factura" (turn 1), "no me llega el recibo" (
 
 ```
 === Turn 1: "tengo un problema con mi factura" ===
-1. speech_started → transcript_final("tengo un problema con mi factura")
-2. RoutingContextBuilder.build():
-   → buffer is empty → RoutingContext(enriched_text=None, llm_context=None)
-3. Router.classify("tengo un problema con mi factura", "es")
-   → Route A: DOMAIN → Route B: BILLING
-4. AgentFSM → RequestAgentAction(specialist="billing")
-5. buffer.append(TurnEntry(seq=1, user_text="tengo un problema con mi factura", route_a_label="domain", specialist="billing"))
+1. speech_started → audio_committed
+2. RouterPromptBuilder.build(history=[]) → response.create with router prompt
+3. Model → JSON action: {"action":"specialist","department":"billing","summary":"..."}
+4. transcript_final arrives async → buffer.append(TurnEntry(seq=1, ...))
 
 === Turn 2: "no me llega el recibo" ===
-6. speech_started → transcript_final("no me llega el recibo")
-7. RoutingContextBuilder.build("no me llega el recibo", "es", buffer):
-   → len = 21 >= 20 → Layer 1 inactive (enriched_text=None)
-   → Layer 2: llm_context with 1 prior turn:
-     language=es
-     turn[-1] user: tengo un problema con mi factura
-     turn[-1] route: domain
-8. Router.classify → DOMAIN → BILLING
-9. buffer.append(TurnEntry(seq=2, user_text="no me llega el recibo", ...))
+5. speech_started → audio_committed
+6. RouterPromptBuilder.build(history=[turn 1]) → response.create
+   → Router prompt includes: conversation history with turn 1 context
+7. Model sees billing context from turn 1 → continues billing specialist routing
+8. transcript_final arrives async → buffer.append(TurnEntry(seq=2, ...))
 
-=== Turn 3: "de este mes" (11 chars, < 20 threshold) ===
-10. speech_started → transcript_final("de este mes")
-11. RoutingContextBuilder.build("de este mes", "es", buffer):
-    → len("de este mes") = 11 < 20 → Layer 1 active
-    → enriched_text = "no me llega el recibo. de este mes" (context_window=1, most recent)
-    → Layer 2: llm_context with 2 prior turns (llm_context_window=3, only 2 available):
-      language=es
-      turn[-2] user: tengo un problema con mi factura
-      turn[-2] route: domain
-      turn[-1] user: no me llega el recibo
-      turn[-1] route: domain
-12. Router.classify("de este mes", "es",
-      enriched_text="no me llega el recibo. de este mes",
-      llm_context=<multi-turn context>):
-    → Lexicon check on "de este mes" → no match
-    → Short utterance check on "de este mes" → no match
-    → Route A embeddings on enriched text → DOMAIN
-    → Route B embeddings on enriched text → BILLING
-    → If ambiguous, LLM fallback receives multi-turn llm_context for conversational reasoning
-13. AgentFSM → RequestAgentAction(specialist="billing")
-    → Correct classification despite the short, ambiguous follow-up
+=== Turn 3: "de este mes" (short follow-up) ===
+9.  speech_started → audio_committed
+10. RouterPromptBuilder.build(history=[turn 1, turn 2]) → response.create
+    → Router prompt includes full conversation history (2 prior billing turns)
+11. Model sees conversation continuity → correctly routes as billing follow-up
+    despite the short, ambiguous utterance
+12. transcript_final arrives async → buffer.append(TurnEntry(seq=3, ...))
 ```
 
 **Key behaviors:**
-- **Embedding enrichment** (Layer 1): Only applies to texts shorter than `routing_short_text_chars` (default: 20). Uses `context_window=1` (most recent turn only). Long, self-contained utterances are classified as-is.
-- **LLM fallback context** (Layer 2): Always produced when buffer is non-empty. Includes up to `llm_context_window` (default: 3) prior turns in structured format with `turn[-N] user:` and `turn[-N] route:` labels, enabling the LLM to reason about multi-turn conversation flow.
-- The two layers are independently configurable: embeddings use 1 turn, LLM uses up to 3 turns.
-- Lexicon and short utterance checks always use the original text — enrichment cannot bypass guardrails.
-- The original `user_text` is preserved for prompt construction, buffer storage, and logging.
+- The model-as-router handles short follow-ups naturally because it sees the **full conversation history** in every `response.create` payload. No separate embedding enrichment or LLM fallback layers are needed.
+- `format_history()` in `context.py` formats the conversation buffer into the router prompt, providing the model with prior turn context.
+- The original `user_text` is preserved in the conversation buffer for history formatting and logging.
+- The embedding pipeline's context enrichment layers (embedding enrichment for short texts, LLM fallback context) remain available for offline analytics comparison.
 
 ---
 
@@ -913,11 +897,11 @@ User says "tengo un problema con mi factura" (turn 1), "no me llega el recibo" (
 | Metric | Type | Description |
 |---|---|---|
 | `voice_turn_latency_ms` | Histogram | Time from finalized to voice start |
-| `voice_route_a_confidence` | Histogram | Route A scores |
-| `voice_route_b_confidence` | Histogram | Route B scores |
+| `voice_route_a_confidence` | Histogram | Route A scores (analytics pipeline only — not recorded on hot path) |
+| `voice_route_b_confidence` | Histogram | Route B scores (analytics pipeline only — not recorded on hot path) |
 | `voice_tool_execution_ms` | Histogram | Tool execution duration |
 | `voice_barge_in_total` | Counter | Barge-in events |
-| `voice_fallback_llm_total` | Counter | LLM fallback invocations |
+| `voice_fallback_llm_total` | Counter | LLM fallback invocations (analytics pipeline only — not incremented on hot path) |
 | `voice_active_calls` | Gauge | Currently active calls |
 | `voice_filler_emitted_total` | Counter | Filler voice starts |
 
@@ -938,22 +922,33 @@ The Coordinator supports an optional debug callback for real-time telemetry, use
 
 | Event Type | When | Data |
 |---|---|---|
-| `turn_update` | After `_on_human_turn_finalized` processes routing | `turn_id`, `text`, `route_a`, `route_b`, `policy_key`, `specialist` |
-| `routing` | During classification | `route_a_label`, `route_a_confidence`, `route_b_label`, `route_b_confidence`, `short_circuit`, `fallback_used` |
-| `fsm_state` | After `AgentFSM.handle_turn` | `agent_generation_id`, `state`, `guided_responses`, `agent_actions` |
-| `latency` | In `_on_request_guided_response` | `turn_processing_ms` (time from turn finalization to voice start) |
+| `turn_update` | After `_on_audio_committed` triggers model-as-router | `turn_id`, `text` (empty — transcript not yet available), `state` ("finalized") |
+| `fsm_state` | After `AgentFSM.start_routing()` | `agent_generation_id`, `state` |
+| `transcript_final` | After `_on_transcript_final` (async) | `turn_id`, `text` |
+
+> **Note**: The `routing` and `latency` debug events from the embedding classification pipeline are no longer emitted on the hot path. The model-as-router pattern eliminates the separate classification step, so there are no Route A/B confidence scores or routing latency measurements to report in real time.
 
 **Emission pattern**: Best-effort via `_emit_debug()` — exceptions are caught and logged, never crash the voice hot path.
 
-### Router Calibration Logging
+### Model-as-Router Logging
 
-Every routing decision emits a structured log (line 395 of coordinator.py):
+The Coordinator emits two structured logs per turn on the hot path:
+
+**`model_router_dispatched`** — when `response.create` is sent to the Realtime model:
 ```
-routing_decision:
-  router_version, call_id, turn_id, agent_generation_id,
-  language, route_a_label, route_a_score, route_b_label,
-  route_b_score, margin, short_circuit, fallback_used, final_action
+model_router_dispatched:
+  call_id, turn_id, agent_generation_id, has_history
 ```
+
+**`model_router_action_received`** — when the model returns a JSON specialist action:
+```
+model_router_action_received:
+  call_id, department, summary, agent_generation_id
+```
+
+For direct voice responses (no JSON action), no additional log is emitted — the model speaks directly and the existing `voice_generation_completed` log covers it.
+
+> **Note**: The legacy `routing_decision` structured log (with `route_a_label`, `route_a_score`, `route_b_label`, `route_b_score`, `margin`, `short_circuit`, `fallback_used`) is no longer emitted on the hot path. It remains available in the offline analytics pipeline.
 
 ### Sentry
 
@@ -1011,15 +1006,17 @@ Factory function `create_app()` with:
 The `lifespan()` async context manager wires everything at startup:
 
 ```
-1. setup_telemetry()        → OpenTelemetry tracer provider
-2. setup_sentry()           → Sentry SDK (if DSN configured)
-3. create_asyncpg_pool()    → PostgreSQL connection pool
-4. create_redis_pool()      → Redis connection pool
-5. load_registry()          → Router registry from YAML
-6. load_policies()          → Policy templates from YAML
-7. EmbeddingEngine.load()   → sentence-transformers model
-8. Router.precompute_centroids() → Compute all centroids
-9. Create repositories      → PgCallRepo, PgTurnRepo, PgAgentGenRepo, PgVoiceGenRepo
+1. setup_telemetry()            → OpenTelemetry tracer provider
+2. setup_sentry()               → Sentry SDK (if DSN configured)
+3. create_asyncpg_pool()        → PostgreSQL connection pool
+4. create_redis_pool()          → Redis connection pool
+5. load_registry()              → Router registry from YAML
+6. load_policies()              → Policy templates from YAML
+7. load_router_prompt_template()→ RouterPromptTemplate from router_prompt.yaml (NEW)
+8. Create RouterPromptBuilder   → Injected into Coordinator per call (NEW)
+9. EmbeddingEngine.load()       → sentence-transformers model (analytics only)
+10. Router.precompute_centroids() → Compute all centroids (analytics only)
+11. Create repositories          → PgCallRepo, PgTurnRepo, PgAgentGenRepo, PgVoiceGenRepo
 ```
 
 On shutdown: close asyncpg pool and Redis connection.
