@@ -16,6 +16,8 @@ class CoordinatorRuntimeState:
     cancelled_agent_generations: set[UUID] = field(default_factory=set)
     cancelled_voice_generations: set[UUID] = field(default_factory=set)
     turn_seq: int = 0
+    turn_speech_started_ms: int = 0  # timestamp when speech_started for current turn
+    turn_audio_committed_ms: int = 0  # timestamp when audio_committed fired
 
     def is_generation_cancelled(self, agent_generation_id: UUID) -> bool:
         return agent_generation_id in self.cancelled_agent_generations

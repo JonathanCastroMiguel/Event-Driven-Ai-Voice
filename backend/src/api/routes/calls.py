@@ -217,7 +217,9 @@ async def handle_offer(call_id: UUID, body: SDPRequest) -> SDPResponse:
             content=orjson.dumps({
                 "model": model,
                 "modalities": ["audio", "text"],
-                "input_audio_transcription": {"model": "whisper-1"},
+                "input_audio_transcription": {
+                    "model": "whisper-1",
+                },
                 "turn_detection": {
                     "type": "server_vad",
                     "create_response": False,
@@ -301,7 +303,9 @@ async def events_ws(websocket: WebSocket, call_id: UUID) -> None:
     session_update = {
         "type": "session.update",
         "session": {
-            "input_audio_transcription": {"model": "whisper-1"},
+            "input_audio_transcription": {
+                "model": "whisper-1",
+            },
             "turn_detection": {
                 "type": "server_vad",
                 "create_response": False,

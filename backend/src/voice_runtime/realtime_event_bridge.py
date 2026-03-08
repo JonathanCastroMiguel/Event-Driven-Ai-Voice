@@ -13,6 +13,7 @@ Architecture:
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any, Callable, Coroutine
 from uuid import UUID, uuid4
 
@@ -49,6 +50,8 @@ class OpenAIRealtimeEventBridge:
         self._closed = False
         self._active_voice_generation_id: UUID | None = None
         self._response_transcript_buffer: str = ""
+        self._response_create_sent_ms: int = 0
+        self._response_created_ms: int = 0
 
     # ------------------------------------------------------------------
     # RealtimeClient protocol: on_event
@@ -98,8 +101,22 @@ class OpenAIRealtimeEventBridge:
             return
 
         self._active_voice_generation_id = event.voice_generation_id
+        self._response_create_sent_ms = _now_ms()
 
-        if isinstance(event.prompt, list):
+        if isinstance(event.prompt, dict):
+            # Already a complete response.create payload from RouterPromptBuilder
+            resp = event.prompt.get("response", {})
+            instructions = resp.get("instructions", "")
+            has_history = "Conversation history:" in instructions
+            logger.info(
+                "bridge_sending_response_create",
+                call_id=str(self._call_id),
+                prompt_type="dict",
+                has_history=has_history,
+                instructions_len=len(instructions),
+            )
+            await self.send_to_frontend(event.prompt)
+        elif isinstance(event.prompt, list):
             system_parts: list[str] = []
             user_text = ""
             for msg in event.prompt:
@@ -220,6 +237,14 @@ class OpenAIRealtimeEventBridge:
 
         elif event_type == "response.created":
             self._response_transcript_buffer = ""
+            self._response_created_ms = _now_ms()
+            send_to_created_ms = self._response_created_ms - self._response_create_sent_ms if self._response_create_sent_ms else 0
+            logger.info(
+                "bridge_response_created",
+                call_id=str(self._call_id),
+                response_id=data.get("response", {}).get("id"),
+                send_to_created_ms=send_to_created_ms,
+            )
 
         elif event_type == "response.audio_transcript.delta":
             delta = str(data.get("delta", ""))
@@ -239,6 +264,17 @@ class OpenAIRealtimeEventBridge:
             )
 
         elif event_type == "response.done":
+            now = _now_ms()
+            created_to_done_ms = now - self._response_created_ms if self._response_created_ms else 0
+            total_response_ms = now - self._response_create_sent_ms if self._response_create_sent_ms else 0
+            logger.info(
+                "bridge_response_done",
+                call_id=str(self._call_id),
+                transcript_len=len(self._response_transcript_buffer),
+                transcript_preview=self._response_transcript_buffer[:100],
+                created_to_done_ms=created_to_done_ms,
+                total_response_ms=total_response_ms,
+            )
             voice_id = self._active_voice_generation_id
             transcript = self._response_transcript_buffer
             self._response_transcript_buffer = ""
@@ -263,12 +299,20 @@ class OpenAIRealtimeEventBridge:
                     call_id=self._call_id,
                     ts=_now_ms(),
                     type="voice_generation_completed",
-                    payload={"voice_generation_id": str(voice_id)},
+                    payload={
+                        "voice_generation_id": str(voice_id),
+                        "transcript": transcript,
+                    },
                     source=EventSource.REALTIME,
                 )
                 self._active_voice_generation_id = None
 
         elif event_type == "response.failed":
+            logger.error(
+                "bridge_response_failed",
+                call_id=str(self._call_id),
+                error=data.get("error"),
+            )
             voice_id = self._active_voice_generation_id
             error_detail = data.get("error", {})
             error_msg = str(
@@ -326,6 +370,4 @@ class OpenAIRealtimeEventBridge:
 
 def _now_ms() -> int:
     """Current time in epoch milliseconds."""
-    import time
-
     return int(time.time() * 1000)

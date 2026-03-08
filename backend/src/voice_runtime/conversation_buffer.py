@@ -5,15 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
-@dataclass(frozen=True)
+@dataclass
 class TurnEntry:
     """A completed turn's summary for conversation history."""
 
     seq: int
-    user_text: str
-    route_a_label: str | None = None
-    policy_key: str | None = None
-    specialist: str | None = None
+    user_text: str = ""
+    agent_text: str = ""
 
 
 class ConversationBuffer:
@@ -31,39 +29,42 @@ class ConversationBuffer:
     def __len__(self) -> int:
         return len(self._entries)
 
+    def _entry_chars(self, entry: TurnEntry) -> int:
+        return len(entry.user_text) + len(entry.agent_text)
+
+    def _prune_oldest(self) -> None:
+        """Drop oldest entries until within character budget."""
+        total = sum(self._entry_chars(e) for e in self._entries)
+        while self._entries and total > self._max_chars:
+            removed = self._entries.pop(0)
+            total -= self._entry_chars(removed)
+
     def append(self, entry: TurnEntry) -> None:
         """Append a turn entry, pruning oldest entries if limits are exceeded."""
-        # Sliding window: drop oldest if at max_turns
         while len(self._entries) >= self._max_turns:
             self._entries.pop(0)
-
-        # Character budget: drop oldest until new entry fits
-        new_chars = len(entry.user_text)
-        current_chars = sum(len(e.user_text) for e in self._entries)
-
-        if current_chars + new_chars > self._max_chars:
-            if new_chars > self._max_chars:
-                # Single entry exceeds entire budget: clear and store as-is
-                self._entries.clear()
-            else:
-                while self._entries and current_chars + new_chars > self._max_chars:
-                    removed = self._entries.pop(0)
-                    current_chars -= len(removed.user_text)
-
         self._entries.append(entry)
+
+    def update_last_user_text(self, text: str) -> None:
+        """Update the user_text of the most recent entry."""
+        if self._entries:
+            self._entries[-1].user_text = text
+            self._prune_oldest()
+
+    def update_agent_text(self, seq: int, text: str) -> None:
+        """Update the agent_text for the entry with the given seq."""
+        for entry in reversed(self._entries):
+            if entry.seq == seq:
+                entry.agent_text = text
+                self._prune_oldest()
+                return
 
     def format_messages(self) -> list[dict[str, str]]:
         """Return history as alternating user/assistant chat messages."""
         messages: list[dict[str, str]] = []
         for entry in self._entries:
-            messages.append({"role": "user", "content": entry.user_text})
-            messages.append({"role": "assistant", "content": self._format_assistant(entry)})
+            if not entry.user_text and not entry.agent_text:
+                continue
+            messages.append({"role": "user", "content": entry.user_text or "(audio)"})
+            messages.append({"role": "assistant", "content": entry.agent_text or "(no response)"})
         return messages
-
-    @staticmethod
-    def _format_assistant(entry: TurnEntry) -> str:
-        if entry.specialist is not None:
-            return f"[{entry.route_a_label}] Specialist: {entry.specialist}"
-        if entry.policy_key is not None:
-            return f"[{entry.policy_key}] Guided response"
-        return f"[{entry.route_a_label}] Response"
