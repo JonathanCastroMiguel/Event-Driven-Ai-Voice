@@ -459,9 +459,9 @@ The Realtime voice model serves as the primary router. Instead of a multi-step e
 
 **Important**: History is embedded in `instructions` (not `response.input`) to preserve OpenAI's native conversation context, which includes the current turn's committed audio buffer. Using `response.input` would override the native context and cause the model to ignore the user's current speech.
 
-The resulting payload is sent as a `response.create` message to OpenAI. The model reads the router prompt, classifies the user's intent, and either:
+The resulting payload is sent as a `response.create` message to OpenAI, including the `route_to_specialist` function tool definition with `tool_choice: "auto"`. The model reads the router prompt, classifies the user's intent, and either:
 - **Speaks directly** (~60-70% of turns): For simple intents (greetings, guardrails, general questions), the model generates a voice response inline
-- **Returns a JSON action**: For specialist routing, the model outputs `{"action":"specialist","department":"billing","summary":"..."}` instead of speaking
+- **Calls `route_to_specialist()` function**: For specialist routing, the model speaks a natural filler message (e.g., "One moment, let me connect you with our billing team") AND simultaneously calls the `route_to_specialist` function with `department` and `summary` parameters. The function call is never vocalized — it travels as structured data on a separate output channel (output_index=1) while the filler audio plays normally (output_index=0). This guarantees clean audio without routing metadata contamination
 
 ### 5.2 RouterPromptTemplate
 
@@ -469,17 +469,43 @@ The resulting payload is sent as a `response.create` message to OpenAI. The mode
 
 YAML-defined prompt template that instructs the Realtime model on:
 - Available departments and their descriptions
-- When to speak directly vs. return a JSON action
+- When to speak directly vs. call `route_to_specialist()` function
 - Guardrail rules (disallowed content, out-of-scope handling)
 - Response style and dynamic language guidelines (respond in the customer's language)
 
 Loaded at startup and injected into `RouterPromptBuilder`.
 
-### 5.3 parse_model_action
+### 5.3 Function Call Routing via `parse_function_call_action`
 
-**File**: `backend/src/voice_runtime/realtime_event_bridge.py` (within the bridge)
+**File**: `backend/src/routing/model_router.py`
 
-The bridge accumulates `response.audio_transcript.delta` fragments. On `response.done`, `parse_model_action()` attempts to parse the accumulated text as JSON. If it matches the specialist action schema (`{"action":"specialist","department":"...","summary":"..."}`), the bridge emits a `model_router_action` event to the Coordinator instead of a `voice_generation_completed` event.
+When the model decides to route to a specialist, it calls the `route_to_specialist` function (defined in `ROUTE_TOOL_DEFINITION`). The OpenAI Realtime API emits a `response.function_call_arguments.done` event with the function name and JSON arguments. The bridge intercepts this event and calls `parse_function_call_action(name, arguments)` to validate and parse the routing action into a `ModelRouterAction(department, summary)`. If valid, the bridge emits a `model_router_action` EventEnvelope to the Coordinator.
+
+The function call is structurally separated from audio output — it arrives on `output_index=1` while audio/text play on `output_index=0`. This eliminates any possibility of routing metadata being vocalized by the TTS.
+
+**Tool registration**: The `route_to_specialist` tool must be registered at both:
+1. **Session level** via `session.update` (sent at WebSocket connection start in `calls.py`) — required for the model to recognize the tool
+2. **Response level** via `response.create` (in `RouterPromptBuilder.build_response_create()`) — ensures the tool is available for each response
+
+### 5.3.1 Routing Architecture Decision Record
+
+**Definitive approach**: OpenAI Realtime API function calling (adopted).
+
+**Explored and discarded approaches**:
+
+1. **JSON action in transcript**: The model outputs a JSON object (`{"action":"specialist","department":"billing","summary":"..."}`) as its text response. **Discarded**: The TTS vocalizes the entire transcript including JSON — the user hears "action specialist department billing" spoken aloud.
+
+2. **JSON action + early `response.cancel`**: Send `response.cancel` when the first `{` character is detected in the transcript delta. **Discarded**: `response.cancel` kills both text AND audio generation. The text is truncated before the full JSON is received, so the backend cannot parse the routing action. Routing fails.
+
+3. **`<<ROUTE:dept:summary>>` marker + backend cancel via WebSocket**: The model outputs a text marker at the end of its filler message. The backend detects the marker in transcript deltas received via WebSocket and sends `response.cancel`. **Discarded**: The WebSocket round-trip adds latency. By the time cancel arrives, the TTS has already synthesized and buffered the marker text as audio. The user hears "route billing" at the end of the filler.
+
+4. **`<<ROUTE:...>>` marker + frontend DataChannel cancel (partial match)**: The frontend detects `<<ROUTE:` in transcript deltas and immediately sends `response.cancel` via the DataChannel (zero network round-trip). **Discarded**: Cancel fires before the backend receives the full marker with closing `>>`. The backend never gets the complete routing information. Routing fails.
+
+5. **`<<ROUTE:...>>` marker + frontend DataChannel cancel (complete match)**: The frontend waits for the complete `<<ROUTE:dept:summary>>` marker before sending cancel. **Discarded**: Text generation runs ahead of audio generation by hundreds of milliseconds. By the time the complete marker appears in text, the TTS has already synthesized it into the audio buffer. The user hears "route billing" despite the cancel.
+
+6. **Audio muting**: Mute the audio element when a marker is detected, unmute when the specialist response starts. **Discarded**: Muting cuts audio at an arbitrary point — it can silence the filler mid-sentence, creating a jarring user experience. There is no way to know exactly when the marker audio begins in the buffer.
+
+7. **Function calling (ADOPTED)**: The model speaks a natural filler message AND calls `route_to_specialist()` as a structured function call. Function calls are never vocalized — they are a separate output channel in the Realtime API. The filler plays cleanly, the function call arrives as structured data, and subsequent `response.create` for the specialist queues audio in a deterministic FIFO buffer after the filler finishes.
 
 ### 5.4 Embedding Pipeline (Analytics Only)
 
@@ -631,7 +657,7 @@ Browser ←WebSocket→ Backend (event forwarding, both directions)
 - `send_to_frontend(data)`: Send a JSON message to the frontend via WebSocket (public method, used by both the bridge internally and external callers like `calls.py` for session.update)
 - `close()`: Clean up bridge state
 
-**JSON action detection**: The bridge accumulates `response.audio_transcript.delta` fragments during each response. On `response.done`, it calls `parse_model_action()` to check if the accumulated text is a JSON specialist action. If it matches (`{"action":"specialist","department":"...","summary":"..."}`), a `model_router_action` event is emitted instead of `voice_generation_completed`.
+**Function call routing**: The bridge handles `response.function_call_arguments.done` events from the OpenAI Realtime API. When the model calls `route_to_specialist()`, the bridge calls `parse_function_call_action()` to validate and parse the function call arguments into a `ModelRouterAction`. If valid, a `model_router_action` EventEnvelope is emitted to the Coordinator. The bridge also accumulates `response.audio_transcript.delta` fragments to capture the filler text that accompanies the function call. The bridge tracks a `_function_call_received` flag to distinguish routing responses from direct responses in the `response.done` handler.
 
 **Server VAD configuration**: The bridge configures server-side VAD with `silence_duration_ms=300` (from `Settings.vad_silence_duration_ms`), which controls how long the server waits after speech stops before committing the audio buffer. The 300ms value balances responsiveness with avoiding premature commits on natural pauses.
 
@@ -643,12 +669,13 @@ Browser ←WebSocket→ Backend (event forwarding, both directions)
 | `input_audio_buffer.speech_stopped` | `type="speech_stopped"` |
 | `input_audio_buffer.committed` | `type="audio_committed"` — **primary turn trigger** |
 | `conversation.item.input_audio_transcription.completed` | `type="transcript_final"` (async logging only, empty transcripts ignored) |
-| `response.done` | `type="voice_generation_completed"` OR `type="model_router_action"` (if JSON action detected) |
+| `response.function_call_arguments.done` | `type="model_router_action"` (if `route_to_specialist` function call) |
+| `response.done` | `type="voice_generation_completed"` (with filler transcript if function call was received) |
 | `response.failed` | `type="voice_generation_error"` |
 
 **Output event translation (Coordinator → OpenAI):**
-- `send_voice_start(RealtimeVoiceStart)` with dict payload (from RouterPromptBuilder) → sent directly as `response.create` with conversation history embedded in `instructions`. No `response.input` — preserves OpenAI's native conversation context (current turn audio). No per-turn `session.update` — instructions are passed inline to avoid the ~500ms round-trip.
-- `send_voice_start(RealtimeVoiceStart)` with string prompt → `response.create` (filler/simple response)
+- `send_voice_start(RealtimeVoiceStart)` with dict payload (from RouterPromptBuilder or specialist prompt) → sent directly as `response.create` with conversation history embedded in `instructions`, plus `tools` and `tool_choice` for router responses. No `response.input` — preserves OpenAI's native conversation context (current turn audio). No per-turn `session.update` — instructions are passed inline to avoid the ~500ms round-trip.
+- `send_voice_start(RealtimeVoiceStart)` with string prompt → `response.create` (simple response)
 - `send_voice_cancel(RealtimeVoiceCancel)` → `response.cancel`
 
 ### 6.6 OpenAI WebRTC SDP Proxy & Session Lifecycle
@@ -667,7 +694,7 @@ The backend acts as a **SDP signaling proxy**, **session lifecycle manager**, an
    - Step 2: `POST /v1/realtime` with the ephemeral key and SDP offer → returns the SDP answer
    - The server API key is only used for the sessions call — the ephemeral key is used for the SDP exchange, so the API key is never exposed to the browser
 3. `WS /calls/{call_id}/events` establishes bidirectional event forwarding:
-   - On connection: sends a one-time `session.update` via the bridge to configure transcription (`whisper-1`), disable auto-response (`create_response: false`), and set server VAD `silence_duration_ms` (default: 300ms). The `/v1/realtime/sessions` endpoint does NOT reliably apply these settings, so the explicit `session.update` is required.
+   - On connection: sends a one-time `session.update` via the bridge to configure transcription (`whisper-1`), disable auto-response (`create_response: false`), set server VAD `silence_duration_ms` (default: 300ms), and register the `route_to_specialist` tool with `tool_choice: "auto"`. Tool registration at session level is **required** — without it, the model writes function call text as transcript instead of invoking the function. The `/v1/realtime/sessions` endpoint does NOT reliably apply these settings, so the explicit `session.update` is required.
    - Receive loop: parses incoming messages and intercepts debug control messages (`debug_enable` / `debug_disable`) to toggle `coordinator.set_debug_enabled()` — these are NOT forwarded to the bridge. All other messages are forwarded to `bridge.handle_frontend_event()`.
    - On disconnect: clears the frontend WebSocket reference via `bridge.set_frontend_ws(None)`
 4. `DELETE /calls/{call_id}` closes the bridge and removes the session.
@@ -755,16 +782,26 @@ User says: "tengo un problema con mi factura"
 
 ```
 1-4. Same as above until audio_committed triggers response.create
-5. Model classifies as specialist routing → returns JSON action:
-   {"action": "specialist", "department": "billing", "summary": "User has a billing issue with their invoice"}
-6. Bridge detects JSON action via parse_model_action()
-   → Emits model_router_action event instead of voice_generation_completed
+5. Model classifies as specialist routing → generates TWO outputs simultaneously:
+   a. output_index=0 (audio): Speaks natural filler: "Un momento, déjame conectarte con facturación"
+   b. output_index=1 (function call): route_to_specialist(department="billing", summary="User has a billing issue")
+   The function call is NEVER vocalized — it travels as structured data on a separate channel.
+6. Bridge receives response.function_call_arguments.done event
+   → parse_function_call_action() validates and parses the function call
+   → Emits model_router_action event with department, summary, and filler_text
 7. Coordinator._on_model_router_action()
    → AgentFSM.specialist_action() → ROUTING → WAITING_TOOLS
    → Dispatch to specialist agent (billing)
-   → Specialist responds → voice plays
-   → AgentFSM.voice_completed() → SPEAKING → DONE
+8. Bridge receives response.done for the router response
+   → Emits voice_generation_completed with the filler transcript
+9. Specialist tool execution completes → Coordinator builds specialist prompt as response.create
+   → Specialist prompt includes conversation history + language instruction in instructions field
+   → Audio is queued in OpenAI's FIFO output buffer AFTER the filler audio finishes
+10. Specialist responds in the customer's language → voice plays seamlessly after filler
+    → AgentFSM.voice_completed() → SPEAKING → DONE
 ```
+
+**Key guarantee**: The OpenAI output audio buffer is a FIFO queue. Audio from sequential `response.create` calls plays in order: filler first, specialist second. No overlap, deterministic.
 
 ### 8.3 Barge-In During Voice Output
 
@@ -798,7 +835,7 @@ User says: "maldita sea" (insult)
    → RouterPromptBuilder builds payload with router prompt that includes guardrail instructions
    → Emit response.create to Realtime API
 5. Model recognizes disallowed content via router prompt instructions
-   → Speaks guardrail response directly (no JSON action)
+   → Speaks guardrail response directly (no function call)
 6. transcript_final arrives async → persisted for logging
 ```
 
@@ -813,7 +850,7 @@ User says: "tengo un problema" (unclear which department)
 4. Model receives router prompt with department descriptions + user audio
    → Intent is ambiguous — model speaks directly asking for clarification
    (e.g., "I can help you with that. Could you tell me if this is about billing, technical support, or something else?")
-5. No JSON action emitted — model handles clarification conversationally
+5. No function call emitted — model handles clarification conversationally
 6. User responds with clarification → next audio_committed triggers new response.create with conversation history
 ```
 
