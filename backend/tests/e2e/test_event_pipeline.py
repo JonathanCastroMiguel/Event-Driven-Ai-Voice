@@ -370,19 +370,14 @@ class TestMultiTurnHistory:
         voice_starts = [e for e in events if isinstance(e, RealtimeVoiceStart)]
         assert len(voice_starts) == 1
 
-        # The response.create payload should include history via input
+        # The response.create payload should include history in instructions
         payload = voice_starts[0].prompt
         assert payload["type"] == "response.create"
         response = payload["response"]
-        assert "input" in response
-        # History should contain at least the user message "hola"
-        input_items = response["input"]
-        user_texts = [
-            item["content"][0]["text"]
-            for item in input_items
-            if item.get("role") == "user"
-        ]
-        assert "hola" in user_texts
+        assert "instructions" in response
+        # History is embedded as "User: hola" in the instructions string
+        instructions = response["instructions"]
+        assert "User: hola" in instructions
 
     @pytest.mark.asyncio
     async def test_three_turns_history_accumulation(self) -> None:
@@ -400,19 +395,16 @@ class TestMultiTurnHistory:
 
         assert len(coord._conversation_buffer) == 3
 
-        # Fourth turn should see all 3 in history
+        # Fourth turn should see all 3 in history (embedded in instructions)
         await fake.speech_started(ts=13000)
         await fake.audio_committed(ts=14000)
         events = capture.drain()
         voice_starts = [e for e in events if isinstance(e, RealtimeVoiceStart)]
         payload = voice_starts[0].prompt
-        input_items = payload["response"]["input"]
-        user_texts = [
-            item["content"][0]["text"]
-            for item in input_items
-            if item.get("role") == "user"
-        ]
-        assert user_texts == ["uno", "dos", "tres"]
+        instructions = payload["response"]["instructions"]
+        assert "User: uno" in instructions
+        assert "User: dos" in instructions
+        assert "User: tres" in instructions
 
 
 # ---------------------------------------------------------------------------

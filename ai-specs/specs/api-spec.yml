@@ -172,10 +172,15 @@ paths:
         WebSocket endpoint for bidirectional event forwarding between the
         browser and the Coordinator. Input: browser forwards OpenAI data channel
         events to the bridge for translation and dispatch. Output: Coordinator
-        commands are sent to the browser for forwarding to the OpenAI data channel,
-        including `response.create` commands from the Coordinator (model-as-router
-        architecture). On connection, a one-time session.update is sent to configure
-        transcription (whisper-1) and disable auto-response (create_response=false).
+        commands (response.create, response.cancel) and debug events (debug_event,
+        turn_update, fsm_state, transcript_final) are sent to the browser. The
+        frontend routes OpenAI-bound messages to the DataChannel and handles
+        backend-only messages locally. On connection, a one-time session.update
+        is sent to configure transcription (whisper-1) and disable auto-response
+        (create_response=false). Debug control: the frontend may send
+        `{"type":"debug_enable"}` or `{"type":"debug_disable"}` to toggle
+        per-session debug event emission on the Coordinator. These control
+        messages are intercepted by the backend and never forwarded to OpenAI.
       tags: [webrtc]
       parameters:
         - name: call_id

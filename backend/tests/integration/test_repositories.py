@@ -61,7 +61,7 @@ def _make_generation(call_id, turn_id, gen_id=None):
         call_id=call_id,
         turn_id=turn_id,
         created_at=1000,
-        state=AgentState.THINKING,
+        state=AgentState.ROUTING,
     )
 
 
@@ -182,7 +182,7 @@ class TestPgAgentGenerationRepository:
 
         result = await repo.get_by_id(gen.agent_generation_id)
         assert result is not None
-        assert result.state == AgentState.THINKING
+        assert result.state == AgentState.ROUTING
 
     async def test_update_with_outcome(self, pg_pool: asyncpg.Pool) -> None:
         call_repo = PgCallRepository(pg_pool)

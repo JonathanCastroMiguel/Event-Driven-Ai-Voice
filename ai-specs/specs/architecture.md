@@ -661,13 +661,14 @@ The backend acts as a **SDP signaling proxy**, **session lifecycle manager**, an
 1. `POST /calls` creates a full runtime actor stack: Coordinator, TurnManager, AgentFSM, ToolExecutor, RouterPromptBuilder, and RealtimeEventBridge. The bridge is wired to the Coordinator bidirectionally:
    - Input: `bridge.on_event(coordinator.handle_event)` — OpenAI events reach the Coordinator
    - Output: `coordinator.set_output_callback(fn)` — Coordinator commands (RealtimeVoiceStart, RealtimeVoiceCancel) are dispatched to `bridge.send_voice_start()` / `bridge.send_voice_cancel()`
+   - Debug: `coordinator.set_debug_callback(fn)` — debug events are sent to the frontend via `bridge.send_to_frontend()`
 2. `POST /calls/{call_id}/offer` performs a **two-step SDP exchange** with OpenAI:
    - Step 1: `POST /v1/realtime/sessions` with session config (model, modalities, `input_audio_transcription` with Whisper auto-language-detection, `turn_detection` with `create_response: false`) → returns an ephemeral key
    - Step 2: `POST /v1/realtime` with the ephemeral key and SDP offer → returns the SDP answer
    - The server API key is only used for the sessions call — the ephemeral key is used for the SDP exchange, so the API key is never exposed to the browser
 3. `WS /calls/{call_id}/events` establishes bidirectional event forwarding:
    - On connection: sends a one-time `session.update` via the bridge to configure transcription (`whisper-1`), disable auto-response (`create_response: false`), and set server VAD `silence_duration_ms` (default: 300ms). The `/v1/realtime/sessions` endpoint does NOT reliably apply these settings, so the explicit `session.update` is required.
-   - Receive loop: forwards browser-sent OpenAI data channel events to `bridge.handle_frontend_event()`
+   - Receive loop: parses incoming messages and intercepts debug control messages (`debug_enable` / `debug_disable`) to toggle `coordinator.set_debug_enabled()` — these are NOT forwarded to the bridge. All other messages are forwarded to `bridge.handle_frontend_event()`.
    - On disconnect: clears the frontend WebSocket reference via `bridge.set_frontend_ws(None)`
 4. `DELETE /calls/{call_id}` closes the bridge and removes the session.
 
@@ -916,21 +917,66 @@ Setup: `setup_telemetry()` creates a `TracerProvider` with optional OTLP gRPC ex
 
 ### 9.1 Debug Event Emission
 
-The Coordinator supports an optional debug callback for real-time telemetry, used by the `RealtimeVoiceBridge` to forward debug data to the browser via the "debug" DataChannel.
+The Coordinator supports two levels of debug telemetry:
 
-**Setup**: `Coordinator.set_debug_callback(callback)` registers an async callback. When `None` (default), no debug events are emitted — zero overhead on the hot path.
+1. **Always-on events** (`_emit_debug`): Low-cost events (`turn_update`, `fsm_state`, `transcript_final`) emitted via the debug callback regardless of debug mode. Used for basic UI state (turn tracking, FSM display).
+2. **On-demand pipeline events** (`_send_debug`): Detailed per-stage timing events gated by a per-session `_debug_enabled: bool` flag. When `False` (default), these are never emitted — zero overhead.
 
-**Debug events emitted:**
+**Setup**:
+- `Coordinator.set_debug_callback(callback)` registers an async callback. When `None`, no events are emitted.
+- `Coordinator.set_debug_enabled(enabled)` toggles the per-session debug flag. Controlled via `debug_enable`/`debug_disable` WebSocket control messages from the frontend (intercepted in `calls.py`, never forwarded to the bridge).
+
+**Per-session debug timing state**: When debug is enabled, the Coordinator tracks `_debug_turn_id` (UUID assigned at `speech_start`), `_debug_turn_start_ms`, and `_debug_last_stage_ms` to compute `delta_ms` (time since previous stage) and `total_ms` (time since turn start).
+
+**Pipeline debug events** (emitted via `_send_debug` when `_debug_enabled=True`):
+
+```json
+{
+  "type": "debug_event",
+  "turn_id": "<uuid>",
+  "stage": "<stage_name>",
+  "delta_ms": 0,
+  "total_ms": 0,
+  "ts": 1709913600000,
+  "label": "greeting",
+  "route_type": "direct"
+}
+```
+
+**Stage catalog:**
+
+| Stage | When | Extra Fields |
+|---|---|---|
+| `speech_start` | `_on_speech_started` — assigns new `_debug_turn_id` | — |
+| `speech_stop` | `_on_speech_stopped` | — |
+| `audio_committed` | `_on_audio_committed` | — |
+| `prompt_sent` | After RouterPromptBuilder builds prompt, before bridge dispatch | — |
+| `model_processing` | Bridge reports `response.created` | — |
+| `route_result` | `response.done` — direct voice or delegate detected | `label`, `route_type` ("direct" or "delegate") |
+| `fill_silence` | Coordinator launches silence-filling for delegate routes | — |
+| `specialist_sent` | Specialist prompt dispatched | — |
+| `specialist_processing` | Specialist `response.created` received | — |
+| `specialist_ready` | Specialist `response.done` received | — |
+| `generation_start` | Voice generation begins | — |
+| `generation_finish` | `_on_voice_completed` | — |
+| `barge_in` | Barge-in detected (new speech during active generation) | — |
+
+**Stage timing decomposition** (previously opaque gaps are now visible):
+- `audio_committed` → `prompt_sent`: prompt building time (RouterPromptBuilder)
+- `prompt_sent` → `model_processing`: network RTT to OpenAI (`send_to_created_ms` from bridge)
+- `model_processing` → `route_result`: model inference time (`created_to_done_ms` from bridge)
+
+**Always-on events** (emitted via `_emit_debug` regardless of `_debug_enabled`):
 
 | Event Type | When | Data |
 |---|---|---|
-| `turn_update` | After `_on_audio_committed` triggers model-as-router | `turn_id`, `text` (empty — transcript not yet available), `state` ("finalized") |
+| `turn_update` | After `_on_audio_committed` triggers model-as-router | `turn_id`, `text`, `state` |
 | `fsm_state` | After `AgentFSM.start_routing()` | `agent_generation_id`, `state` |
 | `transcript_final` | After `_on_transcript_final` (async) | `turn_id`, `text` |
 
-> **Note**: The `routing` and `latency` debug events from the embedding classification pipeline are no longer emitted on the hot path. The model-as-router pattern eliminates the separate classification step, so there are no Route A/B confidence scores or routing latency measurements to report in real time.
+**Emission pattern**: Best-effort — exceptions are caught and logged, never crash the voice hot path.
 
-**Emission pattern**: Best-effort via `_emit_debug()` — exceptions are caught and logged, never crash the voice hot path.
+**Frontend routing of debug events**: The frontend WebSocket handler distinguishes backend-only events (`debug_event`, `turn_update`, `fsm_state`, `transcript_final`) from OpenAI-bound events. Backend-only events are routed to the debug handler locally; all other messages are forwarded to the OpenAI DataChannel.
 
 ### Model-as-Router Logging
 
@@ -1060,28 +1106,39 @@ Browser
 | Speaker Animation | `frontend/src/components/voice/speaker-animation.tsx` |
 | Transcription Panel | `frontend/src/components/voice/transcription-panel.tsx` |
 | Debug Panel | `frontend/src/components/debug/debug-panel.tsx` |
+| Turn Timeline | `frontend/src/components/debug/turn-timeline.tsx` |
 | Dockerfile | `frontend/Dockerfile` |
 
 ### 12.3 Hooks
 
 **`useVoiceSession`** — Full WebRTC lifecycle manager with direct OpenAI connection.
 - Calls `POST /calls` to create session → `POST /calls/{id}/offer` for SDP proxy exchange
-- Creates RTCPeerConnection, captures microphone, creates `"oai-events"` data channel
+- Creates RTCPeerConnection, captures microphone (with `echoCancellation: true`), creates `"oai-events"` data channel
+- Appends `<audio>` element to `document.body` (hidden, `crossOrigin="anonymous"`) for browser AEC to work — removed on cleanup
+- Catches `NotAllowedError` from `getUserMedia()` → sets `mic_denied` status with clear error message
+- WebSocket message routing: backend-only types (`debug_event`, `turn_update`, `fsm_state`, `transcript_final`) are sent to the debug handler; all other messages are forwarded to the OpenAI DataChannel
 - Translates OpenAI events to internal format: `conversation.item.input_audio_transcription.completed` → human transcription, `response.audio_transcript.done` → agent transcription
 - Filters `response.audio.delta` from debug handler (high-frequency)
+- `sendDebugControl(enabled)` — sends `debug_enable`/`debug_disable` control message via event WebSocket
 - Uses local variable for cleanup (avoids stale closure bug) + `beforeunload` beacon
-- Returns: `status`, `callId`, `startSession`, `endSession`, `onControlMessage`, `onDebugMessage`, `error`
+- Returns: `status`, `callId`, `startSession`, `endSession`, `onControlMessage`, `onDebugMessage`, `sendDebugControl`, `error`
 
-**`useDebugChannel`** — Parses debug events into typed state.
-- Maintains: `turns` (DebugTurn[]), `fsmState`, `routing` (DebugRouting), `events` (DebugEvent[]), `latencies` (DebugLatency[])
-- Limits events array to 100 entries
+**`useDebugChannel`** — Groups `debug_event` messages by `turn_id` into visual pipeline timelines.
+- Maintains `DebugTurnTimeline[]` — each turn has `stages[]`, `specialist_stages[]`, `is_delegate`, `barge_in`
+- Each `DebugStage` has: `stage`, `delta_ms`, `total_ms`, `ts`, optional `label`/`route_type`
+- Detects delegate routes when `route_result` has `route_type: "delegate"` — subsequent `specialist_*` stages go to `specialist_stages[]`
+- FIFO of last 5 turns (newest first), evicts oldest when 6th arrives
+- `clearState()` resets all state when debug is toggled off
+- Returns: `state` (with `turns`), `handleDebugMessage`, `clearState`
 
 ### 12.4 Components
 
 **`VoiceSession`** — Main orchestrator component. Wires hooks together.
 - Lazy-loads `DebugPanel` via `next/dynamic` (no debug overhead when disabled)
+- Debug toggle sends `debug_enable`/`debug_disable` to backend via `sendDebugControl()`; on disable, calls `clearState()` to reset debug channel
 - Uses OpenAI events for speaking indicators (`speech_started/stopped`, `response.audio.delta/done`)
-- Shows: connection status badge, start/end call buttons, mic/speaker animations, transcription panel
+- Shows: connection status badge (including `mic_denied` state), start/end call buttons, debug toggle, mic/speaker animations, transcription panel
+- Debug panel renders full-width (breaks out of parent `max-w-2xl`) for pipeline visibility
 
 **`MicAnimation`** — Green pulsing circle with mic icon when user is speaking.
 
@@ -1089,7 +1146,14 @@ Browser
 
 **`TranscriptionPanel`** — Chat-style display. Human messages right-aligned (primary color), agent messages left-aligned (muted). Auto-scrolls to bottom on new entries.
 
-**`DebugPanel`** — 3-column grid: FSM State badge, Last Routing details (Route A/B confidence, short circuit, LLM fallback), Latency measurements (color-coded: green < 200ms, red > 200ms). Plus Turn History list and Event Log (last 20, monospace JSON).
+**`DebugPanel`** — Full-width pipeline timeline viewer. Displays a FIFO stack of the last 5 turns (newest on top). Each turn is rendered by `TurnTimeline`.
+
+**`TurnTimeline`** — Horizontal box-and-arrow diagram for a single turn's pipeline stages.
+- Each box shows: stage name, `+delta_ms` / `total_ms`
+- Color coding: green (<100ms), yellow (100-300ms), red (>=300ms)
+- Direct routes: single row of 8 stages (`speech_start` → `generation_finish`)
+- Delegate routes: main row forks at `route_result` with a specialist sub-flow row (dashed border) showing `specialist_sent` → `specialist_processing` → `specialist_ready`
+- Barge-in: red indicator box cutting the timeline
 
 ### 12.5 Data Flow
 
@@ -1113,8 +1177,16 @@ Browser
 4. Agent response audio streams back via WebRTC directly from OpenAI
    → Browser plays through speaker (remote audio track)
 
-5. Non-audio events forwarded to debug handler (when enabled)
-   → useDebugChannel parses → DebugPanel updates
+5. Backend sends commands via event WebSocket
+   → Frontend routes messages: OpenAI types → DataChannel, backend-only types → debug handler
+   → Backend-only types: debug_event, turn_update, fsm_state, transcript_final
+
+6. Debug mode (optional, toggled via "Show Debug" button):
+   → Frontend sends debug_enable/debug_disable via event WebSocket
+   → Backend intercepts, sets Coordinator._debug_enabled flag
+   → Coordinator emits debug_event messages with per-stage timing
+   → useDebugChannel groups by turn_id into DebugTurnTimeline[]
+   → TurnTimeline renders horizontal box-and-arrow pipeline
 ```
 
 ### 12.6 Deployment

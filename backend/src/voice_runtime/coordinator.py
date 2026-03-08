@@ -88,6 +88,10 @@ class Coordinator:
             RealtimeVoiceStart | RealtimeVoiceCancel | CancelAgentGeneration
         ] = []
         self._debug_callback: Callable[[dict[str, Any]], Coroutine[Any, Any, None]] | None = None
+        self._debug_enabled: bool = False
+        self._debug_turn_id: UUID | None = None
+        self._debug_turn_start_ms: int = 0
+        self._debug_last_stage_ms: int = 0
         self._output_callback: Callable[
             [RealtimeVoiceStart | RealtimeVoiceCancel | CancelAgentGeneration],
             Coroutine[Any, Any, None],
@@ -141,6 +145,15 @@ class Coordinator:
         """Register or unregister a debug event callback."""
         self._debug_callback = callback
 
+    def set_debug_enabled(self, enabled: bool) -> None:
+        """Enable or disable debug event emission for this session."""
+        self._debug_enabled = enabled
+        logger.info(
+            "debug_mode_toggled",
+            call_id=str(self._call_id),
+            enabled=enabled,
+        )
+
     async def _emit_debug(self, event: dict[str, Any]) -> None:
         """Emit a debug event if a callback is registered."""
         if self._debug_callback is not None:
@@ -148,6 +161,38 @@ class Coordinator:
                 await self._debug_callback(event)
             except Exception:
                 pass  # Debug is best-effort
+
+    async def _send_debug(self, stage: str, **extra: Any) -> None:
+        """Emit a structured debug_event for the pipeline timeline.
+
+        No-op when debug is disabled. Computes delta_ms and total_ms
+        automatically from the turn's timing state.
+        """
+        if not self._debug_enabled or self._debug_callback is None:
+            return
+
+        now = self._now_ms()
+
+        if stage == "speech_start":
+            self._debug_turn_id = uuid4()
+            self._debug_turn_start_ms = now
+            self._debug_last_stage_ms = now
+
+        delta_ms = now - self._debug_last_stage_ms if self._debug_last_stage_ms else 0
+        total_ms = now - self._debug_turn_start_ms if self._debug_turn_start_ms else 0
+        self._debug_last_stage_ms = now
+
+        event: dict[str, Any] = {
+            "type": "debug_event",
+            "turn_id": str(self._debug_turn_id) if self._debug_turn_id else "",
+            "stage": stage,
+            "delta_ms": delta_ms,
+            "total_ms": total_ms,
+            "ts": now,
+            **extra,
+        }
+
+        await self._emit_debug(event)
 
     # ------------------------------------------------------------------
     # Persistence helpers
@@ -208,12 +253,16 @@ class Coordinator:
             match envelope.type:
                 case "speech_started":
                     await self._on_speech_started(envelope)
+                case "speech_stopped":
+                    await self._on_speech_stopped(envelope)
                 case "audio_committed":
                     await self._on_audio_committed(envelope)
                 case "transcript_final":
                     await self._on_transcript_final(envelope)
                 case "model_router_action":
                     await self._on_model_router_action(envelope)
+                case "response_created":
+                    await self._send_debug("model_processing")
                 case "voice_generation_completed":
                     await self._on_voice_completed(envelope)
                 case "voice_generation_error":
@@ -243,10 +292,15 @@ class Coordinator:
             fsm_state=self._agent_fsm.state.value,
         )
 
+        # Debug: speech_start (assigns new turn_id, resets timing)
+        await self._send_debug("speech_start")
+
         # Cancel active voice if any (record barge-in metric)
         voice_id = s.cancel_active_voice()
         if voice_id is not None:
             BARGE_IN_TOTAL.inc()
+            # Debug: barge_in on previous turn
+            await self._send_debug("barge_in")
             await self._emit_output(
                 RealtimeVoiceCancel(
                     call_id=self._call_id,
@@ -294,6 +348,10 @@ class Coordinator:
         # Forward to TurnManager
         self._turn_manager.handle_speech_started(envelope.ts)
 
+    async def _on_speech_stopped(self, envelope: EventEnvelope) -> None:
+        """Handle speech_stopped: VAD detected silence. Debug only — no pipeline action."""
+        await self._send_debug("speech_stop")
+
     # ------------------------------------------------------------------
     # Audio committed — primary turn trigger (model-as-router)
     # ------------------------------------------------------------------
@@ -312,6 +370,9 @@ class Coordinator:
             speech_to_committed_ms=speech_to_committed_ms,
             fsm_state=self._agent_fsm.state.value,
         )
+
+        # Debug: audio_committed
+        await self._send_debug("audio_committed")
 
         # Finalize the turn via TurnManager
         self._turn_manager.handle_audio_committed(envelope.ts)
@@ -397,6 +458,9 @@ class Coordinator:
                             "instructions": fallback_instructions,
                         },
                     }
+
+                # Debug: prompt_sent (after building, before sending)
+                await self._send_debug("prompt_sent")
 
                 voice_gen_id = uuid4()
                 s.active_voice_generation_id = voice_gen_id
@@ -545,6 +609,9 @@ class Coordinator:
             logger.debug("late_model_router_action_ignored")
             return
 
+        # Debug: route_result (delegate)
+        await self._send_debug("route_result", label=department, route_type="delegate")
+
         # FSM: routing → waiting_tools
         self._agent_fsm.specialist_action(envelope.ts)
         logger.info(
@@ -563,6 +630,9 @@ class Coordinator:
             agent_generation_id=str(s.active_agent_generation_id),
         )
 
+        # Debug: fill_silence (main flow — parallel to specialist sub-flow)
+        await self._send_debug("fill_silence")
+
         # Filler strategy
         if self._should_emit_filler():
             FILLER_EMITTED_TOTAL.inc()
@@ -577,6 +647,9 @@ class Coordinator:
                 )
             )
             self._start_filler_timeout(filler_voice_id, envelope.ts)
+
+        # Debug: specialist_sent (sub-flow starts)
+        await self._send_debug("specialist_sent")
 
         # Execute specialist tool
         tool_request_id = uuid4()
@@ -599,8 +672,14 @@ class Coordinator:
             fsm_state=self._agent_fsm.state.value,
         )
 
+        # Debug: specialist_ready (sub-flow complete)
+        await self._send_debug("specialist_ready")
+
         # Cancel filler if still running
         self._cancel_filler()
+
+        # Debug: generation_start (specialist voice begins)
+        await self._send_debug("generation_start")
 
         # Emit specialist response voice
         voice_gen_id = uuid4()
@@ -692,6 +771,17 @@ class Coordinator:
                     fsm_state=self._agent_fsm.state.value,
                     total_turn_ms=total_turn_ms,
                 )
+            elif self._agent_fsm.state == AgentState.ROUTING:
+                # Direct route: model spoke directly (no specialist action)
+                # Emit route_result + generation_start retroactively
+                await self._send_debug("route_result", label="direct", route_type="direct")
+                await self._send_debug("generation_start")
+                # Transition routing → speaking → done
+                self._agent_fsm.voice_started(envelope.ts)
+                self._agent_fsm.voice_completed(envelope.ts)
+
+            # Debug: generation_finish (both direct and delegate)
+            await self._send_debug("generation_finish")
 
             # Persist voice generation update
             if self._voice_gen_repo is not None:
