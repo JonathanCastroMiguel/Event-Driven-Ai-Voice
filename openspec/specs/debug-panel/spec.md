@@ -69,3 +69,36 @@ Debug data SHALL be delivered from the backend to the frontend via the "debug" W
 - **WHEN** debug mode is enabled and system events occur
 - **THEN** debug data SHALL flow through the "debug" DataChannel
 - **AND** the audio DataChannel/track SHALL not carry any debug data
+
+### Requirement: Audio playback event emission
+The frontend SHALL emit `audio_playback_start` and `audio_playback_end` debug events by detecting `output_audio_buffer.started` (first occurrence per response) and `output_audio_buffer.stopped` from the OpenAI WebRTC data channel. These events SHALL be sent to the backend via the event WebSocket as `client_debug_event` messages.
+
+#### Scenario: Audio playback start emitted
+- **WHEN** the first `output_audio_buffer.started` event arrives for a response
+- **THEN** the frontend SHALL send `{type: "client_debug_event", stage: "audio_playback_start", turn_id, ts}` to the backend
+
+#### Scenario: Audio playback end emitted
+- **WHEN** `output_audio_buffer.stopped` arrives
+- **THEN** the frontend SHALL send `{type: "client_debug_event", stage: "audio_playback_end", turn_id, ts}` to the backend
+
+### Requirement: Bridge timing display
+The debug panel SHALL display bridge timing metrics (`send_to_created_ms`, `created_to_done_ms`) when present in debug events.
+
+#### Scenario: Bridge timing shown in stage box
+- **WHEN** a debug_event includes `send_to_created_ms: 150`
+- **THEN** the stage box SHALL display `bridge: 150ms` below the delta/total line
+
+### Requirement: Readable stage labels
+The debug panel SHALL display human-friendly labels for debug stages without changing backend event names.
+
+#### Scenario: Direct route label
+- **WHEN** `route_result` event has `route_type="direct"`
+- **THEN** the label SHALL display "Direct Response"
+
+#### Scenario: Delegate route label
+- **WHEN** `route_result` event has `route_type="delegate"` and `label="billing"`
+- **THEN** the label SHALL display "Delegate → billing"
+
+#### Scenario: Model processing label
+- **WHEN** `model_processing` event is displayed
+- **THEN** the label SHALL display "Model Inference"
