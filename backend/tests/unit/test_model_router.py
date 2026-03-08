@@ -61,12 +61,12 @@ class TestRouterPromptBuilder:
         ]
         payload = builder.build_response_create(history=history)
 
-        assert "input" in payload["response"]
-        input_msgs = payload["response"]["input"]
-        assert len(input_msgs) == 2
-        assert input_msgs[0]["role"] == "user"
-        assert input_msgs[0]["content"][0]["text"] == "hola"
-        assert input_msgs[1]["role"] == "assistant"
+        # History embedded in instructions, not in response.input
+        assert "input" not in payload["response"]
+        instructions = payload["response"]["instructions"]
+        assert "Conversation history:" in instructions
+        assert "User: hola" in instructions
+        assert "Assistant: [greeting] Guided response" in instructions
 
     def test_build_with_multi_turn_history(self, builder: RouterPromptBuilder) -> None:
         history = [
@@ -77,8 +77,10 @@ class TestRouterPromptBuilder:
         ]
         payload = builder.build_response_create(history=history)
 
-        input_msgs = payload["response"]["input"]
-        assert len(input_msgs) == 4
+        assert "input" not in payload["response"]
+        instructions = payload["response"]["instructions"]
+        assert "User: hola" in instructions
+        assert "User: mi factura" in instructions
 
     def test_instructions_contain_all_sections(self, builder: RouterPromptBuilder) -> None:
         instructions = builder.system_instruction
@@ -95,7 +97,10 @@ class TestRouterPromptBuilder:
             for i in range(20)
         ]
         payload = builder.build_response_create(history=history)
-        assert len(payload["response"]["input"]) == 20
+        instructions = payload["response"]["instructions"]
+        # All 20 turns should be in instructions
+        for i in range(20):
+            assert f"User: turn {i}" in instructions
 
 
 # ---------------------------------------------------------------------------

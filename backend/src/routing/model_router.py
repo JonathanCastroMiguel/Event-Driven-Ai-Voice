@@ -71,6 +71,10 @@ class RouterPromptBuilder:
     ) -> dict[str, Any]:
         """Build a response.create payload for the OpenAI Realtime API.
 
+        History is embedded in instructions (system prompt) so that the model
+        uses OpenAI's native conversation context (which includes the current
+        turn's audio) rather than a text-only override via response.input.
+
         Args:
             history: Prior conversation turns as user/assistant message pairs
                      from ConversationBuffer.format_messages().
@@ -78,27 +82,25 @@ class RouterPromptBuilder:
         Returns:
             A dict suitable for sending as a response.create event.
         """
-        payload: dict[str, Any] = {
-            "type": "response.create",
-            "response": {
-                "modalities": ["text", "audio"],
-                "instructions": self._system_instruction,
-            },
-        }
+        instructions = self._system_instruction
 
         if history:
-            input_messages: list[dict[str, Any]] = []
+            history_lines: list[str] = []
             for msg in history:
                 role = msg.get("role", "user")
                 content = msg.get("content", "")
-                input_messages.append({
-                    "type": "message",
-                    "role": role,
-                    "content": [{"type": "input_text", "text": content}],
-                })
-            payload["response"]["input"] = input_messages
+                label = "User" if role == "user" else "Assistant"
+                history_lines.append(f"{label}: {content}")
+            history_text = "\n".join(history_lines)
+            instructions = f"{instructions}\n\nConversation history:\n{history_text}"
 
-        return payload
+        return {
+            "type": "response.create",
+            "response": {
+                "modalities": ["text", "audio"],
+                "instructions": instructions,
+            },
+        }
 
 
 def parse_model_action(transcript: str) -> ModelRouterAction | None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import TYPE_CHECKING, Any, Callable, Coroutine
 from uuid import UUID, uuid4
 
@@ -226,8 +227,21 @@ class Coordinator:
     # Barge-in
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _now_ms() -> int:
+        return int(time.time() * 1000)
+
     async def _on_speech_started(self, envelope: EventEnvelope) -> None:
         s = self._state
+        s.turn_speech_started_ms = envelope.ts
+
+        logger.info(
+            "fsm_speech_started",
+            call_id=str(self._call_id),
+            turn_seq=s.turn_seq,
+            ts=envelope.ts,
+            fsm_state=self._agent_fsm.state.value,
+        )
 
         # Cancel active voice if any (record barge-in metric)
         voice_id = s.cancel_active_voice()
@@ -287,6 +301,17 @@ class Coordinator:
     async def _on_audio_committed(self, envelope: EventEnvelope) -> None:
         """Handle audio_committed: finalize turn, build router prompt, emit response.create."""
         s = self._state
+        s.turn_audio_committed_ms = envelope.ts
+
+        speech_to_committed_ms = envelope.ts - s.turn_speech_started_ms if s.turn_speech_started_ms else 0
+        logger.info(
+            "fsm_audio_committed",
+            call_id=str(self._call_id),
+            turn_seq=s.turn_seq,
+            ts=envelope.ts,
+            speech_to_committed_ms=speech_to_committed_ms,
+            fsm_state=self._agent_fsm.state.value,
+        )
 
         # Finalize the turn via TurnManager
         self._turn_manager.handle_audio_committed(envelope.ts)
@@ -327,32 +352,51 @@ class Coordinator:
                 agent_generation_id = uuid4()
                 s.active_agent_generation_id = agent_generation_id
 
+                # Create conversation buffer entry early (user_text/agent_text filled async)
+                self._conversation_buffer.append(TurnEntry(seq=s.turn_seq))
+
                 # FSM: idle → routing
                 self._agent_fsm.start_routing(agent_generation_id, envelope.ts)
+                logger.info(
+                    "fsm_transition",
+                    call_id=str(self._call_id),
+                    turn_seq=s.turn_seq,
+                    transition="idle→routing",
+                    fsm_state=self._agent_fsm.state.value,
+                    agent_generation_id=str(agent_generation_id),
+                )
 
-                # Build router prompt with conversation history
+                # Build router prompt with conversation history (excludes current turn)
                 history = self._conversation_buffer.format_messages()
+                if history:
+                    logger.info(
+                        "history_content",
+                        call_id=str(self._call_id),
+                        turn_count=len(history) // 2,
+                        messages=[
+                            {"role": m["role"], "text": m["content"][:80]}
+                            for m in history
+                        ],
+                    )
 
                 if self._router_prompt_builder is not None:
                     payload = self._router_prompt_builder.build_response_create(history)
                 else:
                     # Fallback when no router prompt builder configured
+                    fallback_instructions = "You are a helpful voice assistant."
+                    if history:
+                        history_lines = [
+                            f"{'User' if m.get('role') == 'user' else 'Assistant'}: {m.get('content', '')}"
+                            for m in history
+                        ]
+                        fallback_instructions += "\n\nConversation history:\n" + "\n".join(history_lines)
                     payload = {
                         "type": "response.create",
                         "response": {
                             "modalities": ["text", "audio"],
-                            "instructions": "You are a helpful voice assistant.",
+                            "instructions": fallback_instructions,
                         },
                     }
-                    if history:
-                        payload["response"]["input"] = [
-                            {
-                                "type": "message",
-                                "role": msg.get("role", "user"),
-                                "content": [{"type": "input_text", "text": msg.get("content", "")}],
-                            }
-                            for msg in history
-                        ]
 
                 voice_gen_id = uuid4()
                 s.active_voice_generation_id = voice_gen_id
@@ -410,12 +454,17 @@ class Coordinator:
                     "agent_generation_id": str(agent_generation_id),
                 })
 
+                dispatch_elapsed_ms = self._now_ms() - s.turn_audio_committed_ms
                 logger.info(
                     "model_router_dispatched",
                     call_id=str(self._call_id),
+                    turn_seq=s.turn_seq,
                     turn_id=str(turn_id),
                     agent_generation_id=str(agent_generation_id),
                     has_history=len(history) > 0,
+                    history_turns=len(history) // 2,
+                    dispatch_elapsed_ms=dispatch_elapsed_ms,
+                    speech_to_dispatch_ms=self._now_ms() - s.turn_speech_started_ms if s.turn_speech_started_ms else 0,
                 )
 
     # ------------------------------------------------------------------
@@ -425,16 +474,23 @@ class Coordinator:
     async def _on_transcript_final(self, envelope: EventEnvelope) -> None:
         """Store transcript for logging, persistence, and debug display. No routing."""
         text = str(envelope.payload.get("text", ""))
+        s = self._state
+
+        transcript_elapsed_ms = envelope.ts - s.turn_audio_committed_ms if s.turn_audio_committed_ms else 0
+        logger.info(
+            "fsm_transcript_final",
+            call_id=str(self._call_id),
+            turn_seq=s.turn_seq,
+            text=text[:100],
+            transcript_elapsed_ms=transcript_elapsed_ms,
+            fsm_state=self._agent_fsm.state.value,
+        )
+
         self._turn_manager.handle_transcript_final(text, envelope.ts)
 
-        # Append to conversation buffer for subsequent turns' history
+        # Update conversation buffer entry with user text (entry created at audio_committed)
         if text and self._state.active_turn_id is not None:
-            self._conversation_buffer.append(
-                TurnEntry(
-                    seq=self._state.turn_seq,
-                    user_text=text,
-                )
-            )
+            self._conversation_buffer.update_last_user_text(text)
 
         # Update persisted turn with transcript text
         if self._turn_repo is not None and self._state.active_turn_id is not None:
@@ -470,6 +526,17 @@ class Coordinator:
         department = str(envelope.payload.get("department", ""))
         summary = str(envelope.payload.get("summary", ""))
 
+        routing_elapsed_ms = envelope.ts - s.turn_audio_committed_ms if s.turn_audio_committed_ms else 0
+        logger.info(
+            "fsm_model_router_action",
+            call_id=str(self._call_id),
+            turn_seq=s.turn_seq,
+            department=department,
+            summary=summary[:100],
+            routing_elapsed_ms=routing_elapsed_ms,
+            fsm_state=self._agent_fsm.state.value,
+        )
+
         if s.active_agent_generation_id is None:
             logger.warning("model_router_action_without_active_generation")
             return
@@ -480,6 +547,13 @@ class Coordinator:
 
         # FSM: routing → waiting_tools
         self._agent_fsm.specialist_action(envelope.ts)
+        logger.info(
+            "fsm_transition",
+            call_id=str(self._call_id),
+            turn_seq=s.turn_seq,
+            transition="routing→waiting_tools",
+            fsm_state=self._agent_fsm.state.value,
+        )
 
         logger.info(
             "model_router_action_received",
@@ -517,6 +591,13 @@ class Coordinator:
 
         # FSM: waiting_tools → speaking
         self._agent_fsm.tool_result(envelope.ts)
+        logger.info(
+            "fsm_transition",
+            call_id=str(self._call_id),
+            turn_seq=s.turn_seq,
+            transition="waiting_tools→speaking",
+            fsm_state=self._agent_fsm.state.value,
+        )
 
         # Cancel filler if still running
         self._cancel_filler()
@@ -566,15 +647,51 @@ class Coordinator:
 
     async def _on_voice_completed(self, envelope: EventEnvelope) -> None:
         voice_id_str = str(envelope.payload.get("voice_generation_id", ""))
+        agent_transcript = str(envelope.payload.get("transcript", ""))
+        s = self._state
+
+        voice_elapsed_ms = envelope.ts - s.turn_audio_committed_ms if s.turn_audio_committed_ms else 0
+        total_turn_ms = envelope.ts - s.turn_speech_started_ms if s.turn_speech_started_ms else 0
+        logger.info(
+            "fsm_voice_completed",
+            call_id=str(self._call_id),
+            turn_seq=s.turn_seq,
+            voice_id=voice_id_str,
+            agent_text=agent_transcript[:100],
+            voice_elapsed_ms=voice_elapsed_ms,
+            total_turn_ms=total_turn_ms,
+            fsm_state=self._agent_fsm.state.value,
+        )
+
         if voice_id_str:
             voice_id = UUID(voice_id_str)
             if self._state.is_voice_cancelled(voice_id):
                 logger.debug("late_voice_completed_ignored", voice_id=voice_id_str)
                 return
 
+            # Store agent response text in conversation buffer
+            if agent_transcript:
+                logger.info(
+                    "agent_text_stored",
+                    call_id=str(self._call_id),
+                    seq=self._state.turn_seq,
+                    agent_text=agent_transcript[:100],
+                )
+                self._conversation_buffer.update_agent_text(
+                    self._state.turn_seq, agent_transcript,
+                )
+
             # FSM: speaking → done
             if self._agent_fsm.state == AgentState.SPEAKING:
                 self._agent_fsm.voice_completed(envelope.ts)
+                logger.info(
+                    "fsm_transition",
+                    call_id=str(self._call_id),
+                    turn_seq=s.turn_seq,
+                    transition="speaking→done",
+                    fsm_state=self._agent_fsm.state.value,
+                    total_turn_ms=total_turn_ms,
+                )
 
             # Persist voice generation update
             if self._voice_gen_repo is not None:

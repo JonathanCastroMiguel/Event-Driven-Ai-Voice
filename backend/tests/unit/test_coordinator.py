@@ -192,8 +192,10 @@ class TestAudioCommitted:
         voice_starts = [e for e in events if isinstance(e, RealtimeVoiceStart)]
         assert len(voice_starts) == 1
         payload = voice_starts[0].prompt
-        # Should have input messages from conversation history
-        assert "input" in payload.get("response", {})
+        # History should be embedded in instructions (not in response.input)
+        instructions = payload.get("response", {}).get("instructions", "")
+        assert "Conversation history:" in instructions
+        assert "input" not in payload.get("response", {})
 
 
 # ---------------------------------------------------------------------------
