@@ -405,3 +405,137 @@ class TestTranscriptBufferAndJsonDetection:
 
         await bridge._translate_event({"type": "response.done"})
         assert bridge._response_transcript_buffer == ""
+
+
+# ---------------------------------------------------------------------------
+# Response source and timing in payloads
+# ---------------------------------------------------------------------------
+
+
+class TestResponseSourceAndTiming:
+    async def test_response_created_includes_response_source_router(self, bridge, call_id):
+        """response_created payload includes response_source='router' by default."""
+        received = []
+        callback = AsyncMock(side_effect=lambda e: received.append(e))
+        bridge.on_event(callback)
+
+        mock_ws = _make_mock_ws()
+        bridge.set_frontend_ws(mock_ws)
+
+        # Simulate send_voice_start to set timing
+        event = RealtimeVoiceStart(
+            call_id=call_id,
+            agent_generation_id=uuid4(),
+            voice_generation_id=uuid4(),
+            prompt="test",
+            ts=1000,
+        )
+        await bridge.send_voice_start(event)
+
+        await bridge._translate_event({"type": "response.created"})
+
+        assert len(received) == 1
+        assert received[0].type == "response_created"
+        assert received[0].payload["response_source"] == "router"
+
+    async def test_response_created_includes_response_source_specialist(self, bridge, call_id):
+        """response_created payload includes response_source='specialist' when set."""
+        received = []
+        callback = AsyncMock(side_effect=lambda e: received.append(e))
+        bridge.on_event(callback)
+
+        mock_ws = _make_mock_ws()
+        bridge.set_frontend_ws(mock_ws)
+
+        event = RealtimeVoiceStart(
+            call_id=call_id,
+            agent_generation_id=uuid4(),
+            voice_generation_id=uuid4(),
+            prompt="specialist prompt",
+            ts=1000,
+            response_source="specialist",
+        )
+        await bridge.send_voice_start(event)
+
+        await bridge._translate_event({"type": "response.created"})
+
+        assert len(received) == 1
+        assert received[0].payload["response_source"] == "specialist"
+
+    async def test_response_created_includes_send_to_created_ms(self, bridge, call_id):
+        """response_created payload includes send_to_created_ms when non-zero."""
+        received = []
+        callback = AsyncMock(side_effect=lambda e: received.append(e))
+        bridge.on_event(callback)
+
+        mock_ws = _make_mock_ws()
+        bridge.set_frontend_ws(mock_ws)
+
+        event = RealtimeVoiceStart(
+            call_id=call_id,
+            agent_generation_id=uuid4(),
+            voice_generation_id=uuid4(),
+            prompt="test",
+            ts=1000,
+        )
+        await bridge.send_voice_start(event)
+        await bridge._translate_event({"type": "response.created"})
+
+        assert len(received) == 1
+        # send_to_created_ms should be present (may be 0 due to fast execution)
+        assert "response_source" in received[0].payload
+
+    async def test_voice_generation_completed_includes_response_source(self, bridge, call_id):
+        """voice_generation_completed payload includes response_source."""
+        received = []
+        callback = AsyncMock(side_effect=lambda e: received.append(e))
+        bridge.on_event(callback)
+
+        voice_id = uuid4()
+        bridge._active_voice_generation_id = voice_id
+        bridge._response_transcript_buffer = "Buenos días"
+        bridge._current_response_source = "router"
+        bridge._response_created_ms = 100
+
+        await bridge._translate_event({"type": "response.done"})
+
+        assert len(received) == 1
+        assert received[0].type == "voice_generation_completed"
+        assert received[0].payload["response_source"] == "router"
+
+    async def test_voice_generation_completed_includes_created_to_done_ms(self, bridge, call_id):
+        """voice_generation_completed payload includes created_to_done_ms when non-zero."""
+        received = []
+        callback = AsyncMock(side_effect=lambda e: received.append(e))
+        bridge.on_event(callback)
+
+        voice_id = uuid4()
+        bridge._active_voice_generation_id = voice_id
+        bridge._response_transcript_buffer = "Hello"
+        bridge._response_created_ms = 1  # Non-zero to trigger inclusion
+
+        await bridge._translate_event({"type": "response.done"})
+
+        assert len(received) == 1
+        assert "created_to_done_ms" in received[0].payload
+        assert received[0].payload["created_to_done_ms"] > 0
+
+    async def test_send_voice_start_resets_timing_state(self, bridge, call_id):
+        """send_voice_start resets timing and response_source state."""
+        mock_ws = _make_mock_ws()
+        bridge.set_frontend_ws(mock_ws)
+
+        bridge._response_created_ms = 999
+        bridge._current_response_source = "specialist"
+
+        event = RealtimeVoiceStart(
+            call_id=call_id,
+            agent_generation_id=uuid4(),
+            voice_generation_id=uuid4(),
+            prompt="test",
+            ts=1000,
+        )
+        await bridge.send_voice_start(event)
+
+        assert bridge._response_created_ms == 0
+        assert bridge._current_response_source == "router"

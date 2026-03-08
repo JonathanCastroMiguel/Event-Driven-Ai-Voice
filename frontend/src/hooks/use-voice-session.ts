@@ -121,6 +121,10 @@ export function useVoiceSession(): UseVoiceSessionReturn {
         pendingMessages.length = 0;
       };
 
+      // Track audio playback state for client debug events
+      let firstAudioReceived = false;
+      let currentDebugTurnId = "";
+
       // Handle messages from backend — route to OpenAI or handle locally
       const backendOnlyTypes = new Set([
         "debug_event",
@@ -135,6 +139,10 @@ export function useVoiceSession(): UseVoiceSessionReturn {
           const parsed = JSON.parse(raw) as Record<string, unknown>;
           const msgType = parsed.type as string | undefined;
           if (msgType && backendOnlyTypes.has(msgType)) {
+            // Track turn_id from debug events for client debug event emission
+            if (msgType === "debug_event" && parsed.turn_id) {
+              currentDebugTurnId = String(parsed.turn_id);
+            }
             // Backend-only event — route to debug handler, don't forward to OpenAI
             debugHandlerRef.current?.(parsed);
             return;
@@ -190,6 +198,33 @@ export function useVoiceSession(): UseVoiceSessionReturn {
 
           const event = JSON.parse(raw) as Record<string, unknown>;
 
+          // Track audio playback for client debug events
+          // In WebRTC mode, audio flows via RTP track (not response.audio.delta).
+          // output_audio_buffer.started = speaker begins playing
+          // output_audio_buffer.stopped = speaker finished playing all buffered audio
+          if (event.type === "response.created") {
+            firstAudioReceived = false;
+          } else if (event.type === "output_audio_buffer.started" && !firstAudioReceived) {
+            firstAudioReceived = true;
+            if (eventWsRef.current?.readyState === WebSocket.OPEN && currentDebugTurnId) {
+              eventWsRef.current.send(JSON.stringify({
+                type: "client_debug_event",
+                stage: "audio_playback_start",
+                turn_id: currentDebugTurnId,
+                ts: Date.now(),
+              }));
+            }
+          } else if (event.type === "output_audio_buffer.stopped") {
+            if (eventWsRef.current?.readyState === WebSocket.OPEN && currentDebugTurnId) {
+              eventWsRef.current.send(JSON.stringify({
+                type: "client_debug_event",
+                stage: "audio_playback_end",
+                turn_id: currentDebugTurnId,
+                ts: Date.now(),
+              }));
+            }
+          }
+
           // Forward to debug handler (filter high-frequency audio deltas)
           if (event.type !== "response.audio.delta") {
             debugHandlerRef.current?.(event);
@@ -210,7 +245,7 @@ export function useVoiceSession(): UseVoiceSessionReturn {
               });
             }
           } else if (event.type === "response.audio_transcript.done") {
-            const text = (event.transcript as string) ?? "";
+            const text = ((event.transcript as string) ?? "").trim();
             if (text) {
               controlHandlerRef.current?.({
                 type: "transcription",

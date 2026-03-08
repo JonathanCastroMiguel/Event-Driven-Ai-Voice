@@ -197,6 +197,7 @@ class RealtimeVoiceStart(msgspec.Struct, frozen=True):
     voice_generation_id: UUID
     prompt: str | list[dict[str, str]]
     ts: int
+    response_source: str = "router"
 
 
 class RealtimeVoiceCancel(msgspec.Struct, frozen=True):

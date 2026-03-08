@@ -1,12 +1,12 @@
 """Model-as-router: uses the Realtime voice model for intent classification.
 
-The model receives a structured router prompt and either speaks directly
-(simple intents) or returns a JSON action for specialist routing.
+The model receives a structured router prompt and always speaks naturally.
+For specialist routing, the model calls a `route_to_specialist` function
+(never vocalized) while simultaneously speaking a filler message.
 """
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -27,10 +27,39 @@ class Department(str, Enum):
 
 @dataclass(frozen=True)
 class ModelRouterAction:
-    """Parsed JSON action from model response indicating specialist routing."""
+    """Parsed routing action from function call indicating specialist routing."""
 
     department: Department
     summary: str
+
+
+# Tool definition for the route_to_specialist function.
+# Included in response.create so the model can signal routing
+# without contaminating the audio stream.
+ROUTE_TOOL_DEFINITION: dict[str, Any] = {
+    "type": "function",
+    "name": "route_to_specialist",
+    "description": (
+        "Route the customer to a specialist department. "
+        "Call this when the customer needs help that requires system access "
+        "(account lookup, billing changes, technical troubleshooting, etc.)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "department": {
+                "type": "string",
+                "enum": ["sales", "billing", "support", "retention"],
+                "description": "The specialist department to route to.",
+            },
+            "summary": {
+                "type": "string",
+                "description": "Brief English summary of what the customer needs.",
+            },
+        },
+        "required": ["department", "summary"],
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -71,9 +100,8 @@ class RouterPromptBuilder:
     ) -> dict[str, Any]:
         """Build a response.create payload for the OpenAI Realtime API.
 
-        History is embedded in instructions (system prompt) so that the model
-        uses OpenAI's native conversation context (which includes the current
-        turn's audio) rather than a text-only override via response.input.
+        Includes the route_to_specialist tool so the model can signal routing
+        via function call (never vocalized) while speaking a filler message.
 
         Args:
             history: Prior conversation turns as user/assistant message pairs
@@ -99,42 +127,41 @@ class RouterPromptBuilder:
             "response": {
                 "modalities": ["text", "audio"],
                 "instructions": instructions,
+                "tools": [ROUTE_TOOL_DEFINITION],
+                "tool_choice": "auto",
             },
         }
 
 
-def parse_model_action(transcript: str) -> ModelRouterAction | None:
-    """Parse accumulated response transcript into a ModelRouterAction or None.
+def parse_function_call_action(
+    name: str,
+    arguments: str,
+) -> ModelRouterAction | None:
+    """Parse a function call from the Realtime API into a routing action.
 
-    Returns None if the transcript is a direct voice response (non-JSON).
-    Returns None with a warning log if the JSON is malformed or doesn't match schema.
+    Returns None if the function name doesn't match or arguments are invalid.
     """
-    text = transcript.strip()
-    if not text.startswith("{"):
+    if name != "route_to_specialist":
+        logger.warning("unexpected_function_call", name=name)
         return None
+
+    import orjson
 
     try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        logger.warning("model_router_malformed_json", transcript=text[:200])
+        args = orjson.loads(arguments)
+    except Exception:
+        logger.warning("function_call_invalid_json", arguments=arguments[:200])
         return None
 
-    if not isinstance(data, dict):
-        logger.warning("model_router_not_dict", transcript=text[:200])
-        return None
+    dept_str = str(args.get("department", "")).lower()
+    summary = str(args.get("summary", "")).strip()
 
-    if data.get("action") != "specialist":
-        logger.warning("model_router_wrong_action", action=data.get("action"))
-        return None
-
-    dept_str = data.get("department", "")
     try:
         department = Department(dept_str)
     except ValueError:
-        logger.warning("model_router_unknown_department", department=dept_str)
+        logger.warning("function_call_unknown_department", department=dept_str)
         return None
 
-    summary = str(data.get("summary", ""))
     return ModelRouterAction(department=department, summary=summary)
 
 
