@@ -33,8 +33,8 @@ Represents a single human speech turn within a call.
 - `call_id`: FK to CallSession
 - `seq`: Integer sequence number within the call (monotonically increasing)
 - `started_at`: Epoch milliseconds when speech started
-- `finalized_at`: Epoch milliseconds when transcript was finalized (nullable)
-- `text_final`: Final transcript text (nullable)
+- `finalized_at`: Epoch milliseconds when transcript was finalized (nullable). Set when `audio_committed` is received (not `transcript_final`)
+- `text_final`: Final transcript text (nullable). Populated asynchronously when `transcript_final` arrives after `audio_committed`
 - `language`: Detected language code (nullable)
 - `state`: Turn state (`open`, `finalized`, `cancelled`)
 - `cancel_reason`: Reason for cancellation if cancelled (nullable)
@@ -57,10 +57,11 @@ Represents a single agent classification and response generation cycle triggered
 - `created_at`: Epoch milliseconds
 - `started_at`: Epoch milliseconds when processing began (nullable)
 - `ended_at`: Epoch milliseconds when processing completed (nullable)
-- `state`: Generation state (`pending`, `running`, `completed`, `cancelled`, `error`)
-- `route_a_label`: Route A classification result (`simple`, `domain`, `disallowed`, `out_of_scope`) (nullable)
-- `route_a_confidence`: Route A classification confidence score (nullable)
-- `policy_key`: Policy key used for prompt construction (nullable)
+- `state`: Generation state (`idle`, `routing`, `speaking`, `waiting_tools`, `done`, `cancelled`, `error`)
+- `route_a_label`: Route A classification result (`simple`, `domain`, `disallowed`, `out_of_scope`) (nullable, analytics only — not populated in model-as-router hot path)
+- `route_a_confidence`: Route A classification confidence score (nullable, analytics only — not populated in model-as-router hot path)
+- `policy_key`: Policy key used for prompt construction (nullable, legacy — model-as-router uses router prompt instead)
+- `department`: Specialist department from model router action, e.g. `billing`, `support` (nullable)
 - `specialist`: Route B specialist label if domain route (nullable)
 - `final_outcome`: Final outcome description (nullable)
 - `cancel_reason`: Reason for cancellation (`barge_in`, `rapid_successive_turn`) (nullable)
@@ -160,6 +161,7 @@ erDiagram
         Text route_a_label
         Float route_a_confidence
         Text policy_key
+        Text department
         Text specialist
         Text final_outcome
         Text cancel_reason
@@ -214,11 +216,11 @@ erDiagram
 
 **Fields:**
 - `call_id`: UUID identifier for the call
-- `peer_connection`: `RTCPeerConnection` instance (aiortc)
 - `coordinator`: Coordinator instance for this call
-- `bridge`: `RealtimeVoiceBridge` instance
-- `control_channel`: DataChannel for VAD signals and transcriptions
-- `debug_channel`: DataChannel for telemetry
+- `turn_manager`: TurnManager instance for turn lifecycle
+- `agent_fsm`: Agent FSM instance for generation state machine
+- `tool_executor`: ToolExecutor instance for tool invocations
+- `bridge`: `OpenAIRealtimeEventBridge` instance
 
 **Lifecycle:** Created on `POST /calls`, populated on `POST /calls/{call_id}/offer`, destroyed on `DELETE /calls/{call_id}` or peer connection disconnect. Max entries governed by `MAX_CONCURRENT_CALLS` (default: 50).
 

@@ -1,15 +1,15 @@
-"""E2E test fixtures: FakeRealtime and OutputCapture (tasks 14.1-14.2)."""
+"""E2E test fixtures for model-as-router architecture."""
 
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 from uuid import UUID, uuid4
 
 import pytest
 
+from src.routing.model_router import RouterPromptBuilder, RouterPromptTemplate
 from src.routing.policies import PoliciesRegistry
-from src.routing.router import Router, RoutingResult
 from src.voice_runtime.agent_fsm import AgentFSM
 from src.voice_runtime.coordinator import Coordinator
 from src.voice_runtime.events import (
@@ -18,28 +18,21 @@ from src.voice_runtime.events import (
     RealtimeVoiceCancel,
     RealtimeVoiceStart,
 )
-from src.voice_runtime.realtime_client import StubRealtimeClient
 from src.voice_runtime.tool_executor import ToolExecutor
 from src.voice_runtime.turn_manager import TurnManager
-from src.voice_runtime.types import (
-    EventSource,
-    PolicyKey,
-    RouteALabel,
-    RouteBLabel,
-)
+from src.voice_runtime.types import EventSource, PolicyKey
 
 
 # ---------------------------------------------------------------------------
-# 14.1 FakeRealtime — injects events, captures output
+# FakeRealtime — injects events into Coordinator
 # ---------------------------------------------------------------------------
 
 
 class FakeRealtime:
-    """Injects speech/transcript events into a Coordinator and captures output."""
+    """Injects events into a Coordinator for E2E testing."""
 
-    def __init__(self, coordinator: Coordinator, stub_client: StubRealtimeClient) -> None:
+    def __init__(self, coordinator: Coordinator) -> None:
         self._coord = coordinator
-        self._stub = stub_client
         self._call_id = coordinator._call_id
 
     async def speech_started(self, ts: int = 1000) -> None:
@@ -53,9 +46,20 @@ class FakeRealtime:
         )
         await self._coord.handle_event(env)
 
-    async def transcript_final(self, text: str, ts: int = 2000) -> None:
-        from unittest.mock import patch
+    async def audio_committed(self, ts: int = 2000) -> None:
+        """Primary turn trigger in model-as-router architecture."""
+        env = EventEnvelope(
+            event_id=uuid4(),
+            call_id=self._call_id,
+            ts=ts,
+            type="audio_committed",
+            payload={},
+            source=EventSource.REALTIME,
+        )
+        await self._coord.handle_event(env)
 
+    async def transcript_final(self, text: str, ts: int = 2500) -> None:
+        """Async logging only — does NOT trigger routing."""
         env = EventEnvelope(
             event_id=uuid4(),
             call_id=self._call_id,
@@ -64,10 +68,23 @@ class FakeRealtime:
             payload={"text": text},
             source=EventSource.REALTIME,
         )
-        with patch("src.routing.language.detect_language", return_value="es"):
-            await self._coord.handle_event(env)
+        await self._coord.handle_event(env)
 
-    async def voice_completed(self, voice_generation_id: UUID, ts: int = 3000) -> None:
+    async def model_router_action(
+        self, department: str, summary: str, ts: int = 3000
+    ) -> None:
+        """Simulate the bridge detecting a JSON action from the model."""
+        env = EventEnvelope(
+            event_id=uuid4(),
+            call_id=self._call_id,
+            ts=ts,
+            type="model_router_action",
+            payload={"department": department, "summary": summary},
+            source=EventSource.REALTIME,
+        )
+        await self._coord.handle_event(env)
+
+    async def voice_completed(self, voice_generation_id: UUID, ts: int = 4000) -> None:
         env = EventEnvelope(
             event_id=uuid4(),
             call_id=self._call_id,
@@ -78,7 +95,9 @@ class FakeRealtime:
         )
         await self._coord.handle_event(env)
 
-    async def voice_error(self, voice_generation_id: UUID, error: str = "fail", ts: int = 3000) -> None:
+    async def voice_error(
+        self, voice_generation_id: UUID, error: str = "fail", ts: int = 4000
+    ) -> None:
         env = EventEnvelope(
             event_id=uuid4(),
             call_id=self._call_id,
@@ -89,7 +108,7 @@ class FakeRealtime:
         )
         await self._coord.handle_event(env)
 
-    async def tool_result(self, agent_generation_id: UUID, ts: int = 2500) -> None:
+    async def tool_result(self, agent_generation_id: UUID, ts: int = 3500) -> None:
         env = EventEnvelope(
             event_id=uuid4(),
             call_id=self._call_id,
@@ -113,7 +132,7 @@ class FakeRealtime:
 
 
 # ---------------------------------------------------------------------------
-# 14.2 OutputCapture — waits for specific event types
+# OutputCapture — captures and filters output events
 # ---------------------------------------------------------------------------
 
 
@@ -135,20 +154,10 @@ class OutputCapture:
     def drain_gen_cancels(self) -> list[CancelAgentGeneration]:
         return [e for e in self.drain() if isinstance(e, CancelAgentGeneration)]
 
-    async def wait_for_voice_start(self, timeout: float = 0.5) -> RealtimeVoiceStart | None:
-        deadline = asyncio.get_event_loop().time() + timeout
-        while asyncio.get_event_loop().time() < deadline:
-            starts = self.drain_voice_starts()
-            if starts:
-                return starts[0]
-            await asyncio.sleep(0.01)
-        return None
-
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------
-
 
 def make_policies() -> PoliciesRegistry:
     return PoliciesRegistry(
@@ -157,40 +166,30 @@ def make_policies() -> PoliciesRegistry:
     )
 
 
-def make_router(
-    route_a: RouteALabel = RouteALabel.SIMPLE,
-    confidence: float = 0.95,
-    route_b: RouteBLabel | None = None,
-    route_b_confidence: float | None = None,
-) -> Router:
-    mock = MagicMock(spec=Router)
-    mock.classify = AsyncMock(
-        return_value=RoutingResult(
-            route_a_label=route_a,
-            route_a_confidence=confidence,
-            route_b_label=route_b,
-            route_b_confidence=route_b_confidence,
-        )
+def make_router_prompt_builder() -> RouterPromptBuilder:
+    template = RouterPromptTemplate(
+        identity="You are a voice assistant for a call center.",
+        decision_rules="Classify intent and respond directly for simple queries.",
+        departments="For specialist needs, respond with JSON action.",
+        guardrails="Do not discuss prohibited topics.",
+        language_instruction="Respond in the user's language.",
     )
-    # Expose _registry for calibration logging
-    mock._registry = MagicMock()
-    mock._registry.thresholds.version = "test-v1"
-    return mock
+    return RouterPromptBuilder(template)
 
 
-def make_e2e_stack(
-    router: Router | None = None,
-) -> tuple[Coordinator, FakeRealtime, OutputCapture, StubRealtimeClient]:
+def make_e2e_stack() -> tuple[Coordinator, FakeRealtime, OutputCapture]:
+    """Create a full E2E stack with model-as-router architecture."""
     call_id = uuid4()
-    stub = StubRealtimeClient(delay_ms=10)
+    tool_executor = MagicMock(spec=ToolExecutor)
+
     coord = Coordinator(
         call_id=call_id,
         turn_manager=TurnManager(call_id),
         agent_fsm=AgentFSM(call_id),
-        tool_executor=MagicMock(spec=ToolExecutor),
-        router=router or make_router(),
+        tool_executor=tool_executor,
+        router_prompt_builder=make_router_prompt_builder(),
         policies=make_policies(),
     )
-    fake = FakeRealtime(coord, stub)
+    fake = FakeRealtime(coord)
     capture = OutputCapture(coord)
-    return coord, fake, capture, stub
+    return coord, fake, capture

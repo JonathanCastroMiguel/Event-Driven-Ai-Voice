@@ -44,6 +44,9 @@ TURN_SERVERS=
 TURN_USERNAME=
 TURN_CREDENTIAL=
 MAX_CONCURRENT_CALLS=50
+
+# Server VAD
+VAD_SILENCE_DURATION_MS=300
 ```
 
 ### 3. Start Infrastructure
@@ -75,6 +78,7 @@ alembic upgrade head
 The router registry lives at `backend/router_registry/v1/` and contains:
 - `config.yml` — thresholds, centroid definitions, lexicon rules
 - `policies.yml` — policy key to prompt template mapping
+- `router_prompt.yaml` — model-as-router system prompt template (identity, decision rules, departments, guardrails, language instruction)
 
 ### 7. Run the Server
 
@@ -107,17 +111,19 @@ pytest tests/unit/test_coordinator.py -v
 
 ### Test Structure
 
-- `tests/unit/` — Unit tests for individual components (coordinator, router, turn manager, agent FSM, tool executor, realtime client, telemetry, API routes)
-- `tests/e2e/` — End-to-end tests exercising the full event pipeline via FakeRealtime + OutputCapture fixtures
+- `tests/unit/` — 265 unit tests for individual components (coordinator, router, turn manager, agent FSM, tool executor, realtime client, telemetry, API routes)
+- `tests/e2e/` — 23 E2E integration tests exercising the full event pipeline via FakeRealtime + OutputCapture fixtures, plus 4 Playwright E2E tests
 
 ## Architecture Overview
 
 The runtime uses an **Event-Driven Actor Model** with four actors communicating via typed events:
 
-1. **Coordinator** (CallSession) — Central orchestrator: state management, barge-in cancellation, idempotency, prompt construction
-2. **TurnManager** — Detects human speech turns from VAD/transcript events
-3. **Agent FSM** — Intent classification (Route A/B) via embeddings, policy key emission
+1. **Coordinator** (CallSession) — Central orchestrator: state management, barge-in cancellation, idempotency, model-as-router dispatch via response.create
+2. **TurnManager** — Detects human speech turns from VAD events and audio_committed signals
+3. **Agent FSM** — State machine tracking agent lifecycle: idle → routing → speaking → waiting_tools → done. No longer performs classification — that's handled by the model-as-router.
 4. **ToolExecutor** — Deterministic tool execution with timeout, cancellation, result caching
+
+The runtime uses a **model-as-router** architecture where the Realtime voice model classifies intent AND responds in a single inference. The embedding pipeline (Router, EmbeddingEngine) is preserved for offline analytics but removed from the hot path.
 
 ### Key Endpoints
 

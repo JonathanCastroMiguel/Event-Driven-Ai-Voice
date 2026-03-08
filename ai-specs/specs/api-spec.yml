@@ -40,6 +40,8 @@ paths:
         Metrics include voice_turn_latency_ms, voice_route_a_confidence,
         voice_route_b_confidence, voice_tool_execution_ms, voice_barge_in_total,
         voice_fallback_llm_total, voice_active_calls, voice_filler_emitted_total.
+        Note: voice_route_a_confidence and voice_route_b_confidence metrics are
+        from the analytics pipeline (not the model-as-router hot path).
       tags: [health]
       responses:
         "200":
@@ -170,9 +172,10 @@ paths:
         WebSocket endpoint for bidirectional event forwarding between the
         browser and the Coordinator. Input: browser forwards OpenAI data channel
         events to the bridge for translation and dispatch. Output: Coordinator
-        commands are sent to the browser for forwarding to the OpenAI data channel.
-        On connection, a one-time session.update is sent to configure transcription
-        (whisper-1) and disable auto-response (create_response=false).
+        commands are sent to the browser for forwarding to the OpenAI data channel,
+        including `response.create` commands from the Coordinator (model-as-router
+        architecture). On connection, a one-time session.update is sent to configure
+        transcription (whisper-1) and disable auto-response (create_response=false).
       tags: [webrtc]
       parameters:
         - name: call_id
@@ -270,12 +273,21 @@ components:
           format: uuid
         state:
           type: string
+          description: >
+            Generation state. Values: idle, routing, speaking, waiting_tools,
+            done, cancelled, error.
         route_a_label:
           type: string
           nullable: true
+          description: "Route A classification result (analytics only — not populated in model-as-router hot path)"
         route_a_confidence:
           type: number
           nullable: true
+          description: "Route A classification confidence score (analytics only — not populated in model-as-router hot path)"
+        department:
+          type: string
+          nullable: true
+          description: "Specialist department from model router action (e.g. billing, support)"
         specialist:
           type: string
           nullable: true
