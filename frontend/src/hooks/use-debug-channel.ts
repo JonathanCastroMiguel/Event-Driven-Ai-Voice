@@ -2,133 +2,122 @@
 
 import { useCallback, useState } from "react";
 
-import type { DebugEvent } from "@/lib/types";
+/** A single stage in the pipeline timeline. */
+export interface DebugStage {
+  stage: string;
+  delta_ms: number;
+  total_ms: number;
+  ts: number;
+  label?: string;
+  route_type?: "direct" | "delegate";
+}
+
+/** A complete turn timeline with main and optional specialist sub-flow. */
+export interface DebugTurnTimeline {
+  turn_id: string;
+  stages: DebugStage[];
+  is_delegate: boolean;
+  specialist_stages: DebugStage[];
+  barge_in: boolean;
+}
 
 interface DebugState {
-  /** Turn history from turn_update events. */
-  turns: DebugTurn[];
-  /** Current FSM state. */
-  fsmState: string | null;
-  /** Latest routing decision. */
-  routing: DebugRouting | null;
-  /** All debug events (most recent first, max 100). */
-  events: DebugEvent[];
-  /** Latency measurements. */
-  latencies: DebugLatency[];
-}
-
-export interface DebugTurn {
-  turnId: string;
-  text: string;
-  routeA: string;
-  routeB: string | null;
-  policyKey: string | null;
-  specialist: string | null;
-  ts: number;
-}
-
-export interface DebugRouting {
-  routeALabel: string;
-  routeAConfidence: number;
-  routeBLabel: string | null;
-  routeBConfidence: number | null;
-  shortCircuit: string | null;
-  fallbackUsed: boolean;
-}
-
-export interface DebugLatency {
-  type: string;
-  ms: number;
-  ts: number;
+  /** Last 5 turns (newest first). */
+  turns: DebugTurnTimeline[];
 }
 
 interface UseDebugChannelReturn {
-  /** Current debug state. */
   state: DebugState;
-  /** Whether debug mode is enabled. */
-  isEnabled: boolean;
-  /** Handle an incoming debug message (register as handler). */
   handleDebugMessage: (msg: unknown) => void;
+  clearState: () => void;
 }
 
-const MAX_EVENTS = 100;
+const MAX_TURNS = 5;
+
+const SPECIALIST_STAGES = new Set([
+  "specialist_sent",
+  "specialist_processing",
+  "specialist_ready",
+]);
 
 function createEmptyState(): DebugState {
+  return { turns: [] };
+}
+
+function createTurn(turn_id: string): DebugTurnTimeline {
   return {
-    turns: [],
-    fsmState: null,
-    routing: null,
-    events: [],
-    latencies: [],
+    turn_id,
+    stages: [],
+    is_delegate: false,
+    specialist_stages: [],
+    barge_in: false,
   };
 }
 
 export function useDebugChannel(): UseDebugChannelReturn {
   const [state, setState] = useState<DebugState>(createEmptyState);
-  const [isEnabled, setIsEnabled] = useState(false);
+
+  const clearState = useCallback(() => {
+    setState(createEmptyState());
+  }, []);
 
   const handleDebugMessage = useCallback((raw: unknown) => {
-    const msg = raw as DebugEvent;
-    if (!msg || typeof msg !== "object" || !("type" in msg)) return;
+    const msg = raw as Record<string, unknown>;
+    if (!msg || typeof msg !== "object" || msg.type !== "debug_event") return;
 
-    setIsEnabled(true);
+    const turn_id = String(msg.turn_id ?? "");
+    if (!turn_id) return;
+
+    const stageEntry: DebugStage = {
+      stage: String(msg.stage ?? ""),
+      delta_ms: Number(msg.delta_ms ?? 0),
+      total_ms: Number(msg.total_ms ?? 0),
+      ts: Number(msg.ts ?? Date.now()),
+    };
+
+    if (msg.label !== undefined) stageEntry.label = String(msg.label);
+    if (msg.route_type !== undefined)
+      stageEntry.route_type = msg.route_type as "direct" | "delegate";
 
     setState((prev) => {
-      const events = [msg, ...prev.events].slice(0, MAX_EVENTS);
-      const next = { ...prev, events };
+      const turns = [...prev.turns];
+      let turnIndex = turns.findIndex((t) => t.turn_id === turn_id);
 
-      switch (msg.type) {
-        case "turn_update":
-          next.turns = [
-            ...prev.turns,
-            {
-              turnId: String(msg.turn_id ?? ""),
-              text: String(msg.text ?? ""),
-              routeA: String(msg.route_a ?? ""),
-              routeB: msg.route_b ? String(msg.route_b) : null,
-              policyKey: msg.policy_key ? String(msg.policy_key) : null,
-              specialist: msg.specialist ? String(msg.specialist) : null,
-              ts: Number(msg.ts ?? Date.now()),
-            },
-          ];
-          break;
+      if (turnIndex === -1) {
+        // New turn — add at the front (newest first)
+        const newTurn = createTurn(turn_id);
+        turns.unshift(newTurn);
+        turnIndex = 0;
 
-        case "fsm_state":
-          next.fsmState = String(msg.state ?? "unknown");
-          break;
-
-        case "routing":
-          next.routing = {
-            routeALabel: String(msg.route_a_label ?? ""),
-            routeAConfidence: Number(msg.route_a_confidence ?? 0),
-            routeBLabel: msg.route_b_label
-              ? String(msg.route_b_label)
-              : null,
-            routeBConfidence: msg.route_b_confidence
-              ? Number(msg.route_b_confidence)
-              : null,
-            shortCircuit: msg.short_circuit
-              ? String(msg.short_circuit)
-              : null,
-            fallbackUsed: Boolean(msg.fallback_used),
-          };
-          break;
-
-        case "latency":
-          next.latencies = [
-            ...prev.latencies,
-            {
-              type: String(msg.latency_type ?? "turn_processing"),
-              ms: Number(msg.turn_processing_ms ?? msg.ms ?? 0),
-              ts: Number(msg.ts ?? Date.now()),
-            },
-          ];
-          break;
+        // Evict oldest if over limit
+        if (turns.length > MAX_TURNS) {
+          turns.pop();
+        }
       }
 
-      return next;
+      const turn = { ...turns[turnIndex] };
+
+      if (stageEntry.stage === "barge_in") {
+        turn.barge_in = true;
+        turn.stages = [...turn.stages, stageEntry];
+      } else if (SPECIALIST_STAGES.has(stageEntry.stage)) {
+        turn.specialist_stages = [...turn.specialist_stages, stageEntry];
+      } else {
+        turn.stages = [...turn.stages, stageEntry];
+
+        // Detect delegate route
+        if (
+          stageEntry.stage === "route_result" &&
+          stageEntry.route_type === "delegate"
+        ) {
+          turn.is_delegate = true;
+        }
+      }
+
+      turns[turnIndex] = turn;
+      return { turns };
     });
   }, []);
 
-  return { state, isEnabled, handleDebugMessage };
+  return { state, handleDebugMessage, clearState };
 }

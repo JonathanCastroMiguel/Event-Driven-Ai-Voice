@@ -119,6 +119,29 @@ class FakeRealtime:
         )
         await self._coord.handle_event(env)
 
+    async def speech_stopped(self, ts: int = 1500) -> None:
+        env = EventEnvelope(
+            event_id=uuid4(),
+            call_id=self._call_id,
+            ts=ts,
+            type="speech_stopped",
+            payload={},
+            source=EventSource.REALTIME,
+        )
+        await self._coord.handle_event(env)
+
+    async def response_created(self, ts: int = 2800) -> None:
+        """Simulate bridge emitting response.created envelope."""
+        env = EventEnvelope(
+            event_id=uuid4(),
+            call_id=self._call_id,
+            ts=ts,
+            type="response_created",
+            payload={"send_to_created_ms": 45},
+            source=EventSource.REALTIME,
+        )
+        await self._coord.handle_event(env)
+
     async def inject_duplicate(self, event_id: UUID, ts: int = 1000) -> None:
         env = EventEnvelope(
             event_id=event_id,
@@ -153,6 +176,40 @@ class OutputCapture:
 
     def drain_gen_cancels(self) -> list[CancelAgentGeneration]:
         return [e for e in self.drain() if isinstance(e, CancelAgentGeneration)]
+
+
+# ---------------------------------------------------------------------------
+# DebugCapture — captures debug events emitted by Coordinator
+# ---------------------------------------------------------------------------
+
+
+class DebugCapture:
+    """Captures debug_event messages emitted by the Coordinator."""
+
+    def __init__(self) -> None:
+        self.events: list[dict[str, object]] = []
+
+    async def callback(self, event: dict[str, object]) -> None:
+        self.events.append(event)
+
+    def drain(self) -> list[dict[str, object]]:
+        """Return all captured events and clear the buffer."""
+        result = list(self.events)
+        self.events.clear()
+        return result
+
+    @property
+    def debug_events(self) -> list[dict[str, object]]:
+        """Return only structured debug_event messages (from _send_debug)."""
+        return [e for e in self.events if e.get("type") == "debug_event"]
+
+    def stages(self) -> list[str]:
+        """Return stage names from debug_event messages only."""
+        return [str(e.get("stage", "")) for e in self.debug_events]
+
+    def by_stage(self, stage: str) -> list[dict[str, object]]:
+        """Filter debug_event messages by stage name."""
+        return [e for e in self.debug_events if e.get("stage") == stage]
 
 
 # ---------------------------------------------------------------------------
@@ -193,3 +250,12 @@ def make_e2e_stack() -> tuple[Coordinator, FakeRealtime, OutputCapture]:
     fake = FakeRealtime(coord)
     capture = OutputCapture(coord)
     return coord, fake, capture
+
+
+def make_debug_e2e_stack() -> tuple[Coordinator, FakeRealtime, OutputCapture, DebugCapture]:
+    """Create an E2E stack with debug enabled and a DebugCapture."""
+    coord, fake, capture = make_e2e_stack()
+    debug = DebugCapture()
+    coord.set_debug_callback(debug.callback)
+    coord.set_debug_enabled(True)
+    return coord, fake, capture, debug

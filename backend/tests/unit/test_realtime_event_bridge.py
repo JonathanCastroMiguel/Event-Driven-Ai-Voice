@@ -391,9 +391,10 @@ class TestTranscriptBufferAndJsonDetection:
         await bridge._translate_event({"type": "response.audio_transcript.delta", "delta": '"summary": "wants upgrade"}'})
         await bridge._translate_event({"type": "response.done"})
 
-        assert len(received) == 1
-        assert received[0].type == "model_router_action"
-        assert received[0].payload["department"] == "sales"
+        assert len(received) == 2
+        assert received[0].type == "response_created"
+        assert received[1].type == "model_router_action"
+        assert received[1].payload["department"] == "sales"
 
     async def test_buffer_cleared_after_response_done(self, bridge):
         """Buffer is cleared after response.done regardless of content."""

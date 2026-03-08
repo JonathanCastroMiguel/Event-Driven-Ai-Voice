@@ -6,7 +6,8 @@ export type ConnectionStatus =
   | "connecting"
   | "connected"
   | "disconnected"
-  | "failed";
+  | "failed"
+  | "mic_denied";
 
 /** A transcription message received via the data channel. */
 export interface TranscriptionMessage {

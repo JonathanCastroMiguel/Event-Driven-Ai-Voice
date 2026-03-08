@@ -3,111 +3,163 @@ import { describe, expect, it } from "vitest";
 
 import { useDebugChannel } from "@/hooks/use-debug-channel";
 
+function makeDebugEvent(
+  turn_id: string,
+  stage: string,
+  overrides: Record<string, unknown> = {},
+) {
+  return {
+    type: "debug_event",
+    turn_id,
+    stage,
+    delta_ms: 0,
+    total_ms: 0,
+    ts: Date.now(),
+    ...overrides,
+  };
+}
+
 describe("useDebugChannel", () => {
   it("starts with empty state", () => {
     const { result } = renderHook(() => useDebugChannel());
     expect(result.current.state.turns).toHaveLength(0);
-    expect(result.current.state.fsmState).toBeNull();
-    expect(result.current.state.routing).toBeNull();
-    expect(result.current.state.events).toHaveLength(0);
-    expect(result.current.state.latencies).toHaveLength(0);
-    expect(result.current.isEnabled).toBe(false);
   });
 
-  it("handles turn_update event", () => {
+  it("groups events by turn_id into timelines", () => {
     const { result } = renderHook(() => useDebugChannel());
 
     act(() => {
-      result.current.handleDebugMessage({
-        type: "turn_update",
-        turn_id: "abc-123",
-        text: "hola",
-        route_a: "simple",
-        route_b: null,
-        policy_key: "greeting",
-        ts: 1000,
-      });
+      result.current.handleDebugMessage(
+        makeDebugEvent("turn-1", "speech_start", { delta_ms: 0, total_ms: 0 }),
+      );
+      result.current.handleDebugMessage(
+        makeDebugEvent("turn-1", "speech_stop", {
+          delta_ms: 500,
+          total_ms: 500,
+        }),
+      );
+      result.current.handleDebugMessage(
+        makeDebugEvent("turn-1", "audio_committed", {
+          delta_ms: 10,
+          total_ms: 510,
+        }),
+      );
     });
 
     expect(result.current.state.turns).toHaveLength(1);
-    expect(result.current.state.turns[0].text).toBe("hola");
-    expect(result.current.state.turns[0].routeA).toBe("simple");
-    expect(result.current.isEnabled).toBe(true);
+    expect(result.current.state.turns[0].turn_id).toBe("turn-1");
+    expect(result.current.state.turns[0].stages).toHaveLength(3);
+    expect(result.current.state.turns[0].stages[0].stage).toBe("speech_start");
+    expect(result.current.state.turns[0].stages[2].total_ms).toBe(510);
   });
 
-  it("handles fsm_state event", () => {
+  it("splits delegate route events into main + specialist_stages", () => {
     const { result } = renderHook(() => useDebugChannel());
 
     act(() => {
-      result.current.handleDebugMessage({
-        type: "fsm_state",
-        state: "thinking",
-      });
+      result.current.handleDebugMessage(
+        makeDebugEvent("turn-d", "speech_start"),
+      );
+      result.current.handleDebugMessage(
+        makeDebugEvent("turn-d", "route_result", {
+          route_type: "delegate",
+          label: "sales",
+        }),
+      );
+      result.current.handleDebugMessage(
+        makeDebugEvent("turn-d", "fill_silence", { delta_ms: 5 }),
+      );
+      result.current.handleDebugMessage(
+        makeDebugEvent("turn-d", "specialist_sent", { delta_ms: 10 }),
+      );
+      result.current.handleDebugMessage(
+        makeDebugEvent("turn-d", "specialist_processing", { delta_ms: 50 }),
+      );
+      result.current.handleDebugMessage(
+        makeDebugEvent("turn-d", "specialist_ready", { delta_ms: 200 }),
+      );
+      result.current.handleDebugMessage(
+        makeDebugEvent("turn-d", "generation_start", { delta_ms: 5 }),
+      );
     });
 
-    expect(result.current.state.fsmState).toBe("thinking");
+    const turn = result.current.state.turns[0];
+    expect(turn.is_delegate).toBe(true);
+    expect(turn.specialist_stages).toHaveLength(3);
+    expect(turn.specialist_stages[0].stage).toBe("specialist_sent");
+    expect(turn.specialist_stages[2].stage).toBe("specialist_ready");
+    // Main stages should not include specialist_* stages
+    expect(turn.stages.find((s) => s.stage === "fill_silence")).toBeTruthy();
+    expect(turn.stages.find((s) => s.stage === "generation_start")).toBeTruthy();
   });
 
-  it("handles routing event", () => {
+  it("evicts oldest turn when FIFO exceeds 5", () => {
     const { result } = renderHook(() => useDebugChannel());
 
     act(() => {
-      result.current.handleDebugMessage({
-        type: "routing",
-        route_a_label: "domain",
-        route_a_confidence: 0.85,
-        route_b_label: "billing",
-        route_b_confidence: 0.9,
-        short_circuit: null,
-        fallback_used: false,
-      });
-    });
-
-    expect(result.current.state.routing).not.toBeNull();
-    expect(result.current.state.routing!.routeALabel).toBe("domain");
-    expect(result.current.state.routing!.routeAConfidence).toBe(0.85);
-    expect(result.current.state.routing!.routeBLabel).toBe("billing");
-  });
-
-  it("handles latency event", () => {
-    const { result } = renderHook(() => useDebugChannel());
-
-    act(() => {
-      result.current.handleDebugMessage({
-        type: "latency",
-        turn_processing_ms: 42,
-        ts: 1000,
-      });
-    });
-
-    expect(result.current.state.latencies).toHaveLength(1);
-    expect(result.current.state.latencies[0].ms).toBe(42);
-  });
-
-  it("limits events to 100", () => {
-    const { result } = renderHook(() => useDebugChannel());
-
-    act(() => {
-      for (let i = 0; i < 110; i++) {
-        result.current.handleDebugMessage({
-          type: "test",
-          index: i,
-        });
+      for (let i = 1; i <= 6; i++) {
+        result.current.handleDebugMessage(
+          makeDebugEvent(`turn-${i}`, "speech_start"),
+        );
       }
     });
 
-    expect(result.current.state.events).toHaveLength(100);
+    expect(result.current.state.turns).toHaveLength(5);
+    // Newest first
+    expect(result.current.state.turns[0].turn_id).toBe("turn-6");
+    // Oldest (turn-1) should be evicted
+    expect(
+      result.current.state.turns.find((t) => t.turn_id === "turn-1"),
+    ).toBeUndefined();
   });
 
-  it("ignores invalid messages", () => {
+  it("marks turn as interrupted on barge_in", () => {
+    const { result } = renderHook(() => useDebugChannel());
+
+    act(() => {
+      result.current.handleDebugMessage(
+        makeDebugEvent("turn-b", "speech_start"),
+      );
+      result.current.handleDebugMessage(
+        makeDebugEvent("turn-b", "generation_start"),
+      );
+      result.current.handleDebugMessage(
+        makeDebugEvent("turn-b", "barge_in"),
+      );
+    });
+
+    const turn = result.current.state.turns[0];
+    expect(turn.barge_in).toBe(true);
+    expect(turn.stages).toHaveLength(3);
+    expect(turn.stages[2].stage).toBe("barge_in");
+  });
+
+  it("ignores non-debug_event messages", () => {
     const { result } = renderHook(() => useDebugChannel());
 
     act(() => {
       result.current.handleDebugMessage(null);
       result.current.handleDebugMessage("not an object");
-      result.current.handleDebugMessage(42);
+      result.current.handleDebugMessage({ type: "other_event" });
+      result.current.handleDebugMessage({ type: "debug_event" }); // no turn_id
     });
 
-    expect(result.current.state.events).toHaveLength(0);
+    expect(result.current.state.turns).toHaveLength(0);
+  });
+
+  it("clearState resets all turns", () => {
+    const { result } = renderHook(() => useDebugChannel());
+
+    act(() => {
+      result.current.handleDebugMessage(
+        makeDebugEvent("turn-1", "speech_start"),
+      );
+    });
+    expect(result.current.state.turns).toHaveLength(1);
+
+    act(() => {
+      result.current.clearState();
+    });
+    expect(result.current.state.turns).toHaveLength(0);
   });
 });

@@ -160,6 +160,12 @@ async def create_call() -> CreateCallResponse:
 
     coordinator.set_output_callback(_on_coordinator_output)
 
+    # Wire debug events: Coordinator → Bridge → Frontend WebSocket
+    async def _on_debug_event(event: dict[str, object]) -> None:
+        await bridge.send_to_frontend(event)  # type: ignore[arg-type]
+
+    coordinator.set_debug_callback(_on_debug_event)
+
     entry = CallSessionEntry(
         call_id=call_id,
         coordinator=coordinator,
@@ -323,6 +329,16 @@ async def events_ws(websocket: WebSocket, call_id: UUID) -> None:
             except (orjson.JSONDecodeError, ValueError):
                 logger.warning("events_ws_malformed", call_id=str(call_id))
                 continue
+
+            # Intercept debug control messages — don't forward to bridge
+            msg_type = data.get("type", "")
+            if msg_type == "debug_enable":
+                entry.coordinator.set_debug_enabled(True)
+                continue
+            if msg_type == "debug_disable":
+                entry.coordinator.set_debug_enabled(False)
+                continue
+
             await entry.bridge.handle_frontend_event(data)
     except WebSocketDisconnect:
         logger.info("events_ws_disconnected", call_id=str(call_id))

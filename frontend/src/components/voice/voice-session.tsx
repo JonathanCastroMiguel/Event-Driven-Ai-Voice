@@ -29,10 +29,12 @@ export function VoiceSession() {
     endSession,
     onControlMessage,
     onDebugMessage,
+    sendDebugControl,
     error,
   } = useVoiceSession();
 
-  const { state: debugState, handleDebugMessage } = useDebugChannel();
+  const { state: debugState, handleDebugMessage, clearState } =
+    useDebugChannel();
   const [debugEnabled, setDebugEnabled] = useState(false);
 
   const [transcriptions, setTranscriptions] = useState<TranscriptionEntry[]>(
@@ -94,10 +96,15 @@ export function VoiceSession() {
     setIsUserSpeaking(false);
   }, [endSession]);
 
-  // Toggle debug mode
+  // Toggle debug mode — sends control message to backend
   const toggleDebug = useCallback(() => {
-    setDebugEnabled((prev) => !prev);
-  }, []);
+    const next = !debugEnabled;
+    setDebugEnabled(next);
+    sendDebugControl(next);
+    if (!next) {
+      clearState();
+    }
+  }, [debugEnabled, sendDebugControl, clearState]);
 
   const isActive = status === "connected";
   const isConnecting = status === "connecting";
@@ -110,7 +117,7 @@ export function VoiceSession() {
         {isConnecting && "Connecting..."}
         {isActive && `Connected (${callId?.slice(0, 8)}...)`}
         {status === "disconnected" && "Disconnected"}
-        {status === "failed" && (
+        {(status === "failed" || status === "mic_denied") && (
           <span className="text-destructive">
             {error ?? "Connection failed"}
           </span>
@@ -132,7 +139,11 @@ export function VoiceSession() {
       {/* Start / End / Debug buttons */}
       <div className="flex items-center gap-3">
         {!isActive && !isConnecting ? (
-          <Button size="lg" onClick={handleStart}>
+          <Button
+            size="lg"
+            onClick={handleStart}
+            disabled={status === "mic_denied"}
+          >
             Start Call
           </Button>
         ) : (
@@ -156,15 +167,11 @@ export function VoiceSession() {
       {/* Transcription panel */}
       <TranscriptionPanel entries={transcriptions} />
 
-      {/* Debug panel (lazy-loaded, only when toggled) */}
+      {/* Debug panel (lazy-loaded, only when toggled) — breaks out of parent max-w */}
       {debugEnabled && (
-        <DebugPanel
-          turns={debugState.turns}
-          fsmState={debugState.fsmState}
-          routing={debugState.routing}
-          events={debugState.events}
-          latencies={debugState.latencies}
-        />
+        <div className="w-[calc(100vw-2rem)] max-w-7xl">
+          <DebugPanel turns={debugState.turns} />
+        </div>
       )}
     </div>
   );

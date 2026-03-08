@@ -18,6 +18,7 @@ interface UseVoiceSessionReturn {
   endSession: () => Promise<void>;
   onControlMessage: (handler: (msg: ControlInMessage) => void) => void;
   onDebugMessage: (handler: (msg: unknown) => void) => void;
+  sendDebugControl: (enabled: boolean) => void;
   error: string | null;
 }
 
@@ -46,6 +47,7 @@ export function useVoiceSession(): UseVoiceSessionReturn {
     }
     if (audioRef.current) {
       audioRef.current.srcObject = null;
+      audioRef.current.remove();
       audioRef.current = null;
     }
     if (eventWsRef.current) {
@@ -119,18 +121,40 @@ export function useVoiceSession(): UseVoiceSessionReturn {
         pendingMessages.length = 0;
       };
 
-      // Handle commands from backend (Coordinator → OpenAI via data channel)
+      // Handle messages from backend — route to OpenAI or handle locally
+      const backendOnlyTypes = new Set([
+        "debug_event",
+        "turn_update",
+        "fsm_state",
+        "transcript_final",
+      ]);
+
       eventWs.addEventListener("message", (e: MessageEvent) => {
-        sendOrBuffer(e.data as string);
+        const raw = e.data as string;
+        try {
+          const parsed = JSON.parse(raw) as Record<string, unknown>;
+          const msgType = parsed.type as string | undefined;
+          if (msgType && backendOnlyTypes.has(msgType)) {
+            // Backend-only event — route to debug handler, don't forward to OpenAI
+            debugHandlerRef.current?.(parsed);
+            return;
+          }
+        } catch {
+          // Not JSON — forward to OpenAI as-is
+        }
+        sendOrBuffer(raw);
       });
 
       // 3. Create RTCPeerConnection
       const pc = new RTCPeerConnection();
       pcRef.current = pc;
 
-      // 4. Audio playback from OpenAI
+      // 4. Audio playback from OpenAI — appended to DOM for AEC to work
       const audio = document.createElement("audio");
       audio.autoplay = true;
+      audio.style.display = "none";
+      audio.crossOrigin = "anonymous";
+      document.body.appendChild(audio);
       audioRef.current = audio;
       pc.ontrack = (e) => {
         audio.srcObject = e.streams[0];
@@ -223,10 +247,15 @@ export function useVoiceSession(): UseVoiceSessionReturn {
         new RTCSessionDescription({ sdp: answer.sdp, type: "answer" }),
       );
     } catch (err) {
-      const message =
-        err instanceof Error ? err.message : "Failed to start session";
+      const isMicDenied =
+        err instanceof DOMException && err.name === "NotAllowedError";
+      const message = isMicDenied
+        ? "Microphone access is required for voice calls. Please allow microphone access in your browser settings."
+        : err instanceof Error
+          ? err.message
+          : "Failed to start session";
       setError(message);
-      setStatus("failed");
+      setStatus(isMicDenied ? "mic_denied" : "failed");
       await cleanup(newCallId);
     }
   }, [cleanup]);
@@ -250,6 +279,13 @@ export function useVoiceSession(): UseVoiceSessionReturn {
     debugHandlerRef.current = handler;
   }, []);
 
+  const sendDebugControl = useCallback((enabled: boolean) => {
+    const ws = eventWsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: enabled ? "debug_enable" : "debug_disable" }));
+    }
+  }, []);
+
   return {
     status,
     callId,
@@ -257,6 +293,7 @@ export function useVoiceSession(): UseVoiceSessionReturn {
     endSession,
     onControlMessage,
     onDebugMessage,
+    sendDebugControl,
     error,
   };
 }

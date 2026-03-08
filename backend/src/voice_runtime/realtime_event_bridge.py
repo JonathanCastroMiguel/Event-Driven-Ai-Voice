@@ -245,6 +245,14 @@ class OpenAIRealtimeEventBridge:
                 response_id=data.get("response", {}).get("id"),
                 send_to_created_ms=send_to_created_ms,
             )
+            envelope = EventEnvelope(
+                event_id=uuid4(),
+                call_id=self._call_id,
+                ts=_now_ms(),
+                type="response_created",
+                payload={"send_to_created_ms": send_to_created_ms},
+                source=EventSource.REALTIME,
+            )
 
         elif event_type == "response.audio_transcript.delta":
             delta = str(data.get("delta", ""))
