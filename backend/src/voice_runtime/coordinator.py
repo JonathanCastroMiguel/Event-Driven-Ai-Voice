@@ -610,7 +610,7 @@ class Coordinator:
     # ------------------------------------------------------------------
 
     async def _on_model_router_action(self, envelope: EventEnvelope) -> None:
-        """Handle model_router_action: the model returned a JSON action for specialist routing."""
+        """Handle model_router_action: the model called route_to_specialist() for specialist routing."""
         s = self._state
         department = str(envelope.payload.get("department", ""))
         summary = str(envelope.payload.get("summary", ""))
