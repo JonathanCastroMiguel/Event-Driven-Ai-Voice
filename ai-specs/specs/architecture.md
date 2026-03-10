@@ -190,11 +190,12 @@ Events are organized by communication direction. Each is a frozen `msgspec.Struc
 |---|---|---|
 | `SpeechStarted` | `call_id, ts` | User started speaking (VAD trigger) |
 | `SpeechStopped` | `call_id, ts` | User stopped speaking |
-| `TranscriptPartial` | `call_id, text, ts` | Partial ASR transcript |
+| `TranscriptPartial` | `call_id, text, ts` | Partial ASR transcript (defined but not currently emitted — reserved for streaming transcription) |
 | `TranscriptFinal` | `call_id, text, ts` | Final ASR transcript (async logging only — no longer triggers routing) |
 | `AudioCommitted` | `call_id, ts` | Audio buffer committed by server VAD — primary turn trigger for model-as-router |
-| `ModelRouterAction` | `call_id, action, department, summary, ts` | Model returned a JSON specialist action instead of direct voice |
-| `VoiceGenerationCompleted` | `call_id, voice_generation_id, ts` | Voice playback finished |
+| `ModelRouterAction` | `call_id, department, summary, filler_text, ts` | Model called `route_to_specialist()` function instead of direct voice |
+| `ResponseCreated` | `call_id, response_source, send_to_created_ms, ts` | OpenAI response.created received (debug timing) |
+| `VoiceGenerationCompleted` | `call_id, voice_generation_id, transcript, created_to_done_ms, response_source, ts` | Voice playback finished |
 | `VoiceGenerationError` | `call_id, voice_generation_id, error, ts` | Voice playback failed |
 
 **TurnManager → Coordinator:**
@@ -202,42 +203,43 @@ Events are organized by communication direction. Each is a frozen `msgspec.Struc
 | Event | Fields | Purpose |
 |---|---|---|
 | `HumanTurnStarted` | `call_id, turn_id, ts` | New turn opened |
-| `HumanTurnFinalized` | `call_id, turn_id, ts` | Turn finalized by audio_committed (text not available yet — transcript arrives async) |
+| `HumanTurnFinalized` | `call_id, turn_id, text, ts` | Turn finalized by audio_committed (text filled async from transcript) |
 | `HumanTurnCancelled` | `call_id, turn_id, reason, ts` | Turn cancelled (barge-in) |
 
-**Coordinator → Agent FSM:**
+**Agent FSM → Coordinator (synchronous calls, not bus events):**
 
-| Event | Fields | Purpose |
+| Method | Returns | Purpose |
 |---|---|---|
-| `HandleTurn` | `call_id, turn_id, text, agent_generation_id, ts` | Process this turn |
-| `CancelAgentGeneration` | `call_id, agent_generation_id, reason, ts` | Cancel current generation |
-| `VoiceDone` | `call_id, agent_generation_id, voice_generation_id, status, ts` | Voice finished for this generation |
+| `AgentFSM.start_routing()` | `AgentStateChanged` | Begin routing for new generation |
+| `AgentFSM.voice_started()` | `AgentStateChanged` | Model began direct voice |
+| `AgentFSM.specialist_action()` | `AgentStateChanged` | Model called `route_to_specialist()` |
+| `AgentFSM.tool_result()` | `AgentStateChanged` | Specialist tool completed |
+| `AgentFSM.voice_completed()` | `AgentStateChanged` | Voice generation finished |
+| `AgentFSM.cancel()` | `AgentStateChanged` | Barge-in or timeout |
 
-**Agent FSM → Coordinator:**
+`AgentStateChanged` fields: `call_id, agent_generation_id, state, ts`.
 
-| Event | Fields | Purpose |
+> **Note:** In the model-as-router architecture, the Coordinator calls AgentFSM methods directly (not via bus events). The FSM returns `AgentStateChanged` structs synchronously. Events like `HandleTurn`, `VoiceDone`, `RequestGuidedResponse`, `RequestAgentAction`, and `RequestToolCall` are defined in `events.py` for future use but are not emitted in the current implementation.
+
+**Coordinator ↔ ToolExecutor (direct method calls):**
+
+| Method | Parameters | Purpose |
 |---|---|---|
-| `AgentStateChanged` | `call_id, agent_generation_id, state, ts` | FSM state transition |
-| `RequestGuidedResponse` | `call_id, agent_generation_id, policy_key, user_text, ts` | Emit voice with this policy |
-| `RequestAgentAction` | `call_id, agent_generation_id, specialist, user_text, ts` | Route to specialist agent |
-| `RequestToolCall` | `call_id, agent_generation_id, tool_name, args, ts` | Execute a tool |
+| `ToolExecutor.execute()` | `tool_name, args, agent_generation_id` | Execute specialist tool, returns result |
+| `ToolExecutor.cancel()` | `agent_generation_id` | Cancel running tool |
 
-**Coordinator ↔ ToolExecutor:**
+`ToolResult` fields: `call_id, agent_generation_id, tool_request_id, ok, payload, ts`.
 
-| Event | Fields | Purpose |
-|---|---|---|
-| `RunTool` | `call_id, agent_generation_id, tool_request_id, tool_name, args, timeout_ms, ts` | Start tool execution |
-| `CancelTool` | `call_id, agent_generation_id, tool_request_id, reason, ts` | Cancel running tool |
-| `ToolResult` | `call_id, agent_generation_id, tool_request_id, ok, payload, ts` | Tool result (success or error) |
+> **Note:** The Coordinator calls ToolExecutor methods directly. `RunTool` and `CancelTool` event structs are defined in `events.py` for future bus-based tool execution but are not currently published.
 
 **Coordinator → Realtime (output):**
 
 | Event | Fields | Purpose |
 |---|---|---|
-| `RealtimeVoiceStart` | `call_id, agent_generation_id, voice_generation_id, prompt, ts` | Start voice synthesis |
+| `RealtimeVoiceStart` | `call_id, agent_generation_id, voice_generation_id, prompt, response_source, ts` | Start voice synthesis |
 | `RealtimeVoiceCancel` | `call_id, voice_generation_id, reason, ts` | Cancel active voice playback |
 
-The `prompt` field in `RealtimeVoiceStart` is either a `str` (for specialist/filler) or `list[dict[str, str]]` (chat messages for guided responses).
+The `prompt` field in `RealtimeVoiceStart` is either a `str` (filler text) or `dict[str, Any]` (a `response.create` payload with `instructions`, `modalities`, and optionally `tools`/`tool_choice`). The `response_source` field is `"router"` (default) or `"specialist"`.
 
 ### 3.3 EventBus
 
@@ -276,7 +278,7 @@ The Coordinator is the central orchestrator for a single call. One `Coordinator`
 | `max_history_turns` | `int` (default: 10) | Max turns in conversation buffer |
 | `max_history_chars` | `int` (default: 2000) | Max total user_text chars in buffer |
 
-**Main entry point**: `handle_event(envelope)` at line 142. This method:
+**Main entry point**: `handle_event(envelope)`. This method:
 
 1. Checks idempotency (Redis TTLSet or in-memory fallback)
 2. Opens an OpenTelemetry span with `call_id`, `event_type`, `turn_id`, `agent_generation_id`
@@ -287,46 +289,47 @@ The Coordinator is the central orchestrator for a single call. One `Coordinator`
 | Event Type | Method | What It Does |
 |---|---|---|
 | `speech_started` | `_on_speech_started` | Barge-in: cancel active voice + generation + filler. Forward to TurnManager |
+| `speech_stopped` | `_on_speech_stopped` | Debug only: emits `speech_stop` debug event. No pipeline action |
 | `audio_committed` | `_on_audio_committed` | **Primary turn trigger**: finalizes turn via TurnManager, builds router prompt via `RouterPromptBuilder`, emits `response.create` to the Realtime model. The model classifies intent AND responds in a single inference |
-| `model_router_action` | `_on_model_router_action` | Handles `route_to_specialist` function calls from the model — dispatches to specialist agent with department, summary, and filler text |
 | `transcript_final` | `_on_transcript_final` | **Async logging only**: persists transcript text to DB, appends to conversation buffer, emits debug display. No longer triggers routing or turn finalization |
-| `request_guided_response` | `_on_request_guided_response` | Build prompt from policy, emit `RealtimeVoiceStart` |
-| `request_agent_action` | `_on_request_agent_action` | Emit specialist voice start (optionally with filler) |
-| `tool_result` | `_on_tool_result` | Handle late/cancelled results, cancel filler |
-| `voice_generation_completed` | `_on_voice_completed` | Clear active voice, persist completion |
+| `model_router_action` | `_on_model_router_action` | Handles `route_to_specialist()` function calls from the model — dispatches to specialist agent with department, summary, and filler text |
+| `response_created` | (inline in `handle_event`) | Debug timing: emits `model_processing` or `specialist_processing` debug event with `send_to_created_ms` |
+| `voice_generation_completed` | `_on_voice_completed` | Clear active voice, emit direct route_result if applicable, persist completion, append agent transcript to buffer |
 | `voice_generation_error` | `_on_voice_error` | Clear active voice, persist error |
+| `tool_result` | `_on_tool_result` | Guard against late/cancelled tool results, cancel filler. Specialist prompt building happens inline in `_on_model_router_action` |
 
-**Idempotency** (line 118): Uses Redis `TTLSet` with `SET NX EX` pattern. If Redis is unavailable, falls back to an in-memory `set[str]`.
+**Idempotency**: Uses Redis `TTLSet` with `SET NX EX` pattern. If Redis is unavailable, falls back to an in-memory `set[str]`.
 
-**Barge-in handling** (line 177): When `speech_started` arrives while voice is playing:
+**Barge-in handling**: When `speech_started` arrives while voice is playing:
 1. Cancel active voice → emit `RealtimeVoiceCancel` with `reason="barge_in"`
 2. Cancel active agent generation → emit `CancelAgentGeneration`, cancel/reset FSM
 3. Cancel filler task if running
 4. Persist cancellation to DB (fire-and-forget)
 5. Forward to TurnManager to open new turn
 
-**Prompt construction** (line 424): For guided responses, builds a prompt with conversation history:
-```python
-[
-    {"role": "system", "content": base_system_prompt},
-    {"role": "system", "content": policy_instructions},
-    *conversation_buffer.format_messages(),  # alternating user/assistant history
-    {"role": "user",   "content": user_text},
-]
-```
-On the first turn the buffer is empty, so the prompt is `[system, policy, user]` (3 messages). On subsequent turns, history messages are injected between the system messages and the current user message.
+**Prompt construction**: The Coordinator builds prompts as `response.create` dict payloads (not message lists). Two paths:
 
-**Conversation Buffer** (`backend/src/voice_runtime/conversation_buffer.py`): A `ConversationBuffer` instance is created per call alongside `CoordinatorRuntimeState`. It accumulates `TurnEntry` records (frozen dataclass: `seq`, `user_text`, `route_a_label`, `policy_key`, `specialist`) after each successful `RealtimeVoiceStart` emission. Cancelled turns (barge-in) are never appended. The buffer enforces two bounds: `max_turns` (sliding window, default 10) and `max_chars` (character budget on total `user_text`, default 2000). `format_messages()` returns alternating `user`/`assistant` messages where assistant content is `[{policy_key}] Guided response` or `[{route_a_label}] Specialist: {specialist}`.
+1. **Router prompt** (via `RouterPromptBuilder.build_response_create(history)`): Returns a dict with `instructions` (router template + history as text), `modalities`, `tools` (route_to_specialist definition), and `tool_choice: "auto"`. History is embedded in the `instructions` string, not in `response.input` — this preserves OpenAI's native conversation context (current turn audio).
 
-**Model-as-Router Pattern**: Instead of running an embedding classification pipeline, the Coordinator uses `RouterPromptBuilder` to construct a `response.create` payload containing a structured router prompt (from `RouterPromptTemplate`) plus conversation history formatted via `format_history()` (from `backend/src/routing/context.py`). The Realtime model classifies intent AND responds in a single inference. For simple intents (~60-70% of turns), the model speaks directly. For specialist routing, the model speaks a natural filler AND calls `route_to_specialist()` as a function call (never vocalized), which the bridge detects via `response.function_call_arguments.done` and emits as a `model_router_action` event.
+2. **Specialist prompt** (built inline in `_on_model_router_action`): A dict with `instructions` containing base system prompt + department context + tool result + language instruction + conversation history. No tools registered (specialist speaks directly).
 
-**Routing context** (`backend/src/routing/context.py`): The `format_history()` function replaces the former `RoutingContextBuilder` class. It formats conversation buffer entries into a simple history string included in the router prompt, enabling the model to reason about conversational continuity.
+3. **Fallback prompt** (when no RouterPromptBuilder configured): A simple `response.create` dict with "You are a helpful voice assistant." and optional history.
 
-**Filler strategy** (line 604): Disabled by default (`_should_emit_filler()` returns `False`). When enabled, emits a brief filler voice ("Un momento, por favor.") before specialist responses, with a 1200ms auto-cancel timeout.
+On the first turn the history is empty. On subsequent turns, history is formatted as `User: ... / Assistant: ...` pairs from the conversation buffer.
 
-**Output events**: Accumulated in `_output_events` list, drained via `drain_output_events()`.
+**Conversation Buffer** (`backend/src/voice_runtime/conversation_buffer.py`): A `ConversationBuffer` instance is created per call alongside `CoordinatorRuntimeState`. It accumulates `TurnEntry` dataclass records (`seq`, `user_text`, `agent_text`). An entry is created at `audio_committed` (text empty), `user_text` is filled asynchronously when `transcript_final` arrives, and `agent_text` is filled when `voice_generation_completed` includes the agent's transcript. Cancelled turns (barge-in) are never appended. The buffer enforces two bounds: `max_turns` (sliding window, default 10) and `max_chars` (character budget on total text, default 2000). `format_messages()` returns alternating `user`/`assistant` messages.
 
-**Persistence pattern** (line 107): Fire-and-forget via `_persist_safe()`:
+**Model-as-Router Pattern**: Instead of running an embedding classification pipeline, the Coordinator uses `RouterPromptBuilder` to construct a `response.create` payload containing a structured router prompt (from `RouterPromptTemplate`) plus conversation history. The Realtime model classifies intent AND responds in a single inference. For simple intents (~60-70% of turns), the model speaks directly. For specialist routing, the model speaks a natural filler AND calls `route_to_specialist()` as a function call (never vocalized), which the bridge detects via `response.function_call_arguments.done` and emits as a `model_router_action` event.
+
+**Routing context** (`backend/src/routing/context.py`): The `format_history()` function delegates to `ConversationBuffer.format_messages()`. It formats conversation buffer entries into alternating user/assistant message pairs for inclusion in the router prompt.
+
+**Filler strategy**: Disabled by default (`_should_emit_filler()` returns `False`). When enabled, emits a brief filler voice ("Un momento, por favor.") before specialist responses, with a 1200ms auto-cancel timeout. In the model-as-router architecture, the model itself speaks a natural filler simultaneously with the function call, so this server-side filler is a secondary fallback.
+
+**Output events**: Accumulated in `_output_events` list, drained via `drain_output_events()`. Also supports a callback via `set_output_callback()` for real-time event forwarding.
+
+**Debug events**: Two emission methods: `_send_debug(stage, **extra)` for pipeline timeline stages (only when debug enabled), and `_emit_debug(event_dict)` for always-on events (`turn_update`, `fsm_state`, `transcript_final`). Frontend can send `client_debug_event` messages (e.g., `audio_playback_start/end`) via `handle_client_debug_event()`.
+
+**Persistence pattern**: Fire-and-forget via `_persist_safe()`:
 ```python
 async def _persist_safe(self, coro):
     try:
@@ -390,7 +393,7 @@ DONE, CANCELLED, ERROR are terminal states
 |---|---|---|
 | `start_routing()` | IDLE → ROUTING | Coordinator sends `response.create` to model |
 | `voice_started()` | ROUTING → SPEAKING | Model begins direct voice response |
-| `specialist_action()` | ROUTING → WAITING_TOOLS | Model returns JSON specialist action |
+| `specialist_action()` | ROUTING → WAITING_TOOLS | Model calls `route_to_specialist()` function |
 | `tool_result()` | WAITING_TOOLS → SPEAKING | Specialist tool completes, voice response starts |
 | `voice_completed()` | SPEAKING → DONE | Voice playback finishes |
 | `cancel()` | Any active → CANCELLED | Barge-in or timeout |
@@ -401,7 +404,7 @@ DONE, CANCELLED, ERROR are terminal states
 1. **Direct voice (~60-70%)**: Model speaks directly for simple intents. Flow: IDLE → ROUTING → SPEAKING → DONE
 2. **Function call routing**: Model speaks filler AND calls `route_to_specialist()`. Flow: IDLE → ROUTING → WAITING_TOOLS → SPEAKING → DONE
 
-**Output**: `AgentFSMOutput` dataclass containing `state_changes`, `guided_responses`, and `agent_actions` lists.
+**Output**: Each method returns `AgentStateChanged | None`. The coordinator reads the state change synchronously after each call.
 
 ### 4.4 ToolExecutor
 
@@ -409,9 +412,9 @@ DONE, CANCELLED, ERROR are terminal states
 
 Executes tools with whitelist validation, Redis caching, timeout, and cancellation.
 
-**Tool registration**: Tools are registered by name via `register_tool(name, func)`. Only registered tools can execute (whitelist, line 60).
+**Tool registration**: Tools are registered by name via `register_tool(name, func)`. Only registered tools can execute (whitelist).
 
-**`execute()` method** (line 48):
+**`execute()` method**:
 
 1. **Whitelist check**: Reject unknown tools immediately
 2. **Cache check**: Look up `tool_request_id` in Redis TTLMap. If hit, return cached result
@@ -419,9 +422,9 @@ Executes tools with whitelist validation, Redis caching, timeout, and cancellati
 4. **Cache on success**: Store result in Redis TTLMap
 5. **Error handling**: Returns `ToolResult(ok=False)` for timeout, cancellation, or exceptions
 
-**Deterministic `tool_request_id`** (line 22): Generated from `agent_generation_id + tool_name + SHA256(args)` using `uuid5`. This ensures the same tool call always produces the same ID, enabling idempotent caching.
+**Deterministic `tool_request_id`**: Generated from `agent_generation_id + tool_name + SHA256(args)` using `uuid5`. This ensures the same tool call always produces the same ID, enabling idempotent caching.
 
-**Cancellation** (line 140): `cancel(tool_request_id)` finds the running `asyncio.Task` and calls `.cancel()` on it.
+**Cancellation**: `cancel(tool_request_id)` finds the running `asyncio.Task` and calls `.cancel()` on it.
 
 ---
 
@@ -467,19 +470,27 @@ The resulting payload is sent as a `response.create` message to OpenAI, includin
 
 **File**: `backend/router_registry/v1/router_prompt.yaml`
 
-YAML-defined prompt template that instructs the Realtime model on:
-- Available departments and their descriptions
-- When to speak directly vs. call `route_to_specialist()` function
-- Guardrail rules (disallowed content, out-of-scope handling)
-- Response style and dynamic language guidelines (respond in the customer's language)
+YAML-defined prompt template with 5 required sections (frozen dataclass):
 
-Loaded at startup and injected into `RouterPromptBuilder`.
+| Section | Purpose |
+|---|---|
+| `identity` | Agent identity and role definition |
+| `decision_rules` | When to speak directly vs. call `route_to_specialist()` |
+| `departments` | Available departments and their descriptions |
+| `guardrails` | Disallowed content, out-of-scope handling rules |
+| `language_instruction` | Dynamic language guidelines (respond in the customer's language) |
+
+`to_system_instruction()` concatenates all 5 sections (separated by `\n\n`) into a single string used as the `instructions` field in `response.create`.
+
+Loaded at startup via `load_router_prompt(registry_path)` which validates all required sections exist. Injected into `RouterPromptBuilder`.
 
 ### 5.3 Function Call Routing via `parse_function_call_action`
 
 **File**: `backend/src/routing/model_router.py`
 
-When the model decides to route to a specialist, it calls the `route_to_specialist` function (defined in `ROUTE_TOOL_DEFINITION`). The OpenAI Realtime API emits a `response.function_call_arguments.done` event with the function name and JSON arguments. The bridge intercepts this event and calls `parse_function_call_action(name, arguments)` to validate and parse the routing action into a `ModelRouterAction(department, summary)`. If valid, the bridge emits a `model_router_action` EventEnvelope to the Coordinator.
+When the model decides to route to a specialist, it calls the `route_to_specialist` function (defined in `ROUTE_TOOL_DEFINITION`). The tool accepts two required parameters: `department` (enum: `sales`, `billing`, `support`, `retention`) and `summary` (brief English description of the customer's need). These map to the `Department` enum and are parsed into a `ModelRouterAction(department, summary)` dataclass.
+
+The OpenAI Realtime API emits a `response.function_call_arguments.done` event with the function name and JSON arguments. The bridge intercepts this event and calls `parse_function_call_action(name, arguments)` to validate the function name, parse the JSON, and resolve the department enum. If valid, the bridge emits a `model_router_action` EventEnvelope to the Coordinator. Invalid function names or malformed arguments are logged and silently dropped.
 
 The function call is structurally separated from audio output — it arrives on `output_index=1` while audio/text play on `output_index=0`. This eliminates any possibility of routing metadata being vocalized by the TTS.
 
@@ -543,7 +554,7 @@ router_registry/v1/
       └── es.yaml            # Category → list of short phrases
 ```
 
-**`ThresholdsConfig`** (line 11): Parsed from `thresholds.yaml` (used for analytics/calibration only):
+**`ThresholdsConfig`**: Parsed from `thresholds.yaml` (used for analytics/calibration only):
 - `version`: Registry version string
 - `route_a[label]["high"|"medium"]`: Per-label confidence thresholds
 - `route_b[label]["high"|"medium"]`: Per-label confidence thresholds
@@ -569,9 +580,9 @@ Uses the `langid` library for language identification (~0.02-0.04ms per call, 97
 **File**: `backend/src/routing/policies.py`
 
 - **`PoliciesRegistry`**: Holds a `base_system` prompt and a dictionary of policy key → instructions text
-- **`get_instructions(policy_key)`** (line 15): Returns the instructions string for a PolicyKey
-- **`build_prompt(policy_key, user_text)`** (line 21): Concatenates base_system + policy instructions + user text into a single string
-- **`load_policies(registry_path)`** (line 26): Loads from `policies.yaml`. Validates that all `PolicyKey` enum values have entries
+- **`get_instructions(policy_key)`**: Returns the instructions string for a PolicyKey
+- **`build_prompt(policy_key, user_text)`**: Concatenates base_system + policy instructions + user text into a single string
+- **`load_policies(registry_path)`**: Loads from `policies.yaml`. Validates that all `PolicyKey` enum values have entries
 
 ---
 
@@ -583,11 +594,11 @@ Uses the `langid` library for language identification (~0.02-0.04ms per call, 97
 
 Two Redis-backed data structures:
 
-**`TTLSet`** (line 18): Used for event idempotency. Each event_id is stored as a Redis key with TTL.
+**`TTLSet`**: Used for event idempotency. Each event_id is stored as a Redis key with TTL.
 - `add(member)`: `SET key "1" NX EX ttl` — returns `True` if newly added
 - `contains(member)`: `EXISTS key`
 
-**`TTLMap`** (line 38): Used for tool result caching.
+**`TTLMap`**: Used for tool result caching.
 - `get(key)`: `GET key`
 - `set(key, value)`: `SET key value EX ttl`
 
@@ -625,13 +636,13 @@ All repos use raw `asyncpg` for maximum performance. Tables are created via Alem
 
 **File**: `backend/src/voice_runtime/realtime_client.py`
 
-**`RealtimeClient` Protocol** (line 22):
+**`RealtimeClient` Protocol**:
 - `send_voice_start(event)`: Start voice synthesis on the provider
 - `send_voice_cancel(event)`: Cancel active voice playback
 - `on_event(callback)`: Register callback for provider events
 - `close()`: Clean up resources
 
-**`StubRealtimeClient`** (line 45): Test implementation that:
+**`StubRealtimeClient`**: Test implementation that:
 - Tracks all `voice_starts` and `voice_cancels` for assertions
 - Auto-emits `VoiceGenerationCompleted` after a configurable delay
 - Supports error injection via `fail_voice_ids` set
@@ -659,7 +670,7 @@ Browser ←WebSocket→ Backend (event forwarding, both directions)
 
 **Function call routing**: The bridge handles `response.function_call_arguments.done` events from the OpenAI Realtime API. When the model calls `route_to_specialist()`, the bridge calls `parse_function_call_action()` to validate and parse the function call arguments into a `ModelRouterAction`. If valid, a `model_router_action` EventEnvelope is emitted to the Coordinator. The bridge also accumulates `response.audio_transcript.delta` fragments to capture the filler text that accompanies the function call. The bridge tracks a `_function_call_received` flag to distinguish routing responses from direct responses in the `response.done` handler.
 
-**Server VAD configuration**: The bridge configures server-side VAD with `silence_duration_ms=300` (from `Settings.vad_silence_duration_ms`), which controls how long the server waits after speech stops before committing the audio buffer. The 300ms value balances responsiveness with avoiding premature commits on natural pauses.
+**Server VAD configuration**: Configured via `session.update` sent by `calls.py` at WebSocket connection start (not by the bridge). Sets `silence_duration_ms=300` (from `Settings.vad_silence_duration_ms`), which controls how long the server waits after speech stops before committing the audio buffer. The bridge handles the `session.updated` acknowledgment event.
 
 **Input event translation (OpenAI → Coordinator):**
 
@@ -669,9 +680,24 @@ Browser ←WebSocket→ Backend (event forwarding, both directions)
 | `input_audio_buffer.speech_stopped` | `type="speech_stopped"` |
 | `input_audio_buffer.committed` | `type="audio_committed"` — **primary turn trigger** |
 | `conversation.item.input_audio_transcription.completed` | `type="transcript_final"` (async logging only, empty transcripts ignored) |
+| `response.created` | `type="response_created"` (debug timing: `send_to_created_ms`, `response_source`) |
 | `response.function_call_arguments.done` | `type="model_router_action"` (if `route_to_specialist` function call) |
-| `response.done` | `type="voice_generation_completed"` (with filler transcript if function call was received) |
+| `response.done` | `type="voice_generation_completed"` (with transcript, `created_to_done_ms`, `response_source`) |
 | `response.failed` | `type="voice_generation_error"` |
+| `response.audio_transcript.delta` | *(no envelope)* — accumulated in `_response_transcript_buffer` for filler text |
+| `session.updated` | *(no envelope)* — logged for diagnostics |
+| `error` | *(no envelope)* — logged as `bridge_openai_error` |
+
+**Bridge internal state** (reset per response cycle):
+
+| Field | Purpose |
+|---|---|
+| `_active_voice_generation_id` | Tracks current voice generation for `voice_generation_completed` payloads |
+| `_response_transcript_buffer` | Accumulates `response.audio_transcript.delta` text (reset on `response.created`) |
+| `_function_call_received` | `True` when `route_to_specialist` function call detected (distinguishes routing vs direct in `response.done`) |
+| `_response_create_sent_ms` | Timestamp of last `response.create` sent (for `send_to_created_ms` timing) |
+| `_response_created_ms` | Timestamp of last `response.created` received (for `created_to_done_ms` timing) |
+| `_current_response_source` | `"router"` or `"specialist"` (from `RealtimeVoiceStart.response_source`) |
 
 **Output event translation (Coordinator → OpenAI):**
 - `send_voice_start(RealtimeVoiceStart)` with dict payload (from RouterPromptBuilder or specialist prompt) → sent directly as `response.create` with conversation history embedded in `instructions`, plus `tools` and `tool_choice` for router responses. No `response.input` — preserves OpenAI's native conversation context (current turn audio). No per-turn `session.update` — instructions are passed inline to avoid the ~500ms round-trip.
@@ -685,9 +711,9 @@ Browser ←WebSocket→ Backend (event forwarding, both directions)
 The backend acts as a **SDP signaling proxy**, **session lifecycle manager**, and **event forwarding hub**. It does NOT process audio or manage WebRTC peer connections. The browser connects directly to OpenAI via WebRTC for audio. Events flow through the backend via WebSocket for Coordinator integration.
 
 **Session lifecycle:**
-1. `POST /calls` creates a full runtime actor stack: Coordinator, TurnManager, AgentFSM, ToolExecutor, RouterPromptBuilder, and RealtimeEventBridge. The bridge is wired to the Coordinator bidirectionally:
+1. `POST /calls` creates a per-call runtime actor stack: Coordinator, TurnManager, AgentFSM, ToolExecutor, and RealtimeEventBridge. The shared `RouterPromptBuilder` singleton is injected into the Coordinator. The bridge is wired to the Coordinator bidirectionally:
    - Input: `bridge.on_event(coordinator.handle_event)` — OpenAI events reach the Coordinator
-   - Output: `coordinator.set_output_callback(fn)` — Coordinator commands (RealtimeVoiceStart, RealtimeVoiceCancel) are dispatched to `bridge.send_voice_start()` / `bridge.send_voice_cancel()`
+   - Output: `coordinator.set_output_callback(fn)` — Coordinator commands (RealtimeVoiceStart, RealtimeVoiceCancel) are dispatched to `bridge.send_voice_start()` / `bridge.send_voice_cancel()`. `CancelAgentGeneration` is internal only — not sent to OpenAI
    - Debug: `coordinator.set_debug_callback(fn)` — debug events are sent to the frontend via `bridge.send_to_frontend()`
 2. `POST /calls/{call_id}/offer` performs a **two-step SDP exchange** with OpenAI:
    - Step 1: `POST /v1/realtime/sessions` with session config (model, modalities, `input_audio_transcription` with Whisper auto-language-detection, `turn_detection` with `create_response: false`) → returns an ephemeral key
@@ -695,13 +721,13 @@ The backend acts as a **SDP signaling proxy**, **session lifecycle manager**, an
    - The server API key is only used for the sessions call — the ephemeral key is used for the SDP exchange, so the API key is never exposed to the browser
 3. `WS /calls/{call_id}/events` establishes bidirectional event forwarding:
    - On connection: sends a one-time `session.update` via the bridge to configure transcription (`whisper-1`), disable auto-response (`create_response: false`), set server VAD `silence_duration_ms` (default: 300ms), and register the `route_to_specialist` tool with `tool_choice: "auto"`. Tool registration at session level is **required** — without it, the model writes function call text as transcript instead of invoking the function. The `/v1/realtime/sessions` endpoint does NOT reliably apply these settings, so the explicit `session.update` is required.
-   - Receive loop: parses incoming messages and intercepts debug control messages (`debug_enable` / `debug_disable`) to toggle `coordinator.set_debug_enabled()` — these are NOT forwarded to the bridge. All other messages are forwarded to `bridge.handle_frontend_event()`.
+   - Receive loop: parses incoming messages and intercepts three control message types that are NOT forwarded to the bridge: `debug_enable`/`debug_disable` (toggle `coordinator.set_debug_enabled()`), and `client_debug_event` (forwarded to `coordinator.handle_client_debug_event()` for audio playback timing from the frontend). All other messages are forwarded to `bridge.handle_frontend_event()`.
    - On disconnect: clears the frontend WebSocket reference via `bridge.set_frontend_ws(None)`
 4. `DELETE /calls/{call_id}` closes the bridge and removes the session.
 
-**In-memory session registry**: `_sessions: dict[UUID, CallSessionEntry]` tracks active calls. Each `CallSessionEntry` holds: `coordinator`, `turn_manager`, `agent_fsm`, `tool_executor`, `bridge`, `router_prompt_builder`.
+**In-memory session registry**: `_sessions: dict[UUID, CallSessionEntry]` tracks active calls. Each `CallSessionEntry` holds: `call_id`, `coordinator`, `turn_manager`, `agent_fsm`, `tool_executor`, `bridge`.
 
-**Shared singletons**: `RouterPromptBuilder`, `Router` (analytics), and `PoliciesRegistry` are set at app startup via `set_shared_dependencies()` (called in `main.py` lifespan). If not initialized, a stub `PoliciesRegistry` with default policies is used (logs `policies_not_initialized_using_stubs` warning).
+**Shared singletons**: `RouterPromptBuilder` and `PoliciesRegistry` are set at app startup via `set_shared_dependencies()` (called in `main.py` lifespan). If `PoliciesRegistry` is not initialized, a stub with default policies is used (logs `policies_not_initialized_using_stubs` warning). `RouterPromptBuilder` is injected into each Coordinator at call creation.
 
 **Endpoints:**
 
@@ -736,6 +762,8 @@ The backend acts as a **SDP signaling proxy**, **session lifecycle manager**, an
 | `cancelled_agent_generations` | `set[UUID]` | Set of cancelled generation IDs |
 | `cancelled_voice_generations` | `set[UUID]` | Set of cancelled voice IDs |
 | `turn_seq` | `int` | Monotonic turn counter |
+| `turn_speech_started_ms` | `int` | Timestamp when `speech_started` fired for current turn (for timing deltas) |
+| `turn_audio_committed_ms` | `int` | Timestamp when `audio_committed` fired (for timing deltas) |
 
 **Key methods:**
 - `is_generation_cancelled(id)` / `is_voice_cancelled(id)`: Check if an ID was cancelled (used for late result filtering)
@@ -873,8 +901,8 @@ User has a multi-turn conversation: "hola" → "mi factura" → "¿cuánto debo?
 5. speech_started (barge-in: cancels turn 1 voice) → audio_committed
 6. Coordinator._on_audio_committed():
    a. RouterPromptBuilder.build(history=[turn 1]) → response.create with conversation context
-   b. Model returns JSON: {"action":"specialist","department":"billing","summary":"..."}
-7. Bridge detects JSON → model_router_action event
+   b. Model calls route_to_specialist(department="billing", summary="...") via function calling
+7. Bridge receives response.function_call_arguments.done → model_router_action event
 8. Coordinator._on_model_router_action() → dispatch to billing specialist
 9. transcript_final("mi factura") → async: persist + append to buffer
 
@@ -988,14 +1016,16 @@ The Coordinator supports two levels of debug telemetry:
 | `speech_stop` | `_on_speech_stopped` | — |
 | `audio_committed` | `_on_audio_committed` | — |
 | `prompt_sent` | After RouterPromptBuilder builds prompt, before bridge dispatch | — |
-| `model_processing` | Bridge reports `response.created` | — |
+| `model_processing` | Bridge reports `response.created` for router | `send_to_created_ms` |
 | `route_result` | `response.done` — direct voice or delegate detected | `label`, `route_type` ("direct" or "delegate") |
 | `fill_silence` | Coordinator launches silence-filling for delegate routes | — |
 | `specialist_sent` | Specialist prompt dispatched | — |
-| `specialist_processing` | Specialist `response.created` received | — |
+| `specialist_processing` | Bridge reports `response.created` for specialist | `send_to_created_ms` |
 | `specialist_ready` | Specialist `response.done` received | — |
-| `generation_start` | Voice generation begins | — |
-| `generation_finish` | `_on_voice_completed` | — |
+| `generation_start` | Specialist voice generation begins (after tool_result) | — |
+| `audio_playback_start` | Frontend detects first `output_audio_buffer.started` | — |
+| `audio_playback_end` | Frontend detects `output_audio_buffer.stopped` | — |
+| `generation_finish` | `_on_voice_completed` — **fallback only** if `audio_playback_end` was not received (barge-in, disconnect) | `created_to_done_ms` |
 | `barge_in` | Barge-in detected (new speech during active generation) | — |
 
 **Stage timing decomposition** (previously opaque gaps are now visible):
@@ -1025,7 +1055,7 @@ model_router_dispatched:
   call_id, turn_id, agent_generation_id, has_history
 ```
 
-**`model_router_action_received`** — when the model returns a JSON specialist action:
+**`model_router_action_received`** — when the model calls `route_to_specialist()` function:
 ```
 model_router_action_received:
   call_id, department, summary, agent_generation_id

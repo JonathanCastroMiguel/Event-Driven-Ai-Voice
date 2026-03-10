@@ -94,7 +94,7 @@ class AgentFSM:
         return self.transition("voice_started", ts)
 
     def specialist_action(self, ts: int) -> AgentStateChanged | None:
-        """Model returned a JSON action for specialist routing. routing → waiting_tools."""
+        """Model called route_to_specialist() function. routing → waiting_tools."""
         return self.transition("specialist_action", ts)
 
     def tool_result(self, ts: int) -> AgentStateChanged | None:
