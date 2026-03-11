@@ -8,6 +8,8 @@ import { useDebugChannel } from "@/hooks/use-debug-channel";
 import { useVoiceSession } from "@/hooks/use-voice-session";
 import type { TranscriptionEntry, TranscriptionMessage } from "@/lib/types";
 
+import { Mic, MicOff } from "lucide-react";
+
 import { MicAnimation } from "./mic-animation";
 import { SpeakerAnimation } from "./speaker-animation";
 import { TranscriptionPanel } from "./transcription-panel";
@@ -25,6 +27,8 @@ export function VoiceSession() {
   const {
     status,
     callId,
+    isMuted,
+    toggleMute,
     startSession,
     endSession,
     onControlMessage,
@@ -127,7 +131,7 @@ export function VoiceSession() {
       {/* Animation indicators */}
       <div className="flex items-center justify-center gap-16">
         <div className="flex flex-col items-center gap-2">
-          <MicAnimation isActive={isActive && isUserSpeaking} />
+          <MicAnimation isActive={isActive && isUserSpeaking && !isMuted} />
           <span className="text-xs text-muted-foreground">You</span>
         </div>
         <div className="flex flex-col items-center gap-2">
@@ -154,6 +158,16 @@ export function VoiceSession() {
             disabled={isConnecting}
           >
             {isConnecting ? "Connecting..." : "End Call"}
+          </Button>
+        )}
+
+        {isActive && (
+          <Button
+            size="sm"
+            variant={isMuted ? "destructive" : "outline"}
+            onClick={toggleMute}
+          >
+            {isMuted ? <MicOff className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
           </Button>
         )}
 

@@ -14,6 +14,8 @@ const WS_BASE =
 interface UseVoiceSessionReturn {
   status: ConnectionStatus;
   callId: string | null;
+  isMuted: boolean;
+  toggleMute: () => void;
   startSession: () => Promise<void>;
   endSession: () => Promise<void>;
   onControlMessage: (handler: (msg: ControlInMessage) => void) => void;
@@ -26,6 +28,7 @@ export function useVoiceSession(): UseVoiceSessionReturn {
   const [status, setStatus] = useState<ConnectionStatus>("idle");
   const [callId, setCallId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [isMuted, setIsMuted] = useState(false);
 
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -299,6 +302,7 @@ export function useVoiceSession(): UseVoiceSessionReturn {
     const currentCallId = callIdRef.current;
     setStatus("disconnected");
     setCallId(null);
+    setIsMuted(false);
     callIdRef.current = null;
     await cleanup(currentCallId);
   }, [cleanup]);
@@ -314,6 +318,17 @@ export function useVoiceSession(): UseVoiceSessionReturn {
     debugHandlerRef.current = handler;
   }, []);
 
+  const toggleMute = useCallback(() => {
+    const pc = pcRef.current;
+    if (!pc) return;
+    const sender = pc.getSenders().find((s) => s.track?.kind === "audio");
+    if (sender?.track) {
+      const next = !sender.track.enabled;
+      sender.track.enabled = next;
+      setIsMuted(!next);
+    }
+  }, []);
+
   const sendDebugControl = useCallback((enabled: boolean) => {
     const ws = eventWsRef.current;
     if (ws && ws.readyState === WebSocket.OPEN) {
@@ -324,6 +339,8 @@ export function useVoiceSession(): UseVoiceSessionReturn {
   return {
     status,
     callId,
+    isMuted,
+    toggleMute,
     startSession,
     endSession,
     onControlMessage,

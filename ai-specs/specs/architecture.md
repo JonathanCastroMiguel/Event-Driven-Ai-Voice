@@ -670,7 +670,9 @@ Browser ←WebSocket→ Backend (event forwarding, both directions)
 
 **Function call routing**: The bridge handles `response.function_call_arguments.done` events from the OpenAI Realtime API. When the model calls `route_to_specialist()`, the bridge calls `parse_function_call_action()` to validate and parse the function call arguments into a `ModelRouterAction`. If valid, a `model_router_action` EventEnvelope is emitted to the Coordinator. The bridge also accumulates `response.audio_transcript.delta` fragments to capture the filler text that accompanies the function call. The bridge tracks a `_function_call_received` flag to distinguish routing responses from direct responses in the `response.done` handler.
 
-**Server VAD configuration**: Configured via `session.update` sent by `calls.py` at WebSocket connection start (not by the bridge). Sets `silence_duration_ms=300` (from `Settings.vad_silence_duration_ms`), which controls how long the server waits after speech stops before committing the audio buffer. The bridge handles the `session.updated` acknowledgment event.
+**Transcript cleanup**: The model occasionally vocalizes function call syntax in its audio output (e.g., `(functions.route_to_specialist(department="billing", ...))`). The `_clean_transcript()` helper strips leaked function call text from transcripts using a regex pattern. Applied in both `response.done` and `model_router_action` handlers before emitting EventEnvelopes. This is a post-hoc text cleanup only — the audio itself cannot be modified after generation.
+
+**Server VAD configuration**: Configured via `session.update` sent by `calls.py` at WebSocket connection start (not by the bridge). Sets `silence_duration_ms=200` (from `Settings.vad_silence_duration_ms`), which controls how long the server waits after speech stops before committing the audio buffer. The bridge handles the `session.updated` acknowledgment event.
 
 **Input event translation (OpenAI → Coordinator):**
 
@@ -1188,7 +1190,8 @@ Browser
 - Filters `response.audio.delta` from debug handler (high-frequency)
 - `sendDebugControl(enabled)` — sends `debug_enable`/`debug_disable` control message via event WebSocket
 - Uses local variable for cleanup (avoids stale closure bug) + `beforeunload` beacon
-- Returns: `status`, `callId`, `startSession`, `endSession`, `onControlMessage`, `onDebugMessage`, `sendDebugControl`, `error`
+- `toggleMute()` — toggles `sender.track.enabled` on the WebRTC audio sender (sends silence when muted, no renegotiation). `isMuted` state resets to `false` on `endSession()`
+- Returns: `status`, `callId`, `startSession`, `endSession`, `toggleMute`, `isMuted`, `onControlMessage`, `onDebugMessage`, `sendDebugControl`, `error`
 
 **`useDebugChannel`** — Groups `debug_event` messages by `turn_id` into visual pipeline timelines.
 - Maintains `DebugTurnTimeline[]` — each turn has `stages[]`, `specialist_stages[]`, `is_delegate`, `barge_in`
@@ -1204,7 +1207,7 @@ Browser
 - Lazy-loads `DebugPanel` via `next/dynamic` (no debug overhead when disabled)
 - Debug toggle sends `debug_enable`/`debug_disable` to backend via `sendDebugControl()`; on disable, calls `clearState()` to reset debug channel
 - Uses OpenAI events for speaking indicators (`speech_started/stopped`, `response.audio.delta/done`)
-- Shows: connection status badge (including `mic_denied` state), start/end call buttons, debug toggle, mic/speaker animations, transcription panel
+- Shows: connection status badge (including `mic_denied` state), start/end call buttons, mute toggle (visible during active call, destructive variant when muted), debug toggle, mic/speaker animations (mic animation deactivated when muted), transcription panel
 - Debug panel renders full-width (breaks out of parent `max-w-2xl`) for pipeline visibility
 
 **`MicAnimation`** — Green pulsing circle with mic icon when user is speaking.
@@ -1219,7 +1222,7 @@ Browser
 - Each box shows: stage name, `+delta_ms` / `total_ms`
 - Color coding: green (<100ms), yellow (100-300ms), red (>=300ms)
 - Direct routes: single row of 8 stages (`speech_start` → `generation_finish`)
-- Delegate routes: main row forks at `route_result` with a specialist sub-flow row (dashed border) showing `specialist_sent` → `specialist_processing` → `specialist_ready`
+- Delegate routes: main row forks at `route_result` with a specialist sub-flow row (dashed border, dynamically offset via invisible spacer matching main row width) showing `specialist_sent` → `specialist_processing` → `specialist_ready`
 - Barge-in: red indicator box cutting the timeline
 
 ### 12.5 Data Flow

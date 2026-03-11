@@ -12,6 +12,7 @@ Architecture:
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Any, Callable, Coroutine
 from uuid import UUID, uuid4
@@ -266,7 +267,7 @@ class OpenAIRealtimeEventBridge:
                     payload={
                         "department": action.department.value,
                         "summary": action.summary,
-                        "filler_text": self._response_transcript_buffer.strip(),
+                        "filler_text": _clean_transcript(self._response_transcript_buffer),
                     },
                     source=EventSource.REALTIME,
                 )
@@ -300,7 +301,7 @@ class OpenAIRealtimeEventBridge:
                 function_call_received=self._function_call_received,
             )
             voice_id = self._active_voice_generation_id
-            transcript = self._response_transcript_buffer
+            transcript = _clean_transcript(self._response_transcript_buffer)
             self._response_transcript_buffer = ""
 
             if self._function_call_received:
@@ -406,3 +407,27 @@ class OpenAIRealtimeEventBridge:
 def _now_ms() -> int:
     """Current time in epoch milliseconds."""
     return int(time.time() * 1000)
+
+
+# Pattern to detect leaked function call text in model audio transcript.
+# The model sometimes vocalizes function calls like:
+#   "(functions.route_to_specialist(department="billing", ...))"
+#   "(functions route_to_specialist ...)"
+# This always appears at the end of the transcript, so we truncate from
+# the first match to the end of the string.
+_LEAKED_FUNC_RE = re.compile(
+    r"\s*\(?functions?[.\s]route_to_specialist.*|route_to_specialist.*|\(\s*functions\b.*",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _clean_transcript(text: str) -> str:
+    """Remove leaked function call syntax from transcript text.
+
+    Truncates everything from the first mention of route_to_specialist
+    to the end of the string, since the leak always appears at the tail.
+    """
+    cleaned = _LEAKED_FUNC_RE.sub("", text).strip()
+    if cleaned != text.strip():
+        logger.warning("transcript_function_leak_cleaned", original_len=len(text), cleaned_len=len(cleaned))
+    return cleaned

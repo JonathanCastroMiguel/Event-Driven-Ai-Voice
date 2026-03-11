@@ -1,5 +1,5 @@
 ### Requirement: Router prompt template definition
-The model-router SHALL define a router system prompt template stored in `router_registry/v1/router_prompt.yaml`. The template SHALL contain sections for: (1) base system identity (call center agent persona), (2) router decision rules (when to speak directly vs. return JSON), (3) department definitions (sales, billing, support, retention), (4) guardrail rules (disallowed content, out-of-scope topics), (5) language instruction (respond in same language as user).
+The model-router SHALL define a router system prompt template stored in `router_registry/v1/router_prompt.yaml`. The template SHALL contain sections for: (1) base system identity (call center agent persona), (2) router decision rules (when to speak directly vs. call route_to_specialist), (3) department definitions (sales, billing, support, retention), (4) guardrail rules (disallowed content, out-of-scope topics), (5) language instruction (respond in same language as user).
 
 #### Scenario: Router prompt loaded at startup
 - **WHEN** the application starts and initializes the router registry
@@ -9,39 +9,34 @@ The model-router SHALL define a router system prompt template stored in `router_
 - **WHEN** `router_prompt.yaml` does not exist at the expected path
 - **THEN** the system SHALL raise a `FileNotFoundError` with a descriptive message
 
-### Requirement: Two response modes — direct voice vs. JSON action
-The router prompt SHALL instruct the model to respond in one of two modes: (a) **direct voice** — speak the response immediately for simple intents (greetings, guardrails, out-of-scope, simple questions), or (b) **JSON action** — return a structured JSON object for specialist routing that requires tool execution.
+### Requirement: Two response modes — direct voice vs. function call action
+The router prompt SHALL instruct the model to respond in one of two modes: (a) **direct voice** — speak the response immediately for simple intents (greetings, guardrails, out-of-scope, simple questions), or (b) **function call** — call the `route_to_specialist` function for specialist routing that requires system access, while simultaneously speaking a brief filler message.
+
+The decision_rules SHALL include explicit reinforcement to ensure deterministic function calling:
+1. A clear instruction that the model MUST call `route_to_specialist` (not just speak about routing)
+2. Negative examples of what NOT to do (e.g., "NEVER say you will connect the customer without also calling route_to_specialist")
+3. End-of-prompt reinforcement repeating the function call requirement (leveraging recency bias)
 
 #### Scenario: Direct voice for greeting
 - **WHEN** the user says "hola, buenos días"
-- **THEN** the model SHALL respond directly with a spoken greeting without returning JSON
+- **THEN** the model SHALL respond directly with a spoken greeting without calling any function
 
 #### Scenario: Direct voice for guardrail (disallowed)
 - **WHEN** the user uses inappropriate language
-- **THEN** the model SHALL respond directly with a calm, professional redirection without returning JSON
+- **THEN** the model SHALL respond directly with a calm, professional redirection without calling any function
 
 #### Scenario: Direct voice for out-of-scope
 - **WHEN** the user asks about a topic outside business capabilities (e.g., "who will win the election")
 - **THEN** the model SHALL respond directly explaining it can only help with account, billing, sales, and support topics
 
-#### Scenario: JSON action for specialist routing
+#### Scenario: Function call for specialist routing
 - **WHEN** the user says "tengo un problema con mi factura"
-- **THEN** the model SHALL return a JSON action `{"action": "specialist", "department": "billing", "summary": "customer has a billing issue"}`
+- **THEN** the model SHALL speak a brief filler message (e.g., "Un momento, le conecto con facturación")
+- **AND** the model SHALL call the `route_to_specialist` function with `department: "billing"` and a brief English summary
 
-### Requirement: JSON action schema
-The JSON action returned by the model for specialist routing SHALL conform to the schema: `{"action": "specialist", "department": "<department_name>", "summary": "<brief_description>"}`. The `department` field SHALL be one of: `sales`, `billing`, `support`, `retention`. The `summary` field SHALL be a brief English description of the user's intent.
-
-#### Scenario: Valid JSON action with known department
-- **WHEN** the model returns `{"action": "specialist", "department": "sales", "summary": "customer wants to upgrade plan"}`
-- **THEN** the action SHALL be accepted as valid
-
-#### Scenario: Unknown department in JSON action
-- **WHEN** the model returns `{"action": "specialist", "department": "unknown_dept", "summary": "..."}`
-- **THEN** the parser SHALL reject the action and treat the response as a direct voice response, logging a warning
-
-#### Scenario: Malformed JSON from model
-- **WHEN** the model returns text that starts with `{` but is not valid JSON
-- **THEN** the parser SHALL treat the response as a direct voice response and log a warning for prompt tuning
+#### Scenario: Function call is mandatory for routing
+- **WHEN** the model determines the user needs specialist help
+- **THEN** the model MUST call `route_to_specialist` — speaking about routing without calling the function is a failure mode that SHALL be prevented by prompt reinforcement
 
 ### Requirement: RouterPromptBuilder builds response.create payloads
 
@@ -63,21 +58,6 @@ Assistant: <text>
 - **WHEN** `build_response_create` is called with a history list of user/assistant messages
 - **THEN** the payload `instructions` SHALL contain the system prompt followed by a `Conversation history:` section with all turns formatted as `User: <text>` / `Assistant: <text>`
 - **AND** the payload MUST NOT contain a `response.input` field
-
-### Requirement: JSON action parser
-The model-router SHALL provide a `parse_model_action` function that takes accumulated response transcript text and determines whether it is a valid JSON action or a direct voice response.
-
-#### Scenario: Valid specialist action parsed
-- **WHEN** the accumulated transcript is `{"action": "specialist", "department": "billing", "summary": "billing issue"}`
-- **THEN** `parse_model_action` SHALL return a `ModelRouterAction` with `department="billing"` and `summary="billing issue"`
-
-#### Scenario: Direct voice response (non-JSON)
-- **WHEN** the accumulated transcript is "Buenos días, ¿en qué puedo ayudarle?"
-- **THEN** `parse_model_action` SHALL return `None` (indicating direct voice)
-
-#### Scenario: JSON with wrong schema
-- **WHEN** the accumulated transcript is `{"type": "something_else", "data": 123}`
-- **THEN** `parse_model_action` SHALL return `None` and log a warning
 
 ### Requirement: Router prompt supports dynamic language
 
