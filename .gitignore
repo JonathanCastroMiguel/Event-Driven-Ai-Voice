@@ -46,6 +46,16 @@ build/
 coverage/
 
 # =========================
+# Claude Code (personal config)
+# =========================
+.claude/settings.json
+
+# =========================
+# Test results (ephemeral)
+# =========================
+frontend/test-results/
+
+# =========================
 # OpenSpec temp artifacts (future-proof)
 # =========================
 .openspec-cache/
