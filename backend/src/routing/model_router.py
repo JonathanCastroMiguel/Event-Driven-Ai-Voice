@@ -129,6 +129,7 @@ class RouterPromptBuilder:
                 "instructions": instructions,
                 "tools": [ROUTE_TOOL_DEFINITION],
                 "tool_choice": "auto",
+                "temperature": 0.8,
             },
         }
 

@@ -120,6 +120,12 @@ export function TurnTimeline({ turn }: TurnTimelineProps) {
     const beforeRoute = routeIdx >= 0 ? turn.stages.slice(0, routeIdx + 1) : turn.stages;
     const afterRoute = routeIdx >= 0 ? turn.stages.slice(routeIdx + 1) : [];
 
+    // Specialist row starts after route_result column.
+    // Each stage + arrow pair occupies one grid column.
+    // beforeRoute has N stages → occupies columns 1..N (with arrows between).
+    // The specialist row should start at column N+1, forking from route_result.
+    const specialistColStart = beforeRoute.length + 1;
+
     return (
       <div className="space-y-1">
         <SilenceBanner stages={turn.stages} />
@@ -139,15 +145,26 @@ export function TurnTimeline({ turn }: TurnTimelineProps) {
           ))}
         </div>
 
-        {/* Sub-flow row: specialist stages */}
-        <div className="flex items-center overflow-x-auto gap-1 pl-8 border-l-2 border-dashed border-muted-foreground/30 ml-4">
-          <span className="text-[10px] text-muted-foreground mr-1 shrink-0">specialist:</span>
-          {turn.specialist_stages.map((s, i) => (
-            <span key={i} className="flex items-center gap-1">
-              {i > 0 && <Arrow />}
-              <StageBox stage={s} />
-            </span>
-          ))}
+        {/* Sub-flow row: specialist stages — offset dynamically to fork from route_result */}
+        <div className="flex items-center overflow-x-auto gap-1">
+          {/* Spacer: invisible replicas of beforeRoute stages to align the specialist row */}
+          <div className="flex items-center gap-1 shrink-0" style={{ visibility: "hidden" }}>
+            {beforeRoute.map((s, i) => (
+              <span key={i} className="flex items-center gap-1">
+                {i > 0 && <Arrow />}
+                <StageBox stage={s} />
+              </span>
+            ))}
+          </div>
+          <div className="flex items-center gap-1 border-l-2 border-dashed border-muted-foreground/30 pl-2">
+            <span className="text-[10px] text-muted-foreground mr-1 shrink-0">specialist:</span>
+            {turn.specialist_stages.map((s, i) => (
+              <span key={i} className="flex items-center gap-1">
+                {i > 0 && <Arrow />}
+                <StageBox stage={s} />
+              </span>
+            ))}
+          </div>
         </div>
       </div>
     );
