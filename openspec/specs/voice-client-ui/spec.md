@@ -32,11 +32,12 @@ The client SHALL capture audio from the user's microphone using the MediaDevices
 - **AND** the "Start Call" button SHALL be disabled
 
 ### Requirement: Audio playback
-The client SHALL play back agent audio received via the WebRTC audio track immediately as it arrives (streaming playback, not buffered).
+The client SHALL play back agent audio received via the WebRTC audio track immediately as it arrives (streaming playback, not buffered). The playback volume SHALL be set to a reduced level (0.35) to minimize residual echo energy.
 
 #### Scenario: Agent audio received
 - **WHEN** audio frames arrive on the remote WebRTC audio track
 - **THEN** the browser SHALL play them through the default audio output device immediately
+- **AND** the playback volume SHALL be 0.35
 
 ### Requirement: OpenAI event translation
 The client SHALL receive events from the OpenAI data channel (`oai-events`) and translate them to internal transcription messages for display.
@@ -135,18 +136,53 @@ The voice client SHALL provide a mute button that toggles the WebRTC audio sende
 - **WHEN** the user ends a call while muted
 - **THEN** the mute state SHALL reset to unmuted for the next call
 
-### Requirement: Echo cancellation via DOM audio element
-The voice client SHALL ensure remote WebRTC audio is played through a DOM `<audio>` element (not Web Audio API) so the browser's built-in acoustic echo cancellation can correlate input and output signals.
+### Requirement: Echo cancellation via three-layer approach
+The voice client SHALL use a three-layer echo cancellation approach: browser-native AEC (`echoCancellation: true`), reduced assistant volume, and grace-period mic gating. This prevents the server-side VAD from detecting the agent's own playback as user speech.
 
-#### Scenario: Remote audio playback path
-- **WHEN** a remote audio track is received on the RTCPeerConnection
-- **THEN** the track SHALL be assigned to a DOM `<audio>` element's `srcObject` for playback
-- **AND** the element SHALL have `autoplay` enabled
+#### Scenario: Browser AEC enabled
+- **WHEN** the client captures microphone audio via `getUserMedia`
+- **THEN** the constraints SHALL include `echoCancellation: true`, `noiseSuppression: true`, `autoGainControl: true`
 
-#### Scenario: Echo cancellation active
-- **WHEN** the user's microphone is captured with `echoCancellation: true`
-- **AND** remote audio plays through a DOM `<audio>` element
-- **THEN** the browser's AEC SHALL be able to correlate input/output for echo suppression
+#### Scenario: Reduced assistant volume
+- **WHEN** the DOM `<audio>` element is created for agent playback
+- **THEN** the volume SHALL be set to 0.35 (`ASSISTANT_VOLUME` constant)
+- **AND** this reduces residual echo energy below the server-side VAD detection threshold
+
+#### Scenario: Grace-period mic gating on playback start
+- **WHEN** the data channel receives an `output_audio_buffer.started` event
+- **THEN** the mic track SHALL be muted immediately (`track.enabled = false`)
+- **AND** a timer SHALL be started for 2000ms (`GRACE_MS` constant)
+- **AND** after the timer expires, the mic track SHALL be unmuted (`track.enabled = true`)
+
+#### Scenario: Grace-period cancelled on playback end
+- **WHEN** the data channel receives an `output_audio_buffer.stopped` event
+- **THEN** any active grace timer SHALL be cancelled
+- **AND** the mic track SHALL be unmuted immediately
+
+#### Scenario: Multiple playback events during grace
+- **WHEN** a new `output_audio_buffer.started` event arrives while a grace timer is active
+- **THEN** the existing timer SHALL be cancelled and a new 2000ms timer SHALL start
+- **AND** the mic SHALL remain muted until the new timer expires
+
+#### Scenario: Barge-in preserved after grace period
+- **WHEN** the grace period has elapsed and the assistant is still speaking
+- **THEN** the mic SHALL be unmuted
+- **AND** the user's speech SHALL reach the server-side VAD to trigger barge-in
+
+### Requirement: Debug timeline thresholds
+The debug turn timeline SHALL use adjusted color thresholds that account for the mic gating grace period.
+
+#### Scenario: Delta color thresholds
+- **WHEN** displaying a timing delta in the turn timeline
+- **THEN** deltas below 550ms SHALL be green
+- **AND** deltas between 550ms and 1000ms SHALL be yellow
+- **AND** deltas above 1000ms SHALL be red
+
+#### Scenario: Silence color thresholds
+- **WHEN** displaying perceived silence duration
+- **THEN** silence below 550ms SHALL be green
+- **AND** silence between 550ms and 1000ms SHALL be yellow
+- **AND** silence above 1000ms SHALL be red
 
 ### Requirement: Visual design
 The voice client SHALL use a light mode design with neutral colors, minimal UI elements, and no visual elements that add rendering latency.

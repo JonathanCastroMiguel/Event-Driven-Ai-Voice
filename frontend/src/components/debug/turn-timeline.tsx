@@ -33,8 +33,8 @@ function stageLabel(stage: DebugStage): string {
 }
 
 function deltaColor(delta_ms: number): string {
-  if (delta_ms < 100) return "border-green-500 bg-green-500/10";
-  if (delta_ms < 300) return "border-yellow-500 bg-yellow-500/10";
+  if (delta_ms < 550) return "border-green-500 bg-green-500/10";
+  if (delta_ms < 1000) return "border-yellow-500 bg-yellow-500/10";
   return "border-red-500 bg-red-500/10";
 }
 
@@ -85,7 +85,7 @@ function computeSilenceMs(stages: DebugStage[]): number | null {
 }
 
 function silenceColor(ms: number): string {
-  if (ms < 500) return "text-green-600";
+  if (ms < 550) return "text-green-600";
   if (ms < 1000) return "text-yellow-600";
   return "text-red-600";
 }
@@ -100,7 +100,7 @@ function SilenceBanner({ stages }: { stages: DebugStage[] }) {
         {silenceMs}ms
       </span>
       <span className="text-muted-foreground/60">
-        (Speech Stop → Audio Start)
+        (Speech Stop → Audio Start + routing)
       </span>
     </div>
   );
