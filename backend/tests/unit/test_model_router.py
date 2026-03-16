@@ -15,7 +15,7 @@ from src.routing.model_router import (
     RouterPromptBuilder,
     RouterPromptTemplate,
     load_router_prompt,
-    parse_model_action,
+    parse_function_call_action,
 )
 
 
@@ -104,15 +104,16 @@ class TestRouterPromptBuilder:
 
 
 # ---------------------------------------------------------------------------
-# parse_model_action tests
+# parse_function_call_action tests
 # ---------------------------------------------------------------------------
 
 
-class TestParseModelAction:
+class TestParseFunctionCallAction:
     def test_valid_specialist_action(self) -> None:
-        transcript = '{"action": "specialist", "department": "billing", "summary": "billing issue"}'
-        result = parse_model_action(transcript)
-
+        result = parse_function_call_action(
+            "route_to_specialist",
+            '{"department": "billing", "summary": "billing issue"}',
+        )
         assert result is not None
         assert isinstance(result, ModelRouterAction)
         assert result.department == Department.BILLING
@@ -120,48 +121,42 @@ class TestParseModelAction:
 
     def test_valid_action_all_departments(self) -> None:
         for dept in Department:
-            transcript = f'{{"action": "specialist", "department": "{dept.value}", "summary": "test"}}'
-            result = parse_model_action(transcript)
+            result = parse_function_call_action(
+                "route_to_specialist",
+                f'{{"department": "{dept.value}", "summary": "test"}}',
+            )
             assert result is not None
             assert result.department == dept
 
-    def test_direct_voice_non_json(self) -> None:
-        result = parse_model_action("Buenos días, ¿en qué puedo ayudarle?")
-        assert result is None
-
-    def test_direct_voice_empty_string(self) -> None:
-        result = parse_model_action("")
-        assert result is None
-
-    def test_direct_voice_whitespace(self) -> None:
-        result = parse_model_action("   ")
+    def test_wrong_function_name(self) -> None:
+        result = parse_function_call_action(
+            "wrong_function",
+            '{"department": "billing", "summary": "test"}',
+        )
         assert result is None
 
     def test_malformed_json(self) -> None:
-        result = parse_model_action('{"action": "specialist", "department": ')
-        assert result is None
-
-    def test_wrong_schema_no_action(self) -> None:
-        result = parse_model_action('{"type": "something_else", "data": 123}')
-        assert result is None
-
-    def test_wrong_action_value(self) -> None:
-        result = parse_model_action('{"action": "not_specialist", "department": "billing"}')
+        result = parse_function_call_action(
+            "route_to_specialist",
+            '{"department": ',
+        )
         assert result is None
 
     def test_unknown_department(self) -> None:
-        result = parse_model_action('{"action": "specialist", "department": "unknown_dept", "summary": "test"}')
+        result = parse_function_call_action(
+            "route_to_specialist",
+            '{"department": "unknown_dept", "summary": "test"}',
+        )
         assert result is None
 
-    def test_json_with_whitespace_padding(self) -> None:
-        transcript = '  {"action": "specialist", "department": "sales", "summary": "wants upgrade"}  '
-        result = parse_model_action(transcript)
+    def test_direct_department(self) -> None:
+        result = parse_function_call_action(
+            "route_to_specialist",
+            '{"department": "direct", "summary": "greeting"}',
+        )
         assert result is not None
-        assert result.department == Department.SALES
-
-    def test_not_dict_json(self) -> None:
-        result = parse_model_action("[1, 2, 3]")
-        assert result is None
+        assert result.department == Department.DIRECT
+        assert result.summary == "greeting"
 
 
 # ---------------------------------------------------------------------------

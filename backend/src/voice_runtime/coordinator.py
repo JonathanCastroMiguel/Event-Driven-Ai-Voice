@@ -676,14 +676,16 @@ class Coordinator:
         # Debug: specialist_sent (sub-flow starts)
         await self._send_debug("specialist_sent")
 
-        # Execute specialist tool
+        # Execute specialist tool — passes summary + conversation history.
+        # The tool returns a complete response.create payload.
         tool_request_id = uuid4()
+        history = self._conversation_buffer.format_messages()
         tool_result = await self._tool_executor.execute(
             call_id=self._call_id,
             agent_generation_id=s.active_agent_generation_id,
             tool_request_id=tool_request_id,
             tool_name=f"specialist_{department}",
-            args={"summary": summary},
+            args={"summary": summary, "history": history},
             timeout_ms=5000,
         )
 
@@ -710,40 +712,29 @@ class Coordinator:
         voice_gen_id = uuid4()
         s.active_voice_generation_id = voice_gen_id
 
-        # Build specialist response prompt as dict (like router prompt)
-        # so history is embedded in instructions and sent correctly
-        history = self._conversation_buffer.format_messages()
-        tool_payload_str = str(tool_result.payload) if tool_result.ok else "Tool unavailable"
-
-        instructions_parts: list[str] = [
-            self._policies.base_system.strip(),
-            f"The user needs help with {department}. Tool result: {tool_payload_str}",
-            (
-                "IMPORTANT: Respond in the same language the customer used in the conversation history. "
-                "If the customer spoke Spanish, respond in Spanish. If English, respond in English. "
-                "The summary below is always in English for internal routing — ignore its language "
-                "and match the customer's language instead."
-            ),
-        ]
-
-        if history:
-            history_lines: list[str] = []
-            for msg in history:
-                role = msg.get("role", "user")
-                content = msg.get("content", "")
-                label = "User" if role == "user" else "Assistant"
-                history_lines.append(f"{label}: {content}")
-            instructions_parts.append("Conversation history:\n" + "\n".join(history_lines))
-
-        instructions_parts.append(f"Customer request: {summary}")
-
-        specialist_prompt: dict[str, Any] = {
-            "type": "response.create",
-            "response": {
-                "modalities": ["text", "audio"],
-                "instructions": "\n\n".join(instructions_parts),
-            },
-        }
+        # Use tool result payload directly as the prompt, or fallback on failure
+        if tool_result.ok:
+            specialist_prompt = tool_result.payload
+        else:
+            logger.warning(
+                "specialist_tool_failed",
+                call_id=str(self._call_id),
+                department=department,
+                error=tool_result.payload,
+            )
+            specialist_prompt = {
+                "type": "response.create",
+                "response": {
+                    "modalities": ["text", "audio"],
+                    "instructions": (
+                        "Apologize to the customer briefly. Tell them you are having "
+                        "a temporary issue connecting to the specialist and ask them "
+                        "to try again in a moment. Respond in the same language the "
+                        "customer used."
+                    ),
+                    "temperature": 0.8,
+                },
+            }
 
         await self._emit_output(
             RealtimeVoiceStart(

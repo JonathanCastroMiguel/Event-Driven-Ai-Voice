@@ -18,19 +18,24 @@ On receiving `audio_committed` (translated from `input_audio_buffer.committed`),
 - **THEN** the Coordinator SHALL build the router prompt with an empty input array (no conversation history)
 
 ### Requirement: Model router response handling
-The Coordinator SHALL handle two response modes from the Realtime model: (a) direct voice response (model speaks the answer) and (b) function call routing (model speaks a filler AND calls `route_to_specialist()`). On receiving `model_router_action` from the Bridge (triggered by `response.function_call_arguments.done`), the Coordinator SHALL dispatch specialist tool execution. On receiving `voice_generation_completed` (direct voice), the Coordinator SHALL finalize the turn normally.
+The Coordinator SHALL handle two response modes from the Realtime model: (a) direct voice response (handled by the Bridge's two-step flow — the Coordinator receives `voice_generation_completed` as normal) and (b) function call routing (model calls `route_to_specialist()` with a specialist department). On receiving `model_router_action` from the Bridge, the Coordinator SHALL dispatch specialist tool execution via `ToolExecutor`, passing both the summary and conversation history. The tool result SHALL contain a complete `response.create` payload that the Coordinator forwards to the voice agent without modification.
 
 #### Scenario: Direct voice response completes
-- **WHEN** the Bridge emits `voice_generation_completed` (model spoke directly, no function call)
+- **WHEN** the Bridge emits `voice_generation_completed` (from the two-step direct flow)
 - **THEN** the Coordinator SHALL clear `active_voice_generation_id`, finalize the agent generation as completed, and append the turn to the conversation buffer
 
-#### Scenario: Function call triggers specialist tool
-- **WHEN** the Bridge emits `model_router_action` with `department="billing"` and `summary="billing issue"` (from `route_to_specialist` function call)
-- **THEN** the Coordinator SHALL dispatch tool execution for the billing specialist. The model's filler audio plays naturally while the function call is processed — no separate filler emission needed since the model speaks the filler simultaneously with the function call.
+#### Scenario: Function call triggers specialist tool with history
+- **WHEN** the Bridge emits `model_router_action` with `department="retention"` and `summary="cancellation request"`
+- **THEN** the Coordinator SHALL dispatch tool execution for `specialist_retention` with `args={"summary": "cancellation request", "history": <conversation_history>}`
 
-#### Scenario: Specialist prompt with language instruction
-- **WHEN** a specialist tool result is ready and conversation history exists
-- **THEN** the Coordinator SHALL build the specialist prompt as a `response.create` dict with conversation history and language instruction embedded in `instructions`, ensuring the specialist responds in the customer's language
+#### Scenario: Specialist tool result forwarded as voice start
+- **WHEN** the specialist tool returns a `response.create` payload
+- **THEN** the Coordinator SHALL emit `RealtimeVoiceStart` with the tool result payload as the `prompt` field and `response_source="specialist"`
+- **AND** the Coordinator SHALL NOT modify the payload content
+
+#### Scenario: Specialist tool failure
+- **WHEN** the specialist tool returns `ok=False`
+- **THEN** the Coordinator SHALL construct a fallback `response.create` with a generic apology message and emit it as `RealtimeVoiceStart`
 
 ### Requirement: Barge-in handling
 On receiving `speech_started` while `active_voice_generation_id` is set, the Coordinator SHALL: (1) emit `realtime_voice_cancel(active_voice_generation_id)`, (2) emit `cancel_agent_generation(active_agent_generation_id)`, (3) add both IDs to their respective cancelled sets, (4) forward the event to TurnManager.

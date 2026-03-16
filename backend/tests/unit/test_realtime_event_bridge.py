@@ -186,21 +186,28 @@ class TestHandleFrontendEvent:
 
 
 class TestOutputEventTranslation:
-    async def test_send_voice_start_with_message_array(self, bridge, call_id):
+    async def test_send_voice_start_with_dict_payload(self, bridge, call_id):
+        """Dict prompt (from RouterPromptBuilder) is forwarded as-is."""
         mock_ws = _make_mock_ws()
         bridge.set_frontend_ws(mock_ws)
 
         voice_id = uuid4()
         gen_id = uuid4()
+        payload = {
+            "type": "response.create",
+            "response": {
+                "modalities": ["text", "audio"],
+                "instructions": "You are helpful. Greet warmly.",
+                "tools": [{"type": "function", "name": "route_to_specialist"}],
+                "tool_choice": "required",
+                "temperature": 0.8,
+            },
+        }
         event = RealtimeVoiceStart(
             call_id=call_id,
             agent_generation_id=gen_id,
             voice_generation_id=voice_id,
-            prompt=[
-                {"role": "system", "content": "You are helpful."},
-                {"role": "system", "content": "Greet warmly."},
-                {"role": "user", "content": "hola"},
-            ],
+            prompt=payload,
             ts=1000,
         )
 
@@ -208,12 +215,10 @@ class TestOutputEventTranslation:
 
         assert mock_ws.send_text.call_count == 1
 
-        # Single response.create with instructions inline
         msg = orjson.loads(mock_ws.send_text.call_args_list[0][0][0])
         assert msg["type"] == "response.create"
         assert "You are helpful." in msg["response"]["instructions"]
-        assert "Greet warmly." in msg["response"]["instructions"]
-        assert msg["response"]["input"][0]["content"][0]["text"] == "hola"
+        assert msg["response"]["tools"] is not None
 
         # Voice generation ID tracked
         assert bridge._active_voice_generation_id == voice_id
@@ -328,17 +333,22 @@ class TestTranscriptBufferAndJsonDetection:
         await bridge._translate_event({"type": "response.created"})
         assert bridge._response_transcript_buffer == ""
 
-    async def test_json_action_detected_on_response_done(self, bridge, call_id):
-        """Valid JSON action in transcript emits model_router_action instead of voice_generation_completed."""
+    async def test_function_call_emits_model_router_action(self, bridge, call_id):
+        """Function call with specialist department emits model_router_action."""
         received = []
         callback = AsyncMock(side_effect=lambda e: received.append(e))
         bridge.on_event(callback)
 
         voice_id = uuid4()
         bridge._active_voice_generation_id = voice_id
-        bridge._response_transcript_buffer = '{"action": "specialist", "department": "billing", "summary": "billing issue"}'
 
-        await bridge._translate_event({"type": "response.done"})
+        await bridge._translate_event({
+            "type": "response.function_call_arguments.done",
+            "name": "route_to_specialist",
+            "arguments": '{"department": "billing", "summary": "billing issue"}',
+            "call_id": "call_abc123",
+            "item_id": "item_abc123",
+        })
 
         assert len(received) == 1
         assert received[0].type == "model_router_action"
@@ -376,21 +386,26 @@ class TestTranscriptBufferAndJsonDetection:
         assert len(received) == 1
         assert received[0].type == "voice_generation_completed"
 
-    async def test_full_delta_accumulation_then_action(self, bridge, call_id):
-        """Full flow: deltas accumulate, then response.done detects JSON action."""
+    async def test_function_call_then_response_done_no_voice_completed(self, bridge, call_id):
+        """Full flow: function call sets flag, response.done does NOT emit voice_generation_completed."""
         received = []
         callback = AsyncMock(side_effect=lambda e: received.append(e))
         bridge.on_event(callback)
 
         bridge._active_voice_generation_id = uuid4()
 
-        # Simulate deltas arriving
+        # Simulate response lifecycle with function call
         await bridge._translate_event({"type": "response.created"})
-        await bridge._translate_event({"type": "response.audio_transcript.delta", "delta": '{"action": "'})
-        await bridge._translate_event({"type": "response.audio_transcript.delta", "delta": 'specialist", "department": "sales", '})
-        await bridge._translate_event({"type": "response.audio_transcript.delta", "delta": '"summary": "wants upgrade"}'})
+        await bridge._translate_event({
+            "type": "response.function_call_arguments.done",
+            "name": "route_to_specialist",
+            "arguments": '{"department": "sales", "summary": "wants upgrade"}',
+            "call_id": "call_xyz",
+            "item_id": "item_xyz",
+        })
         await bridge._translate_event({"type": "response.done"})
 
+        # response_created + model_router_action — no voice_generation_completed
         assert len(received) == 2
         assert received[0].type == "response_created"
         assert received[1].type == "model_router_action"
