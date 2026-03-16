@@ -1,13 +1,4 @@
-### Requirement: Router prompt template definition
-The model-router SHALL define a router system prompt template stored in `router_registry/v1/router_prompt.yaml`. The template SHALL contain sections for: (1) base system identity (call center agent persona), (2) router decision rules (when to speak directly vs. call route_to_specialist), (3) department definitions (sales, billing, support, retention), (4) guardrail rules (disallowed content, out-of-scope topics), (5) language instruction (respond in same language as user).
-
-#### Scenario: Router prompt loaded at startup
-- **WHEN** the application starts and initializes the router registry
-- **THEN** the router prompt template SHALL be loaded from `router_registry/v1/router_prompt.yaml` and validated for required sections
-
-#### Scenario: Missing router prompt file
-- **WHEN** `router_prompt.yaml` does not exist at the expected path
-- **THEN** the system SHALL raise a `FileNotFoundError` with a descriptive message
+## MODIFIED Requirements
 
 ### Requirement: Two response modes — direct voice vs. function call action
 The router prompt SHALL instruct the model to classify every user message via a mandatory `route_to_specialist` function call with `tool_choice: "required"`. The model SHALL call `route_to_specialist(department="direct", summary="...")` for messages it handles itself (greetings, guardrails, out-of-scope, simple questions), and `route_to_specialist(department="<specialist>", summary="...")` for messages requiring specialist routing. Because `tool_choice: "required"` suppresses audio output, the model produces only the function call in this response — the spoken reply is generated in a separate follow-up `response.create`.
@@ -45,17 +36,7 @@ The RouterPromptBuilder SHALL embed conversation history as text within the `ins
 - **THEN** the payload `instructions` SHALL contain the system prompt followed by a `Conversation history:` section
 - **AND** the payload SHALL include `tool_choice: "required"` and `tools` with `route_to_specialist`
 
-### Requirement: Router prompt supports dynamic language
-
-The router prompt `language_instruction` section SHALL instruct the model to respond in the same language the customer is speaking, rather than forcing a single language.
-
-#### Scenario: Customer speaks Spanish
-- **WHEN** the customer speaks in Spanish
-- **THEN** the model SHALL respond in Spanish
-
-#### Scenario: Customer speaks English
-- **WHEN** the customer speaks in English
-- **THEN** the model SHALL respond in English
+## ADDED Requirements
 
 ### Requirement: Department.DIRECT enum value
 The `Department` enum SHALL include a `DIRECT = "direct"` value representing messages the model handles without specialist routing. The `route_to_specialist` tool definition SHALL include `"direct"` in the `department` parameter enum alongside `"sales"`, `"billing"`, `"support"`, and `"retention"`.

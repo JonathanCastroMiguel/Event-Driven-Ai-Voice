@@ -19,6 +19,7 @@ logger = structlog.get_logger()
 
 
 class Department(str, Enum):
+    DIRECT = "direct"
     SALES = "sales"
     BILLING = "billing"
     SUPPORT = "support"
@@ -40,8 +41,10 @@ ROUTE_TOOL_DEFINITION: dict[str, Any] = {
     "type": "function",
     "name": "route_to_specialist",
     "description": (
-        "Route the customer to a specialist department. "
-        "Call this when the customer needs help that requires system access "
+        "Classify every user message. "
+        "Use 'direct' when you can answer directly (greetings, small talk, "
+        "general questions, clarifications). "
+        "Use a specialist department when the customer needs system access "
         "(account lookup, billing changes, technical troubleshooting, etc.)."
     ),
     "parameters": {
@@ -49,8 +52,11 @@ ROUTE_TOOL_DEFINITION: dict[str, Any] = {
         "properties": {
             "department": {
                 "type": "string",
-                "enum": ["sales", "billing", "support", "retention"],
-                "description": "The specialist department to route to.",
+                "enum": ["direct", "sales", "billing", "support", "retention"],
+                "description": (
+                    "'direct' for messages you handle yourself. "
+                    "A specialist department for requests requiring system access."
+                ),
             },
             "summary": {
                 "type": "string",
@@ -128,7 +134,7 @@ class RouterPromptBuilder:
                 "modalities": ["text", "audio"],
                 "instructions": instructions,
                 "tools": [ROUTE_TOOL_DEFINITION],
-                "tool_choice": "auto",
+                "tool_choice": "required",
                 "temperature": 0.8,
             },
         }

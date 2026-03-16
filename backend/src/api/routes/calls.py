@@ -29,6 +29,7 @@ from src.voice_runtime.events import (
     RealtimeVoiceStart,
 )
 from src.voice_runtime.realtime_event_bridge import OpenAIRealtimeEventBridge
+from src.voice_runtime.specialist_tools import register_specialist_tools
 from src.voice_runtime.tool_executor import ToolExecutor
 from src.voice_runtime.turn_manager import TurnManager
 
@@ -130,6 +131,7 @@ async def create_call() -> CreateCallResponse:
     turn_manager = TurnManager(call_id=call_id)
     agent_fsm = AgentFSM(call_id=call_id)
     tool_executor = ToolExecutor()
+    register_specialist_tools(tool_executor)
     policies = _get_policies()
 
     coordinator = Coordinator(

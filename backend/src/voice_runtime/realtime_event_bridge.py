@@ -20,7 +20,7 @@ from uuid import UUID, uuid4
 import orjson
 import structlog
 
-from src.routing.model_router import parse_function_call_action
+from src.routing.model_router import Department, parse_function_call_action
 from src.voice_runtime.events import (
     EventEnvelope,
     RealtimeVoiceCancel,
@@ -54,6 +54,10 @@ class OpenAIRealtimeEventBridge:
         self._response_created_ms: int = 0
         self._current_response_source: str = "router"
         self._function_call_received: bool = False
+        self._pending_direct_audio: bool = False
+        self._last_instructions: str = ""
+        self._pending_fn_call_id: str = ""
+        self._pending_fn_item_id: str = ""
 
     # ------------------------------------------------------------------
     # RealtimeClient protocol: on_event
@@ -113,6 +117,7 @@ class OpenAIRealtimeEventBridge:
             instructions = resp.get("instructions", "")
             has_history = "Conversation history:" in instructions
             has_tools = bool(resp.get("tools"))
+            self._last_instructions = instructions
             logger.info(
                 "bridge_sending_response_create",
                 call_id=str(self._call_id),
@@ -248,6 +253,10 @@ class OpenAIRealtimeEventBridge:
             # This is never vocalized (separate channel from audio).
             fn_name = str(data.get("name", ""))
             fn_args = str(data.get("arguments", ""))
+            # Capture OpenAI's internal call_id and item_id for acknowledging
+            # the function call before sending follow-up response.create.
+            self._pending_fn_call_id = str(data.get("call_id", ""))
+            self._pending_fn_item_id = str(data.get("item_id", ""))
             logger.info(
                 "bridge_function_call_received",
                 call_id=str(self._call_id),
@@ -256,21 +265,32 @@ class OpenAIRealtimeEventBridge:
             )
             action = parse_function_call_action(fn_name, fn_args)
             if action is not None:
-                self._function_call_received = True
-                voice_id = self._active_voice_generation_id
-                self._active_voice_generation_id = None
-                envelope = EventEnvelope(
-                    event_id=uuid4(),
-                    call_id=self._call_id,
-                    ts=_now_ms(),
-                    type="model_router_action",
-                    payload={
-                        "department": action.department.value,
-                        "summary": action.summary,
-                        "filler_text": _clean_transcript(self._response_transcript_buffer),
-                    },
-                    source=EventSource.REALTIME,
-                )
+                if action.department == Department.DIRECT:
+                    # Direct response — tool_choice=required suppresses audio,
+                    # so we flag for a second response.create (audio-only, no tools)
+                    # that will be sent on response.done.
+                    self._pending_direct_audio = True
+                    logger.info(
+                        "bridge_direct_response_via_tool",
+                        call_id=str(self._call_id),
+                        summary=action.summary[:100],
+                    )
+                else:
+                    self._function_call_received = True
+                    voice_id = self._active_voice_generation_id
+                    self._active_voice_generation_id = None
+                    envelope = EventEnvelope(
+                        event_id=uuid4(),
+                        call_id=self._call_id,
+                        ts=_now_ms(),
+                        type="model_router_action",
+                        payload={
+                            "department": action.department.value,
+                            "summary": action.summary,
+                            "filler_text": _clean_transcript(self._response_transcript_buffer),
+                        },
+                        source=EventSource.REALTIME,
+                    )
 
         elif event_type == "conversation.item.input_audio_transcription.completed":
             transcript = str(data.get("transcript", "")).strip()
@@ -289,7 +309,9 @@ class OpenAIRealtimeEventBridge:
             now = _now_ms()
             created_to_done_ms = now - self._response_created_ms if self._response_created_ms else 0
             total_response_ms = now - self._response_create_sent_ms if self._response_create_sent_ms else 0
-            response_status = data.get("response", {}).get("status", "completed")
+            response_obj = data.get("response", {})
+            response_status = response_obj.get("status", "completed")
+            status_details = response_obj.get("status_details")
             logger.info(
                 "bridge_response_done",
                 call_id=str(self._call_id),
@@ -298,32 +320,66 @@ class OpenAIRealtimeEventBridge:
                 created_to_done_ms=created_to_done_ms,
                 total_response_ms=total_response_ms,
                 status=response_status,
+                status_details=status_details,
                 function_call_received=self._function_call_received,
+                pending_direct_audio=self._pending_direct_audio,
             )
+
+            # Two-step direct response: tool_choice=required produced only
+            # a tool call (no audio).  Send a function call output to acknowledge
+            # the tool call, then a second response.create WITHOUT tools so the
+            # model generates the actual spoken reply.
+            if self._pending_direct_audio:
+                self._pending_direct_audio = False
+                self._response_transcript_buffer = ""
+
+                # Acknowledge the function call so OpenAI accepts the next response.create
+                if self._pending_fn_call_id:
+                    fn_output: dict[str, Any] = {
+                        "type": "conversation.item.create",
+                        "item": {
+                            "type": "function_call_output",
+                            "call_id": self._pending_fn_call_id,
+                            "output": '{"status":"ok"}',
+                        },
+                    }
+                    logger.info(
+                        "bridge_direct_fn_ack",
+                        call_id=str(self._call_id),
+                        fn_call_id=self._pending_fn_call_id,
+                    )
+                    await self.send_to_frontend(fn_output)
+                    self._pending_fn_call_id = ""
+                    self._pending_fn_item_id = ""
+
+                self._response_create_sent_ms = _now_ms()
+                self._response_created_ms = 0
+                second_response: dict[str, Any] = {
+                    "type": "response.create",
+                    "response": {
+                        "modalities": ["text", "audio"],
+                        "instructions": self._last_instructions,
+                        "temperature": 0.8,
+                    },
+                }
+                logger.info(
+                    "bridge_direct_audio_followup",
+                    call_id=str(self._call_id),
+                    instructions_len=len(self._last_instructions),
+                )
+                await self.send_to_frontend(second_response)
+                return  # wait for second response.done
+
             voice_id = self._active_voice_generation_id
             transcript = _clean_transcript(self._response_transcript_buffer)
             self._response_transcript_buffer = ""
 
             if self._function_call_received:
                 # Routing was dispatched via function call.
-                # Emit voice_generation_completed with the filler transcript.
-                if voice_id is not None:
-                    vgc_payload: dict[str, Any] = {
-                        "voice_generation_id": str(voice_id),
-                        "transcript": transcript.strip(),
-                        "response_source": self._current_response_source,
-                    }
-                    if created_to_done_ms:
-                        vgc_payload["created_to_done_ms"] = created_to_done_ms
-                    envelope = EventEnvelope(
-                        event_id=uuid4(),
-                        call_id=self._call_id,
-                        ts=_now_ms(),
-                        type="voice_generation_completed",
-                        payload=vgc_payload,
-                        source=EventSource.REALTIME,
-                    )
-                    self._active_voice_generation_id = None
+                # Do NOT emit voice_generation_completed here — the specialist's
+                # response.done will emit it with the correct transcript.
+                # The coordinator already transitioned FSM via model_router_action.
+                pass
             elif voice_id is not None:
                 # Normal direct response (no function call).
                 vgc_payload = {
