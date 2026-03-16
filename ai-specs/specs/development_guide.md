@@ -78,7 +78,13 @@ alembic upgrade head
 The router registry lives at `backend/router_registry/v1/` and contains:
 - `config.yml` — thresholds, centroid definitions, lexicon rules
 - `policies.yml` — policy key to prompt template mapping
-- `router_prompt.yaml` — model-as-router system prompt template (identity, decision rules, departments, guardrails, language instruction)
+- `router_prompt.yaml` — model-as-router system prompt template (identity, decision rules, departments, guardrails, language instruction). Uses always-classify pattern with `tool_choice: "required"` — every message triggers a `route_to_specialist` call with `department="direct"` or a specialist department.
+
+### 6.1 Specialist Tools
+
+Mock specialist tools live at `backend/src/voice_runtime/specialist_tools.py`. Four tools (`specialist_sales`, `specialist_billing`, `specialist_support`, `specialist_retention`) are registered in `ToolExecutor` at call creation via `register_specialist_tools()`. Each tool has its own prompt builder with department-specific triage examples (sales: plan/features/budget, billing: invoice/charge/amount, support: device/error/timing, retention: reason/tenure/retention). Shared `_TRIAGE_FRAMEWORK` enforces mandatory clarifying questions before transfer and dynamic language matching from conversation history. These simulate future LangGraph/LangChain sub-agents.
+
+Tests: `backend/tests/unit/test_specialist_tools.py` (9 tests: prompt differentiation, no hardcoded Spanish, department-specific keywords, history embedding) + `backend/tests/unit/test_two_step_routing.py` (13 tests: function call parsing, tool registration, payload structure).
 
 ### 7. Run the Server
 
@@ -111,7 +117,7 @@ pytest tests/unit/test_coordinator.py -v
 
 ### Test Structure
 
-- `tests/unit/` — 265 unit tests for individual components (coordinator, router, turn manager, agent FSM, tool executor, realtime client, telemetry, API routes)
+- `tests/unit/` — 303 unit tests for individual components (coordinator, router, turn manager, agent FSM, tool executor, specialist tools, realtime event bridge, two-step routing, telemetry, API routes)
 - `tests/e2e/` — 23 E2E integration tests exercising the full event pipeline via FakeRealtime + OutputCapture fixtures, plus 4 Playwright E2E tests
 
 ## Architecture Overview

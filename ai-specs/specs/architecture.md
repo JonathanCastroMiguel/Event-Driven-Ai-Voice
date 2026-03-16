@@ -309,9 +309,9 @@ The Coordinator is the central orchestrator for a single call. One `Coordinator`
 
 **Prompt construction**: The Coordinator builds prompts as `response.create` dict payloads (not message lists). Two paths:
 
-1. **Router prompt** (via `RouterPromptBuilder.build_response_create(history)`): Returns a dict with `instructions` (router template + history as text), `modalities`, `tools` (route_to_specialist definition), and `tool_choice: "auto"`. History is embedded in the `instructions` string, not in `response.input` — this preserves OpenAI's native conversation context (current turn audio).
+1. **Router prompt** (via `RouterPromptBuilder.build_response_create(history)`): Returns a dict with `instructions` (router template + history as text), `modalities`, `tools` (route_to_specialist definition), and `tool_choice: "required"`. History is embedded in the `instructions` string, not in `response.input` — this preserves OpenAI's native conversation context (current turn audio). The `tool_choice: "required"` forces the model to always call `route_to_specialist` — either with `department="direct"` (self-handled) or a specialist department.
 
-2. **Specialist prompt** (built inline in `_on_model_router_action`): A dict with `instructions` containing base system prompt + department context + tool result + language instruction + conversation history. No tools registered (specialist speaks directly).
+2. **Specialist prompt** (returned by specialist tools via `ToolExecutor`): A complete `response.create` dict with `instructions` containing department identity + department-specific triage examples + triage steps + language instruction + conversation history. Each department has its own dedicated prompt builder (not a shared template). Department names appear only in English in the prompt; the model translates them dynamically based on the customer's language. No tools registered (specialist speaks directly). The Coordinator forwards this payload without modification — prompt construction is delegated to the specialist tool (future: LangGraph/LangChain sub-agents).
 
 3. **Fallback prompt** (when no RouterPromptBuilder configured): A simple `response.create` dict with "You are a helpful voice assistant." and optional history.
 
@@ -319,7 +319,9 @@ On the first turn the history is empty. On subsequent turns, history is formatte
 
 **Conversation Buffer** (`backend/src/voice_runtime/conversation_buffer.py`): A `ConversationBuffer` instance is created per call alongside `CoordinatorRuntimeState`. It accumulates `TurnEntry` dataclass records (`seq`, `user_text`, `agent_text`). An entry is created at `audio_committed` (text empty), `user_text` is filled asynchronously when `transcript_final` arrives, and `agent_text` is filled when `voice_generation_completed` includes the agent's transcript. Cancelled turns (barge-in) are never appended. The buffer enforces two bounds: `max_turns` (sliding window, default 10) and `max_chars` (character budget on total text, default 2000). `format_messages()` returns alternating `user`/`assistant` messages.
 
-**Model-as-Router Pattern**: Instead of running an embedding classification pipeline, the Coordinator uses `RouterPromptBuilder` to construct a `response.create` payload containing a structured router prompt (from `RouterPromptTemplate`) plus conversation history. The Realtime model classifies intent AND responds in a single inference. For simple intents (~60-70% of turns), the model speaks directly. For specialist routing, the model speaks a natural filler AND calls `route_to_specialist()` as a function call (never vocalized), which the bridge detects via `response.function_call_arguments.done` and emits as a `model_router_action` event.
+**Model-as-Router Pattern (Two-Step)**: Instead of running an embedding classification pipeline, the Coordinator uses `RouterPromptBuilder` to construct a `response.create` payload containing a structured router prompt (from `RouterPromptTemplate`) plus conversation history. With `tool_choice: "required"`, every user message triggers a mandatory `route_to_specialist` function call — the model always classifies, producing either `department="direct"` (self-handled) or a specialist department. The first response contains only the function call (no audio, because `tool_choice: "required"` suppresses audio generation). The Bridge then handles the second step: for `direct`, it acknowledges the function call and sends a second `response.create` without tools to generate the spoken reply; for specialists, it emits `model_router_action` and the Coordinator delegates to a specialist tool via `ToolExecutor`.
+
+**Specialist Tools** (`backend/src/voice_runtime/specialist_tools.py`): Four mock specialist tools (`specialist_sales`, `specialist_billing`, `specialist_support`, `specialist_retention`) are registered in the `ToolExecutor` at call creation. Each tool has its own dedicated prompt builder (`_build_sales_prompt`, `_build_billing_prompt`, `_build_support_prompt`, `_build_retention_prompt`) with department-specific triage examples (e.g., sales asks about current plan/features/budget; billing asks about invoice number/charge date/amount). Shared helpers `_format_history_block()` and `_wrap_response_create()` handle common boilerplate. A shared `_TRIAGE_FRAMEWORK` constant enforces: (1) mandatory clarifying question before transfer, (2) step-awareness from conversation history, (3) language matching — the model detects the customer's language from the history and responds in that same language. Department names appear only in English in the prompt; the model translates them dynamically. The Coordinator forwards the tool result payload to the voice agent without modification. These mock tools simulate future LangGraph/LangChain sub-agents.
 
 **Routing context** (`backend/src/routing/context.py`): The `format_history()` function delegates to `ConversationBuffer.format_messages()`. It formats conversation buffer entries into alternating user/assistant message pairs for inclusion in the router prompt.
 
@@ -462,9 +464,10 @@ The Realtime voice model serves as the primary router. Instead of a multi-step e
 
 **Important**: History is embedded in `instructions` (not `response.input`) to preserve OpenAI's native conversation context, which includes the current turn's committed audio buffer. Using `response.input` would override the native context and cause the model to ignore the user's current speech.
 
-The resulting payload is sent as a `response.create` message to OpenAI, including the `route_to_specialist` function tool definition with `tool_choice: "auto"`. The model reads the router prompt, classifies the user's intent, and either:
-- **Speaks directly** (~60-70% of turns): For simple intents (greetings, guardrails, general questions), the model generates a voice response inline
-- **Calls `route_to_specialist()` function**: For specialist routing, the model speaks a natural filler message (e.g., "One moment, let me connect you with our billing team") AND simultaneously calls the `route_to_specialist` function with `department` and `summary` parameters. The function call is never vocalized — it travels as structured data on a separate output channel (output_index=1) while the filler audio plays normally (output_index=0). This guarantees clean audio without routing metadata contamination
+The resulting payload is sent as a `response.create` message to OpenAI, including the `route_to_specialist` function tool definition with `tool_choice: "required"`. The model reads the router prompt, classifies the user's intent, and **always** calls `route_to_specialist()` with one of two department types:
+
+- **`department="direct"`** (~60-70% of turns): For simple intents (greetings, guardrails, general questions). Since `tool_choice: "required"` suppresses audio output, the Bridge handles a two-step flow: (1) acknowledge the function call via `conversation.item.create` with `function_call_output`, then (2) send a second `response.create` without tools to generate the spoken reply
+- **Specialist department** (`sales`, `billing`, `support`, `retention`): For specialist routing. The Bridge emits `model_router_action` to the Coordinator, which dispatches to the corresponding specialist tool via `ToolExecutor`. The tool returns a complete `response.create` payload that the Coordinator forwards unchanged
 
 ### 5.2 RouterPromptTemplate
 
@@ -488,11 +491,11 @@ Loaded at startup via `load_router_prompt(registry_path)` which validates all re
 
 **File**: `backend/src/routing/model_router.py`
 
-When the model decides to route to a specialist, it calls the `route_to_specialist` function (defined in `ROUTE_TOOL_DEFINITION`). The tool accepts two required parameters: `department` (enum: `sales`, `billing`, `support`, `retention`) and `summary` (brief English description of the customer's need). These map to the `Department` enum and are parsed into a `ModelRouterAction(department, summary)` dataclass.
+With `tool_choice: "required"`, the model **always** calls `route_to_specialist` (defined in `ROUTE_TOOL_DEFINITION`). The tool accepts two required parameters: `department` (enum: `direct`, `sales`, `billing`, `support`, `retention`) and `summary` (brief English description of the customer's need). These map to the `Department` enum and are parsed into a `ModelRouterAction(department, summary)` dataclass. `Department.DIRECT` indicates the model handles the message itself (greetings, guardrails, clarifications) — no specialist routing needed.
 
-The OpenAI Realtime API emits a `response.function_call_arguments.done` event with the function name and JSON arguments. The bridge intercepts this event and calls `parse_function_call_action(name, arguments)` to validate the function name, parse the JSON, and resolve the department enum. If valid, the bridge emits a `model_router_action` EventEnvelope to the Coordinator. Invalid function names or malformed arguments are logged and silently dropped.
+The OpenAI Realtime API emits a `response.function_call_arguments.done` event with the function name and JSON arguments. The bridge intercepts this event and calls `parse_function_call_action(name, arguments)` to validate the function name, parse the JSON, and resolve the department enum. For specialist departments, the bridge emits a `model_router_action` EventEnvelope to the Coordinator. For `Department.DIRECT`, the bridge sets `_pending_direct_audio = True` and handles the two-step follow-up flow internally (see section 6.5). Invalid function names or malformed arguments are logged and silently dropped.
 
-The function call is structurally separated from audio output — it arrives on `output_index=1` while audio/text play on `output_index=0`. This eliminates any possibility of routing metadata being vocalized by the TTS.
+Since `tool_choice: "required"` forces function-call-only output, there is no audio in the classification response. Audio is generated in the second step: either via the Bridge's direct follow-up `response.create` or via the specialist tool's `response.create` payload.
 
 **Tool registration**: The `route_to_specialist` tool must be registered at both:
 1. **Session level** via `session.update` (sent at WebSocket connection start in `calls.py`) — required for the model to recognize the tool
@@ -516,7 +519,7 @@ The function call is structurally separated from audio output — it arrives on 
 
 6. **Audio muting**: Mute the audio element when a marker is detected, unmute when the specialist response starts. **Discarded**: Muting cuts audio at an arbitrary point — it can silence the filler mid-sentence, creating a jarring user experience. There is no way to know exactly when the marker audio begins in the buffer.
 
-7. **Function calling (ADOPTED)**: The model speaks a natural filler message AND calls `route_to_specialist()` as a structured function call. Function calls are never vocalized — they are a separate output channel in the Realtime API. The filler plays cleanly, the function call arrives as structured data, and subsequent `response.create` for the specialist queues audio in a deterministic FIFO buffer after the filler finishes.
+7. **Function calling (ADOPTED, then evolved to two-step)**: Initially, the model spoke a natural filler message AND called `route_to_specialist()` simultaneously with `tool_choice: "auto"`. This worked but was unreliable — the model sometimes skipped the function call and spoke directly, or produced inconsistent filler messages. **Evolved to two-step with `tool_choice: "required"`**: The model is forced to always call `route_to_specialist` (with `department="direct"` for self-handled messages). The first response produces only the function call (no audio). The Bridge then handles the second step: acknowledging the function call and sending a second `response.create` to generate speech. This guarantees 100% classification reliability at the cost of one extra round-trip (~150ms) for direct responses.
 
 ### 5.4 Embedding Pipeline (Analytics Only)
 
@@ -696,13 +699,17 @@ Browser ←WebSocket→ Backend (event forwarding, both directions)
 |---|---|
 | `_active_voice_generation_id` | Tracks current voice generation for `voice_generation_completed` payloads |
 | `_response_transcript_buffer` | Accumulates `response.audio_transcript.delta` text (reset on `response.created`) |
-| `_function_call_received` | `True` when `route_to_specialist` function call detected (distinguishes routing vs direct in `response.done`) |
+| `_function_call_received` | `True` when specialist `route_to_specialist` function call detected (suppresses `voice_generation_completed` on `response.done` — the specialist's response.done handles it) |
+| `_pending_direct_audio` | `True` when `Department.DIRECT` function call received — triggers two-step follow-up on `response.done` |
+| `_last_instructions` | Cached `instructions` from the last `response.create` dict payload — reused in the direct follow-up `response.create` (without tools) |
+| `_pending_fn_call_id` | OpenAI's internal `call_id` for the pending function call — used to send `function_call_output` acknowledgment |
+| `_pending_fn_item_id` | OpenAI's internal `item_id` for the pending function call item |
 | `_response_create_sent_ms` | Timestamp of last `response.create` sent (for `send_to_created_ms` timing) |
 | `_response_created_ms` | Timestamp of last `response.created` received (for `created_to_done_ms` timing) |
 | `_current_response_source` | `"router"` or `"specialist"` (from `RealtimeVoiceStart.response_source`) |
 
 **Output event translation (Coordinator → OpenAI):**
-- `send_voice_start(RealtimeVoiceStart)` with dict payload (from RouterPromptBuilder or specialist prompt) → sent directly as `response.create` with conversation history embedded in `instructions`, plus `tools` and `tool_choice` for router responses. No `response.input` — preserves OpenAI's native conversation context (current turn audio). No per-turn `session.update` — instructions are passed inline to avoid the ~500ms round-trip.
+- `send_voice_start(RealtimeVoiceStart)` with dict payload (from RouterPromptBuilder or specialist tool) → sent directly as `response.create`. Router payloads include `tools`, `tool_choice: "required"`, and conversation history in `instructions`. Specialist payloads include triage instructions and history but no tools. No `response.input` — preserves OpenAI's native conversation context (current turn audio). No per-turn `session.update` — instructions are passed inline to avoid the ~500ms round-trip. For dict payloads, the Bridge caches `instructions` in `_last_instructions` for use in the two-step direct follow-up.
 - `send_voice_start(RealtimeVoiceStart)` with string prompt → `response.create` (simple response)
 - `send_voice_cancel(RealtimeVoiceCancel)` → `response.cancel`
 
@@ -713,7 +720,7 @@ Browser ←WebSocket→ Backend (event forwarding, both directions)
 The backend acts as a **SDP signaling proxy**, **session lifecycle manager**, and **event forwarding hub**. It does NOT process audio or manage WebRTC peer connections. The browser connects directly to OpenAI via WebRTC for audio. Events flow through the backend via WebSocket for Coordinator integration.
 
 **Session lifecycle:**
-1. `POST /calls` creates a per-call runtime actor stack: Coordinator, TurnManager, AgentFSM, ToolExecutor, and RealtimeEventBridge. The shared `RouterPromptBuilder` singleton is injected into the Coordinator. The bridge is wired to the Coordinator bidirectionally:
+1. `POST /calls` creates a per-call runtime actor stack: Coordinator, TurnManager, AgentFSM, ToolExecutor, and RealtimeEventBridge. Mock specialist tools (`specialist_sales`, `specialist_billing`, `specialist_support`, `specialist_retention`) are registered in the ToolExecutor via `register_specialist_tools()`. The shared `RouterPromptBuilder` singleton is injected into the Coordinator. The bridge is wired to the Coordinator bidirectionally:
    - Input: `bridge.on_event(coordinator.handle_event)` — OpenAI events reach the Coordinator
    - Output: `coordinator.set_output_callback(fn)` — Coordinator commands (RealtimeVoiceStart, RealtimeVoiceCancel) are dispatched to `bridge.send_voice_start()` / `bridge.send_voice_cancel()`. `CancelAgentGeneration` is internal only — not sent to OpenAI
    - Debug: `coordinator.set_debug_callback(fn)` — debug events are sent to the frontend via `bridge.send_to_frontend()`
@@ -722,7 +729,7 @@ The backend acts as a **SDP signaling proxy**, **session lifecycle manager**, an
    - Step 2: `POST /v1/realtime` with the ephemeral key and SDP offer → returns the SDP answer
    - The server API key is only used for the sessions call — the ephemeral key is used for the SDP exchange, so the API key is never exposed to the browser
 3. `WS /calls/{call_id}/events` establishes bidirectional event forwarding:
-   - On connection: sends a one-time `session.update` via the bridge to configure transcription (`whisper-1`), disable auto-response (`create_response: false`), set server VAD `silence_duration_ms` (default: 300ms), and register the `route_to_specialist` tool with `tool_choice: "auto"`. Tool registration at session level is **required** — without it, the model writes function call text as transcript instead of invoking the function. The `/v1/realtime/sessions` endpoint does NOT reliably apply these settings, so the explicit `session.update` is required.
+   - On connection: sends a one-time `session.update` via the bridge to configure transcription (`whisper-1`), disable auto-response (`create_response: false`), set server VAD `silence_duration_ms` (default: 300ms), and register the `route_to_specialist` tool with `tool_choice: "auto"` (session-level default; overridden per-response to `"required"` by `RouterPromptBuilder`). Tool registration at session level is **required** — without it, the model writes function call text as transcript instead of invoking the function. The `/v1/realtime/sessions` endpoint does NOT reliably apply these settings, so the explicit `session.update` is required.
    - Receive loop: parses incoming messages and intercepts three control message types that are NOT forwarded to the bridge: `debug_enable`/`debug_disable` (toggle `coordinator.set_debug_enabled()`), and `client_debug_event` (forwarded to `coordinator.handle_client_debug_event()` for audio playback timing from the frontend). All other messages are forwarded to `bridge.handle_frontend_event()`.
    - On disconnect: clears the frontend WebSocket reference via `bridge.set_frontend_ws(None)`
 4. `DELETE /calls/{call_id}` closes the bridge and removes the session.
@@ -778,7 +785,7 @@ This state is ephemeral — destroyed when the call ends. The cancelled sets gro
 
 ## 8. End-to-End Flows
 
-### 8.1 Happy Path: Simple Greeting
+### 8.1 Happy Path: Simple Greeting (Two-Step Direct)
 
 User says: "hola buenos días"
 
@@ -790,20 +797,28 @@ User says: "hola buenos días"
 4. Coordinator._on_audio_committed()
    a. TurnManager.handle_audio_committed() → HumanTurnFinalized
    b. AgentFSM.start_routing() → IDLE → ROUTING
-   c. RouterPromptBuilder.build(conversation_history) → response.create payload
-   d. Emit response.create to Realtime API (model classifies + responds in single inference)
-5. Model speaks directly (simple greeting, ~60-70% of turns)
+   c. RouterPromptBuilder.build(conversation_history) → response.create payload (tool_choice: "required")
+   d. Emit response.create to Realtime API
+5. Model classifies → calls route_to_specialist(department="direct", summary="greeting")
+   → No audio output (tool_choice: "required" suppresses audio)
+6. Bridge receives response.function_call_arguments.done
+   → parse_function_call_action() → Department.DIRECT
+   → Sets _pending_direct_audio = True, caches _last_instructions
+7. Bridge receives response.done (classification response complete)
+   → Sends function_call_output acknowledgment to OpenAI
+   → Sends second response.create WITHOUT tools (using cached instructions)
+   → Resets transcript buffer for fresh accumulation
+8. Model generates spoken reply: "¡Hola! ¿Cómo estás?"
    → AgentFSM.voice_started() → ROUTING → SPEAKING
-6. Realtime Provider → transcript_final("hola buenos días") (arrives async)
-7. Coordinator._on_transcript_final()
-   → Persist text to DB (fire-and-forget)
-   → Append to conversation buffer
-   → Emit debug display
-8. Realtime Provider → voice_generation_completed
-9. Coordinator._on_voice_completed()
-   → AgentFSM.voice_completed() → SPEAKING → DONE
-   → Clear active_voice_generation_id
-   → Persist completion
+9. Realtime Provider → transcript_final("hola buenos días") (arrives async)
+10. Coordinator._on_transcript_final()
+    → Persist text to DB (fire-and-forget)
+    → Append to conversation buffer
+11. Realtime Provider → voice_generation_completed (from second response)
+12. Coordinator._on_voice_completed()
+    → AgentFSM.voice_completed() → SPEAKING → DONE
+    → Clear active_voice_generation_id
+    → Persist completion
 ```
 
 ### 8.2 Domain Route: Specialist Agent
@@ -811,27 +826,31 @@ User says: "hola buenos días"
 User says: "tengo un problema con mi factura"
 
 ```
-1-4. Same as above until audio_committed triggers response.create
-5. Model classifies as specialist routing → generates TWO outputs simultaneously:
-   a. output_index=0 (audio): Speaks natural filler: "Un momento, déjame conectarte con facturación"
-   b. output_index=1 (function call): route_to_specialist(department="billing", summary="User has a billing issue")
-   The function call is NEVER vocalized — it travels as structured data on a separate channel.
+1-4. Same as above until audio_committed triggers response.create (tool_choice: "required")
+5. Model classifies → calls route_to_specialist(department="billing", summary="invoice charge issue")
+   → No audio output (tool_choice: "required" suppresses audio)
 6. Bridge receives response.function_call_arguments.done event
-   → parse_function_call_action() validates and parses the function call
+   → parse_function_call_action() → Department.BILLING (specialist)
+   → Sets _function_call_received = True
+   → Clears _active_voice_generation_id
    → Emits model_router_action event with department, summary, and filler_text
 7. Coordinator._on_model_router_action()
    → AgentFSM.specialist_action() → ROUTING → WAITING_TOOLS
-   → Dispatch to specialist agent (billing)
-8. Bridge receives response.done for the router response
-   → Emits voice_generation_completed with the filler transcript
-9. Specialist tool execution completes → Coordinator builds specialist prompt as response.create
-   → Specialist prompt includes conversation history + language instruction in instructions field
-   → Audio is queued in OpenAI's FIFO output buffer AFTER the filler audio finishes
-10. Specialist responds in the customer's language → voice plays seamlessly after filler
+   → Dispatches specialist_billing tool via ToolExecutor with args={summary, history}
+8. Bridge receives response.done for the classification response
+   → _function_call_received is True → does NOT emit voice_generation_completed
+   → The specialist's response.done will handle it
+9. Specialist tool returns complete response.create payload
+   → Coordinator forwards payload unchanged as RealtimeVoiceStart(prompt=payload)
+   → AgentFSM → WAITING_TOOLS → SPEAKING
+10. Bridge sends specialist response.create to OpenAI (no tools, triage instructions)
+11. Specialist responds with triage questions in the customer's language
+    → voice_generation_completed from specialist response
+12. Coordinator._on_voice_completed()
     → AgentFSM.voice_completed() → SPEAKING → DONE
 ```
 
-**Key guarantee**: The OpenAI output audio buffer is a FIFO queue. Audio from sequential `response.create` calls plays in order: filler first, specialist second. No overlap, deterministic.
+**Specialist tool interface**: Each tool (`specialist_sales`, `specialist_billing`, `specialist_support`, `specialist_retention`) accepts `summary` (str) and `history` (list[dict]) and returns a complete `response.create` dict. The tool builds triage instructions with step-awareness from conversation history (acknowledge → ask clarifying questions → transfer). The Coordinator never modifies the payload — prompt construction is fully delegated to the tool.
 
 ### 8.3 Barge-In During Voice Output
 
@@ -860,16 +879,15 @@ Any late results from the cancelled generation are silently ignored via `is_gene
 User says: "maldita sea" (insult)
 
 ```
-1-3. Same until audio_committed triggers response.create
-4. Coordinator._on_audio_committed()
-   → RouterPromptBuilder builds payload with router prompt that includes guardrail instructions
-   → Emit response.create to Realtime API
-5. Model recognizes disallowed content via router prompt instructions
-   → Speaks guardrail response directly (no function call)
+1-3. Same until audio_committed triggers response.create (tool_choice: "required")
+4. Model classifies → calls route_to_specialist(department="direct", summary="disallowed content")
+   → Same two-step direct flow as 8.1: fn_ack → second response.create without tools
+5. Model generates guardrail response via second response.create
+   → Speaks appropriate redirection (e.g., "I'm here to help you. How can I assist you?")
 6. transcript_final arrives async → persisted for logging
 ```
 
-The router prompt template includes explicit guardrail rules. The model handles disallowed content detection inline — no separate lexicon check is needed on the hot path. The embedding pipeline's lexicon checks remain available for offline analytics.
+The router prompt template includes explicit guardrail rules. The model handles disallowed content by classifying as `department="direct"` — the two-step flow generates the response. No separate lexicon check is needed on the hot path. The embedding pipeline's lexicon checks remain available for offline analytics.
 
 ### 8.5 Ambiguous Intent: Clarify Department
 
@@ -1182,8 +1200,9 @@ Browser
 
 **`useVoiceSession`** — Full WebRTC lifecycle manager with direct OpenAI connection.
 - Calls `POST /calls` to create session → `POST /calls/{id}/offer` for SDP proxy exchange
-- Creates RTCPeerConnection, captures microphone (with `echoCancellation: true`), creates `"oai-events"` data channel
-- Appends `<audio>` element to `document.body` (hidden, `crossOrigin="anonymous"`) for browser AEC to work — removed on cleanup
+- Creates RTCPeerConnection, captures microphone (with `echoCancellation: true`, `noiseSuppression: true`, `autoGainControl: true`), creates `"oai-events"` data channel
+- Appends `<audio>` element to `document.body` (hidden, `volume=0.35`) for speaker output — removed on cleanup
+- **Three-layer echo cancellation**: (1) browser-native AEC via `getUserMedia` constraints, (2) reduced assistant volume (`ASSISTANT_VOLUME = 0.35`) to minimize residual echo energy, (3) grace-period mic gating — mic track muted for 2s (`GRACE_MS`) on `output_audio_buffer.started`, unmuted on timer expiry or `output_audio_buffer.stopped`. This prevents server-side VAD from detecting the agent's own playback as user speech during AEC convergence
 - Catches `NotAllowedError` from `getUserMedia()` → sets `mic_denied` status with clear error message
 - WebSocket message routing: backend-only types (`debug_event`, `turn_update`, `fsm_state`, `transcript_final`) are sent to the debug handler; all other messages are forwarded to the OpenAI DataChannel
 - Translates OpenAI events to internal format: `conversation.item.input_audio_transcription.completed` → human transcription, `response.audio_transcript.done` → agent transcription

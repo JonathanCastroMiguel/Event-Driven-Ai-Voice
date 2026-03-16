@@ -11,6 +11,10 @@ const WS_BASE =
     "ws",
   );
 
+// Reduced assistant volume to minimize residual echo energy reaching the mic.
+// Browser AEC handles most echo; lower volume reduces residual leakage.
+const ASSISTANT_VOLUME = 0.20;
+
 interface UseVoiceSessionReturn {
   status: ConnectionStatus;
   callId: string | null;
@@ -160,28 +164,56 @@ export function useVoiceSession(): UseVoiceSessionReturn {
       const pc = new RTCPeerConnection();
       pcRef.current = pc;
 
-      // 4. Audio playback from OpenAI — appended to DOM for AEC to work
+      // 4. Audio playback — DOM <audio> element for speaker output
       const audio = document.createElement("audio");
       audio.autoplay = true;
       audio.style.display = "none";
-      audio.crossOrigin = "anonymous";
       document.body.appendChild(audio);
       audioRef.current = audio;
-      pc.ontrack = (e) => {
-        audio.srcObject = e.streams[0];
-      };
+      audio.volume = ASSISTANT_VOLUME;
 
-      // 5. Microphone
-      const stream = await navigator.mediaDevices.getUserMedia({
+      // 5. Microphone — browser AEC + grace period mic gating
+      const micStream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
           noiseSuppression: true,
           autoGainControl: true,
         },
       });
-      pc.addTrack(stream.getTracks()[0]);
 
-      // 6. Data channel — wire listeners inline (not in useEffect)
+      const micTrack = micStream.getAudioTracks()[0];
+      pc.addTrack(micTrack);
+
+      // Mic gating with grace period: mute mic for the first 2s of assistant
+      // playback (browser AEC needs time to converge), then unmute for barge-in.
+      const GRACE_MS = 2000;
+      let graceTimer: ReturnType<typeof setTimeout> | null = null;
+
+      const startGrace = () => {
+        // Mute mic immediately when assistant starts speaking
+        const sender = pc.getSenders().find((s) => s.track?.kind === "audio");
+        if (sender?.track) sender.track.enabled = false;
+
+        // Unmute after grace period to allow barge-in
+        if (graceTimer) clearTimeout(graceTimer);
+        graceTimer = setTimeout(() => {
+          const s = pc.getSenders().find((s) => s.track?.kind === "audio");
+          if (s?.track) s.track.enabled = true;
+          graceTimer = null;
+        }, GRACE_MS);
+      };
+
+      const endGrace = () => {
+        if (graceTimer) { clearTimeout(graceTimer); graceTimer = null; }
+        const sender = pc.getSenders().find((s) => s.track?.kind === "audio");
+        if (sender?.track) sender.track.enabled = true;
+      };
+
+      pc.ontrack = (e) => {
+        audio.srcObject = e.streams[0];
+      };
+
+      // 7. Data channel — wire listeners inline (not in useEffect)
       const dc = pc.createDataChannel("oai-events");
       dcRef.current = dc;
 
@@ -207,17 +239,21 @@ export function useVoiceSession(): UseVoiceSessionReturn {
           // output_audio_buffer.stopped = speaker finished playing all buffered audio
           if (event.type === "response.created") {
             firstAudioReceived = false;
-          } else if (event.type === "output_audio_buffer.started" && !firstAudioReceived) {
-            firstAudioReceived = true;
-            if (eventWsRef.current?.readyState === WebSocket.OPEN && currentDebugTurnId) {
-              eventWsRef.current.send(JSON.stringify({
-                type: "client_debug_event",
-                stage: "audio_playback_start",
-                turn_id: currentDebugTurnId,
-                ts: Date.now(),
-              }));
+          } else if (event.type === "output_audio_buffer.started") {
+            startGrace();
+            if (!firstAudioReceived) {
+              firstAudioReceived = true;
+              if (eventWsRef.current?.readyState === WebSocket.OPEN && currentDebugTurnId) {
+                eventWsRef.current.send(JSON.stringify({
+                  type: "client_debug_event",
+                  stage: "audio_playback_start",
+                  turn_id: currentDebugTurnId,
+                  ts: Date.now(),
+                }));
+              }
             }
           } else if (event.type === "output_audio_buffer.stopped") {
+            endGrace();
             if (eventWsRef.current?.readyState === WebSocket.OPEN && currentDebugTurnId) {
               eventWsRef.current.send(JSON.stringify({
                 type: "client_debug_event",
@@ -263,7 +299,7 @@ export function useVoiceSession(): UseVoiceSessionReturn {
         }
       });
 
-      // 7. Connection state
+      // 8. Connection state
       pc.onconnectionstatechange = () => {
         const state = pc.connectionState;
         if (state === "connected") {
@@ -276,7 +312,7 @@ export function useVoiceSession(): UseVoiceSessionReturn {
         }
       };
 
-      // 8. SDP exchange
+      // 9. SDP exchange
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
 
