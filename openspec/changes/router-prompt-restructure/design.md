@@ -6,12 +6,13 @@ This means the YAML is **data**, not a prompt template. The prompt text is gener
 
 ## Decision: Departments drive both prompt and tool definition
 
-Each department entry in the YAML contains `description`, `triggers`, and `tool`. From this single source:
+Each department entry in the YAML contains `description`, `triggers`, `fillers`, and `tool`. From this single source:
 
 1. **Prompt generation**: The builder iterates departments to produce the routing rules section (replacing the old `decision_rules` + `departments` duplication).
 2. **Tool definition**: `ROUTE_TOOL_DEFINITION` is generated dynamically — the `department` enum is built from the YAML keys. No more hardcoded enum list.
 3. **Department enum**: The Python `Department` enum is validated against (or replaced by) the YAML department keys at load time.
 4. **Coordinator dispatch**: The coordinator reads `dept_config.tool` to resolve the specialist tool name instead of `f"specialist_{department}"`.
+5. **Filler selection**: The coordinator picks a random filler from `dept_config.fillers` instead of the hardcoded `"Un momento, por favor."`. Each department has contextually relevant fillers.
 
 ## Decision: Keep Department as a runtime-validated set, not a static enum
 
@@ -39,6 +40,7 @@ load_router_prompt() → RouterPromptConfig (dataclass)
         ├── departments: dict[str, DepartmentConfig]
         │       ├── description: str
         │       ├── triggers: list[str]
+        │       ├── fillers: list[str]  (empty for "direct")
         │       └── tool: str | None  (None for "direct")
         ├── guardrails: list[str]
         └── language_instruction: str
@@ -50,15 +52,25 @@ RouterPromptBuilder (runtime)
         │       ├── assembles prompt from config sections
         │       └── generates ROUTE_TOOL_DEFINITION dynamically
         │
-        └── get_department_tool(department) → str | None
-                └── used by Coordinator to resolve tool name
+        ├── get_department_tool(department) → str | None
+        │       └── used by Coordinator to resolve tool name
+        │
+        └── get_department_filler(department) → str | None
+                └── returns random filler from dept's list (None if empty)
 
 Coordinator
         │
         └── on model_router_action:
                 tool_name = builder.get_department_tool(department)
-                                    # instead of f"specialist_{department}"
+                filler = builder.get_department_filler(department)
+                # instead of f"specialist_{department}" and "Un momento, por favor."
 ```
+
+## Decision: Per-department fillers replace hardcoded filler string
+
+The coordinator currently has a hardcoded `prompt="Un momento, por favor."` (line 670) used as a filler while the specialist tool executes. This is always in Spanish and generic. Each department in the YAML now includes a `fillers` list of contextually relevant messages. The `RouterPromptBuilder` exposes `get_department_filler(department: str) -> str | None` which picks a random entry from the department's fillers list. The coordinator calls this instead of using the hardcoded string. The `direct` department has an empty fillers list (no filler needed — the model speaks directly).
+
+Alternative considered: Having the model generate the filler dynamically. Rejected because the model already generates a spoken filler via the two-step routing (it speaks while calling the function). The `RealtimeVoiceStart` filler is a backup/silence-fill — it needs to be instant, not LLM-generated.
 
 ## File changes
 
@@ -66,7 +78,7 @@ Coordinator
 |------|--------|
 | `router_registry/v1/router_prompt.yaml` | Restructure from 5 text sections to structured format |
 | `backend/src/routing/model_router.py` | Replace `RouterPromptTemplate` with `RouterPromptConfig` + `DepartmentConfig`. Replace static `ROUTE_TOOL_DEFINITION` and `Department` enum with dynamic generation. Add `get_department_tool()` method. |
-| `backend/src/voice_runtime/coordinator.py` | Change specialist tool resolution from `f"specialist_{department}"` to `builder.get_department_tool(department)` |
+| `backend/src/voice_runtime/coordinator.py` | Change specialist tool resolution from `f"specialist_{department}"` to `builder.get_department_tool(department)`. Change filler from hardcoded string to `builder.get_department_filler(department)`. |
 | `backend/tests/unit/test_model_router.py` | Update for new YAML structure and dynamic generation |
 | `backend/tests/unit/test_two_step_routing.py` | Update fixtures for new YAML structure |
 | `backend/tests/e2e/test_event_pipeline.py` | Update fixtures if needed |
