@@ -3,7 +3,7 @@
 ### Requirement: Router prompt template definition
 _Replaces: "Router prompt template definition"_
 
-The model-router SHALL define a router configuration stored in `router_registry/v1/router_prompt.yaml`. The configuration SHALL use structured data (not free-text prompt sections) with: (1) `identity` — agent persona as a text string, (2) `departments` — a dict where each key is a department name and each value contains `description` (str), `triggers` (list of strings), and optionally `tool` (specialist function name, absent for `direct`), (3) `guardrails` — a list of behavioral restriction strings, (4) `language_instruction` — language matching rules as a text string. The tool-calling mechanics (`system_mechanic`) SHALL be generated as a constant by the builder, not stored in the YAML.
+The model-router SHALL define a router configuration stored in `router_registry/v1/router_prompt.yaml`. The configuration SHALL use structured data (not free-text prompt sections) with: (1) `identity` — agent persona as a text string, (2) `departments` — a dict where each key is a department name and each value contains `description` (str), `triggers` (list of strings), `fillers` (list of filler message strings, empty for `direct`), and optionally `tool` (specialist endpoint config, absent for `direct`), (3) `guardrails` — a list of behavioral restriction strings, (4) `language_instruction` — language matching rules as a text string. The tool-calling mechanics (`system_mechanic`) SHALL be generated as a constant by the builder, not stored in the YAML.
 
 #### Scenario: Structured YAML loaded at startup
 - **WHEN** the application starts and calls `load_router_prompt()`
@@ -11,11 +11,11 @@ The model-router SHALL define a router configuration stored in `router_registry/
 
 #### Scenario: Department config parsed with tool binding
 - **WHEN** the YAML contains a department `billing` with `tool: "specialist_billing"`
-- **THEN** the loaded `DepartmentConfig` for `billing` SHALL have `tool="specialist_billing"`, `description` (str), and `triggers` (list of str)
+- **THEN** the loaded `DepartmentConfig` for `billing` SHALL have `tool="specialist_billing"`, `description` (str), `triggers` (list of str), and `fillers` (list of str)
 
 #### Scenario: Direct department has no tool binding
 - **WHEN** the YAML contains a department `direct` without a `tool` field
-- **THEN** the loaded `DepartmentConfig` for `direct` SHALL have `tool=None`
+- **THEN** the loaded `DepartmentConfig` for `direct` SHALL have `tool=None` and `fillers=[]`
 
 #### Scenario: Missing required YAML sections
 - **WHEN** the YAML is missing `identity`, `departments`, `guardrails`, or `language_instruction`
@@ -78,4 +78,21 @@ The `RouterPromptBuilder` SHALL assemble the system prompt at runtime from the s
 
 #### Scenario: get_department_tool returns None for direct
 - **WHEN** `get_department_tool("direct")` is called and `direct` has no `tool` field
+- **THEN** it SHALL return `None`
+
+### Requirement: Per-department filler selection
+_New requirement — replaces hardcoded filler in coordinator_
+
+The `RouterPromptBuilder` SHALL expose `get_department_filler(department: str) -> str | None` which returns a randomly selected filler message from the department's `fillers` list. If the department has an empty `fillers` list or the department is unknown, it SHALL return `None`.
+
+#### Scenario: Filler selected from department list
+- **WHEN** `get_department_filler("billing")` is called and billing has fillers `["Let me connect you with billing", "One moment, checking your account"]`
+- **THEN** it SHALL return one of the two filler strings
+
+#### Scenario: No filler for direct department
+- **WHEN** `get_department_filler("direct")` is called and direct has `fillers=[]`
+- **THEN** it SHALL return `None`
+
+#### Scenario: No filler for unknown department
+- **WHEN** `get_department_filler("nonexistent")` is called
 - **THEN** it SHALL return `None`
