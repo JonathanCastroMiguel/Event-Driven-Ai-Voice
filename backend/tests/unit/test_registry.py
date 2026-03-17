@@ -1,5 +1,3 @@
-import os
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -51,51 +49,7 @@ class TestRegistryLoader:
         assert registry.thresholds.filler_start_after_ms == 350
         assert registry.thresholds.filler_max_ms == 1200
 
-    def test_route_a_locales_loaded(self, registry: RouterRegistry) -> None:
-        assert "base" in registry.route_a_examples
-        assert "es" in registry.route_a_examples
-        assert "en" in registry.route_a_examples
-
-    def test_route_a_examples_have_classes(self, registry: RouterRegistry) -> None:
-        es = registry.get_route_a_examples("es")
-        assert "simple" in es
-        assert "disallowed" in es
-        assert "out_of_scope" in es
-        assert "domain" in es
-        assert len(es["simple"]) > 0
-
-    def test_language_fallback_to_base(self, registry: RouterRegistry) -> None:
-        fr_examples = registry.get_route_a_examples("fr")
-        base_examples = registry.get_route_a_examples("base")
-        assert fr_examples == base_examples
-
-    def test_lexicon_loaded(self, registry: RouterRegistry) -> None:
-        es_lex = registry.get_lexicon("es")
-        assert "idiota" in es_lex
-        en_lex = registry.get_lexicon("en")
-        assert "idiot" in en_lex
-
-    def test_lexicon_case_insensitive(self, registry: RouterRegistry) -> None:
-        es_lex = registry.get_lexicon("es")
-        # All stored lowercase
-        for word in es_lex:
-            assert word == word.lower()
-
-    def test_lexicon_missing_language_returns_empty(self, registry: RouterRegistry) -> None:
-        assert registry.get_lexicon("fr") == set()
-
-    def test_short_utterances_loaded(self, registry: RouterRegistry) -> None:
-        es_short = registry.get_short_utterances("es")
-        assert "greetings" in es_short
-        assert "acknowledgements" in es_short
-        assert "hola" in es_short["greetings"]
-
-    def test_short_utterances_missing_language_returns_empty(self, registry: RouterRegistry) -> None:
-        assert registry.get_short_utterances("fr") == {}
-
     def test_missing_thresholds_raises(self, tmp_path: Path) -> None:
-        (tmp_path / "route_a").mkdir()
-        (tmp_path / "route_b").mkdir()
         with pytest.raises(FileNotFoundError, match="thresholds.yaml"):
             load_registry(str(tmp_path))
 

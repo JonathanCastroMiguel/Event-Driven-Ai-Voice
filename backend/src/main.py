@@ -59,18 +59,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.policies = policies
     logger.info("policies_loaded")
 
-    # 5. Load embedding model and precompute centroids
-    from src.routing.embeddings import EmbeddingEngine
-    from src.routing.router import Router
-
-    engine = EmbeddingEngine.load()
-    router = Router(registry=registry, embedding_engine=engine)
-    router.precompute_centroids()
-    app.state.router = router
-    app.state.models_loaded = True
-    logger.info("embedding_model_loaded_and_centroids_computed")
-
-    # 5b. Load model-as-router prompt template
+    # 5. Load model-as-router prompt template
     from src.routing.model_router import RouterPromptBuilder, load_router_prompt
 
     router_prompt_template = load_router_prompt(settings.router_registry_path)
