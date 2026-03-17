@@ -1,7 +1,7 @@
 ## Tasks
 
-### YAML restructure
-- [ ] Rewrite `router_registry/v1/router_prompt.yaml` with structured format: `identity` (str), `departments` (dict with description/triggers/fillers/tool), `guardrails` (list), `language_instruction` (str). Remove `decision_rules` and flat `departments` text sections. The `tool` field is an object `{ type, name/url, auth }` for specialist departments, `null` for `direct`.
+### JSON config file
+- [ ] Create `router_registry/v1/router_prompt.json` with the exact target API payload structure from design.md. Delete the old `router_prompt.yaml`.
 
 ### model_router.py refactor
 - [ ] Add `ToolConfig` dataclass (type: str, name: str | None, url: str | None, auth: str | None) for specialist endpoint configuration.
@@ -14,13 +14,13 @@
 - [ ] Add `RouterPromptBuilder.get_department_filler(department: str) -> str | None` method (random selection from dept's fillers list, `None` if empty/unknown).
 - [ ] Update `build_response_create` to use the dynamically generated tool definition.
 - [ ] Update `parse_function_call_action` to accept a `valid_departments: set[str]` parameter instead of using the static `Department` enum.
-- [ ] Update `load_router_prompt` to parse the new structured YAML format and return `RouterPromptConfig`. Parse `tool` field as `ToolConfig` when present.
+- [ ] Rewrite `load_router_prompt` to load the JSON file and return `RouterPromptConfig`. Add `load_router_prompt_from_dict(data: dict) -> RouterPromptConfig` that accepts a Python dict matching the target API payload structure (same parsing logic, no file I/O). `load_router_prompt` reads the JSON file and delegates to `load_router_prompt_from_dict`. Both paths produce the same `RouterPromptConfig`.
 
 ### Coordinator update
 - [ ] Update coordinator to resolve specialist tool via `self._router_prompt_builder.get_department_tool(department)` returning `ToolConfig | None` instead of `f"specialist_{department}"`. For MVP, extract tool name from `ToolConfig.name` for `internal` type tools.
 - [ ] Replace hardcoded filler `"Un momento, por favor."` with `self._router_prompt_builder.get_department_filler(department)`. Skip filler emission if `None` returned.
 
 ### Test updates
-- [ ] Update `test_model_router.py` — new YAML fixtures with `ToolConfig` objects, test dynamic tool definition generation, test `get_department_tool` returns `ToolConfig`, test `get_department_filler`, test structured config loading, test prompt assembly.
-- [ ] Update `test_two_step_routing.py` — update fixtures for new YAML structure if needed.
+- [ ] Update `test_model_router.py` — JSON fixtures with `ToolConfig` objects, test dynamic tool definition generation, test `get_department_tool` returns `ToolConfig`, test `get_department_filler`, test structured config loading from dict, test prompt assembly.
+- [ ] Update `test_two_step_routing.py` — update fixtures for new JSON structure if needed.
 - [ ] Run full test suite and fix any breakage from the refactor.

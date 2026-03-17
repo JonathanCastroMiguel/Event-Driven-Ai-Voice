@@ -3,7 +3,7 @@
 ### Requirement: Router prompt template definition
 _Replaces: "Router prompt template definition"_
 
-The model-router SHALL consume a router configuration that conforms to the **Target API payload structure** defined in design.md. The configuration follows this JSON contract (loaded from YAML in MVP, from API in future — the runtime SHALL consume the same shape regardless of source):
+The model-router SHALL consume a router configuration that conforms to the **Target API payload structure** defined in design.md. The configuration is a JSON object with this contract:
 
 ```json
 {
@@ -21,49 +21,49 @@ The model-router SHALL consume a router configuration that conforms to the **Tar
 }
 ```
 
-During MVP, this is stored in `router_registry/v1/router_prompt.yaml` as structured YAML (not free-text prompt sections). The `tool` field is an object with `type` (internal, mcp, rag, langgraph, rest), optional `name` (for internal), optional `url` (for remote), and optional `auth` (secret reference); or `null` for the `direct` department. The tool-calling mechanics (`system_mechanic`) SHALL be generated as a constant by the builder, not stored in the config.
+During MVP, this JSON is stored locally in `router_registry/v1/router_prompt.json` — the exact same structure that will arrive from the API in the future. The runtime SHALL consume this shape identically regardless of whether it was loaded from a local file or received from an API call. The `tool` field is an object with `type` (internal, mcp, rag, langgraph, rest), optional `name` (for internal), optional `url` (for remote), and optional `auth` (secret reference); or `null` for the `direct` department. The tool-calling mechanics (`system_mechanic`) SHALL be generated as a constant by the builder, not stored in the config.
 
-#### Scenario: Structured YAML loaded at startup
+#### Scenario: JSON config loaded at startup
 - **WHEN** the application starts and calls `load_router_prompt()`
-- **THEN** it SHALL parse the YAML into a `RouterPromptConfig` containing `identity` (str), `departments` (dict of `DepartmentConfig`), `guardrails` (list of str), and `language_instruction` (str)
+- **THEN** it SHALL read the JSON file and parse it into a `RouterPromptConfig` containing `identity` (str), `departments` (dict of `DepartmentConfig`), `guardrails` (list of str), and `language_instruction` (str)
 
 #### Scenario: Department config parsed with tool binding
-- **WHEN** the YAML contains a department `billing` with `tool: { type: "internal", name: "specialist_billing" }`
+- **WHEN** the JSON contains a department `billing` with `tool: { type: "internal", name: "specialist_billing" }`
 - **THEN** the loaded `DepartmentConfig` for `billing` SHALL have `tool` as a `ToolConfig(type="internal", name="specialist_billing")`, `description` (str), `triggers` (list of str), and `fillers` (list of str)
 
 #### Scenario: Direct department has no tool binding
-- **WHEN** the YAML contains a department `direct` without a `tool` field
+- **WHEN** the JSON contains a department `direct` with `tool: null`
 - **THEN** the loaded `DepartmentConfig` for `direct` SHALL have `tool=None` and `fillers=[]`
 
 #### Scenario: Config loaded from dict (API response)
 - **WHEN** the system receives the router configuration as a Python dict (e.g., from a JSON API response) matching the target payload structure
-- **THEN** it SHALL parse it into the same `RouterPromptConfig` as the YAML path, with identical behavior
+- **THEN** `load_router_prompt_from_dict(data)` SHALL parse it into the same `RouterPromptConfig` as the file path, with identical behavior
 
-#### Scenario: Missing required YAML sections
-- **WHEN** the YAML is missing `identity`, `departments`, `guardrails`, or `language_instruction`
-- **THEN** `load_router_prompt()` SHALL raise a `ValueError` with a descriptive message
+#### Scenario: Missing required fields
+- **WHEN** the JSON is missing `identity`, `departments`, `guardrails`, or `language_instruction`
+- **THEN** `load_router_prompt_from_dict()` SHALL raise a `ValueError` with a descriptive message
 
 #### Scenario: Missing router prompt file
-- **WHEN** `router_prompt.yaml` does not exist at the expected path
-- **THEN** the system SHALL raise a `FileNotFoundError` with a descriptive message
+- **WHEN** `router_prompt.json` does not exist at the expected path
+- **THEN** `load_router_prompt()` SHALL raise a `FileNotFoundError` with a descriptive message
 
 ### Requirement: Dynamic ROUTE_TOOL_DEFINITION generation
 _Replaces: part of "Department.DIRECT enum value" — tool definition is no longer static_
 
-The `ROUTE_TOOL_DEFINITION` SHALL be generated dynamically from the loaded department configuration. The `department` parameter enum SHALL be built from the keys of the `departments` dict in the YAML. The tool description SHALL remain fixed (classify every user message).
+The `ROUTE_TOOL_DEFINITION` SHALL be generated dynamically from the loaded department configuration. The `department` parameter enum SHALL be built from the keys of the `departments` dict in the config. The tool description SHALL remain fixed (classify every user message).
 
-#### Scenario: Tool definition matches YAML departments
-- **WHEN** the YAML defines departments `direct`, `sales`, `billing`, `support`, `retention`
+#### Scenario: Tool definition matches config departments
+- **WHEN** the config defines departments `direct`, `sales`, `billing`, `support`, `retention`
 - **THEN** `ROUTE_TOOL_DEFINITION["parameters"]["properties"]["department"]["enum"]` SHALL be `["direct", "sales", "billing", "support", "retention"]`
 
-#### Scenario: Adding a department to YAML updates tool definition
-- **WHEN** a new department `escalation` is added to the YAML
+#### Scenario: Adding a department to config updates tool definition
+- **WHEN** a new department `escalation` is added to the JSON config
 - **THEN** the generated tool definition SHALL include `"escalation"` in the enum without code changes
 
 ### Requirement: Dynamic department validation
 _Replaces: "Department.DIRECT enum value" — static enum replaced by runtime validation_
 
-The system SHALL validate department names from function call arguments against the set of department keys loaded from YAML. The static `Department(str, Enum)` SHALL be replaced by a `valid_departments: set[str]` attribute on the config. `parse_function_call_action` SHALL accept the valid set and reject unknown department names.
+The system SHALL validate department names from function call arguments against the set of department keys loaded from config. The static `Department(str, Enum)` SHALL be replaced by a `valid_departments: set[str]` attribute on the config. `parse_function_call_action` SHALL accept the valid set and reject unknown department names.
 
 #### Scenario: Valid department parsed
 - **WHEN** `parse_function_call_action` receives `{"department": "billing", "summary": "invoice issue"}` and `billing` is in the valid set
@@ -99,7 +99,7 @@ The `RouterPromptBuilder` SHALL assemble the system prompt at runtime from the s
 - **THEN** it SHALL return the `ToolConfig` object
 
 #### Scenario: get_department_tool returns None for direct
-- **WHEN** `get_department_tool("direct")` is called and `direct` has no `tool` field
+- **WHEN** `get_department_tool("direct")` is called and `direct` has `tool: null`
 - **THEN** it SHALL return `None`
 
 ### Requirement: Per-department filler selection
