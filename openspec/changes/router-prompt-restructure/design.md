@@ -28,6 +28,130 @@ The tool-calling mechanics ("ALWAYS call route_to_specialist", "never vocalize f
 
 Guardrails become a YAML list of strings. The builder joins them with newline-prefixed bullets when assembling the prompt. This makes it easy to add/remove individual guardrails via API without parsing free text.
 
+## Target API payload structure
+
+This is the structure that will arrive from the API (or be loaded from YAML during MVP). The runtime consumes this identical shape regardless of source.
+
+```json
+{
+  "identity": "You are a professional call center voice assistant for a telecommunications company. You are warm, concise, and empathetic.",
+
+  "departments": {
+    "direct": {
+      "description": "Handle directly without specialist",
+      "triggers": [
+        "Greetings and small talk",
+        "General knowledge questions (math, facts, time, weather)",
+        "Inappropriate language — calmly redirect",
+        "Out of scope — explain you handle account, billing, sales, and support",
+        "Unclear input — ask to repeat or clarify"
+      ],
+      "fillers": [],
+      "tool": null
+    },
+    "billing": {
+      "description": "Billing and payment department",
+      "triggers": [
+        "Any question about invoices and their charges",
+        "Claims for unrecognized charges",
+        "Payment method changes or updates",
+        "Questions about due dates or payment deadlines",
+        "Refund requests"
+      ],
+      "fillers": [
+        "Let me connect you with our billing team.",
+        "One moment, I'll check that with billing.",
+        "Let me get a billing specialist for you."
+      ],
+      "tool": {
+        "type": "internal",
+        "name": "specialist_billing"
+      }
+    },
+    "sales": {
+      "description": "Sales department",
+      "triggers": [
+        "Plan upgrades or downgrades",
+        "New plan inquiries and comparisons",
+        "Current promotions and offers",
+        "Add-on services"
+      ],
+      "fillers": [
+        "Let me connect you with our sales team.",
+        "One moment, I'll get a sales specialist.",
+        "Let me check what options we have for you."
+      ],
+      "tool": {
+        "type": "langgraph",
+        "url": "https://agents.example.com/sales/invoke",
+        "auth": "bearer_token_ref"
+      }
+    },
+    "support": {
+      "description": "Technical support department",
+      "triggers": [
+        "Internet connectivity issues or outages",
+        "Device configuration or problems",
+        "Service speed or quality complaints",
+        "Troubleshooting requests"
+      ],
+      "fillers": [
+        "Let me connect you with technical support.",
+        "One moment, I'll get someone to help with that.",
+        "Let me check that with our support team."
+      ],
+      "tool": {
+        "type": "mcp",
+        "url": "https://mcp.example.com/support",
+        "auth": "api_key_ref"
+      }
+    },
+    "retention": {
+      "description": "Retention department",
+      "triggers": [
+        "Service cancellation requests",
+        "Plan downgrade due to dissatisfaction",
+        "Complaints about service quality or pricing",
+        "Threats to switch provider"
+      ],
+      "fillers": [
+        "Let me connect you with a specialist who can help.",
+        "One moment, I want to make sure we find the best solution for you.",
+        "Let me get someone who can look into this for you."
+      ],
+      "tool": {
+        "type": "rag",
+        "url": "https://rag.example.com/retention/query",
+        "auth": null
+      }
+    }
+  },
+
+  "guardrails": [
+    "Never provide medical, legal, or financial advice",
+    "Never share personal opinions on politics, religion, or controversial topics",
+    "Never pretend to access systems or data you cannot reach",
+    "If the user is aggressive, remain calm and professional",
+    "If unsure which department, ask a brief clarifying question instead of guessing",
+    "If the user asks something unrelated to telecom, answer briefly and redirect"
+  ],
+
+  "language_instruction": "Respond in the same language the customer is speaking. If unsure, default to Spanish (es-ES). Never respond in a language the customer is not using."
+}
+```
+
+**Tool types:**
+
+| type | Description | Invocation |
+|------|-------------|------------|
+| `internal` | Local registered function (mock/demo) | Direct call via ToolExecutor |
+| `mcp` | MCP server | MCP protocol |
+| `rag` | RAG endpoint | POST with query + history |
+| `langgraph` | LangGraph/LangChain agent | POST invoke with state |
+| `rest` | Generic REST API | POST with configurable payload |
+
+The `auth` field is a reference to a secret (never inline tokens), or `null` if no auth required. The `direct` department always has `tool: null` — no specialist is invoked, the router model speaks directly.
+
 ## Architecture
 
 ```
@@ -41,7 +165,10 @@ load_router_prompt() → RouterPromptConfig (dataclass)
         │       ├── description: str
         │       ├── triggers: list[str]
         │       ├── fillers: list[str]  (empty for "direct")
-        │       └── tool: str | None  (None for "direct")
+        │       └── tool: ToolConfig | None  (None for "direct")
+        │               ├── type: str  (internal|mcp|rag|langgraph|rest)
+        │               ├── name/url: str
+        │               └── auth: str | None
         ├── guardrails: list[str]
         └── language_instruction: str
         │

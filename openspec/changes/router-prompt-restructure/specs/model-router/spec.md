@@ -3,19 +3,41 @@
 ### Requirement: Router prompt template definition
 _Replaces: "Router prompt template definition"_
 
-The model-router SHALL define a router configuration stored in `router_registry/v1/router_prompt.yaml`. The configuration SHALL use structured data (not free-text prompt sections) with: (1) `identity` — agent persona as a text string, (2) `departments` — a dict where each key is a department name and each value contains `description` (str), `triggers` (list of strings), `fillers` (list of filler message strings, empty for `direct`), and optionally `tool` (specialist endpoint config, absent for `direct`), (3) `guardrails` — a list of behavioral restriction strings, (4) `language_instruction` — language matching rules as a text string. The tool-calling mechanics (`system_mechanic`) SHALL be generated as a constant by the builder, not stored in the YAML.
+The model-router SHALL consume a router configuration that conforms to the **Target API payload structure** defined in design.md. The configuration follows this JSON contract (loaded from YAML in MVP, from API in future — the runtime SHALL consume the same shape regardless of source):
+
+```json
+{
+  "identity": "str",
+  "departments": {
+    "<name>": {
+      "description": "str",
+      "triggers": ["str"],
+      "fillers": ["str"],
+      "tool": { "type": "internal|mcp|rag|langgraph|rest", "name": "str?", "url": "str?", "auth": "str?" } | null
+    }
+  },
+  "guardrails": ["str"],
+  "language_instruction": "str"
+}
+```
+
+During MVP, this is stored in `router_registry/v1/router_prompt.yaml` as structured YAML (not free-text prompt sections). The `tool` field is an object with `type` (internal, mcp, rag, langgraph, rest), optional `name` (for internal), optional `url` (for remote), and optional `auth` (secret reference); or `null` for the `direct` department. The tool-calling mechanics (`system_mechanic`) SHALL be generated as a constant by the builder, not stored in the config.
 
 #### Scenario: Structured YAML loaded at startup
 - **WHEN** the application starts and calls `load_router_prompt()`
 - **THEN** it SHALL parse the YAML into a `RouterPromptConfig` containing `identity` (str), `departments` (dict of `DepartmentConfig`), `guardrails` (list of str), and `language_instruction` (str)
 
 #### Scenario: Department config parsed with tool binding
-- **WHEN** the YAML contains a department `billing` with `tool: "specialist_billing"`
-- **THEN** the loaded `DepartmentConfig` for `billing` SHALL have `tool="specialist_billing"`, `description` (str), `triggers` (list of str), and `fillers` (list of str)
+- **WHEN** the YAML contains a department `billing` with `tool: { type: "internal", name: "specialist_billing" }`
+- **THEN** the loaded `DepartmentConfig` for `billing` SHALL have `tool` as a `ToolConfig(type="internal", name="specialist_billing")`, `description` (str), `triggers` (list of str), and `fillers` (list of str)
 
 #### Scenario: Direct department has no tool binding
 - **WHEN** the YAML contains a department `direct` without a `tool` field
 - **THEN** the loaded `DepartmentConfig` for `direct` SHALL have `tool=None` and `fillers=[]`
+
+#### Scenario: Config loaded from dict (API response)
+- **WHEN** the system receives the router configuration as a Python dict (e.g., from a JSON API response) matching the target payload structure
+- **THEN** it SHALL parse it into the same `RouterPromptConfig` as the YAML path, with identical behavior
 
 #### Scenario: Missing required YAML sections
 - **WHEN** the YAML is missing `identity`, `departments`, `guardrails`, or `language_instruction`
@@ -54,7 +76,7 @@ The system SHALL validate department names from function call arguments against 
 ### Requirement: RouterPromptBuilder assembles prompt from structured config
 _Replaces: "RouterPromptBuilder builds response.create payloads"_
 
-The `RouterPromptBuilder` SHALL assemble the system prompt at runtime from the structured `RouterPromptConfig`. The assembled prompt SHALL concatenate: (1) system mechanics (constant text about mandatory tool calling), (2) identity from config, (3) routing rules generated from departments (each department with its description and triggers), (4) guardrails joined as a bulleted list, (5) language instruction from config. The builder SHALL also expose `get_department_tool(department: str) -> str | None` to resolve the specialist tool name for a given department.
+The `RouterPromptBuilder` SHALL assemble the system prompt at runtime from the structured `RouterPromptConfig`. The assembled prompt SHALL concatenate: (1) system mechanics (constant text about mandatory tool calling), (2) identity from config, (3) routing rules generated from departments (each department with its description and triggers), (4) guardrails joined as a bulleted list, (5) language instruction from config. The builder SHALL also expose `get_department_tool(department: str) -> ToolConfig | None` to resolve the specialist tool config for a given department.
 
 #### Scenario: Prompt assembled from config
 - **WHEN** `build_response_create` is called
@@ -73,8 +95,8 @@ The `RouterPromptBuilder` SHALL assemble the system prompt at runtime from the s
 - **THEN** the payload SHALL include the dynamically generated `ROUTE_TOOL_DEFINITION` in `tools` and `tool_choice: "required"`
 
 #### Scenario: get_department_tool resolves specialist tool
-- **WHEN** `get_department_tool("billing")` is called and the config has `billing.tool = "specialist_billing"`
-- **THEN** it SHALL return `"specialist_billing"`
+- **WHEN** `get_department_tool("billing")` is called and the config has `billing.tool = ToolConfig(type="internal", name="specialist_billing")`
+- **THEN** it SHALL return the `ToolConfig` object
 
 #### Scenario: get_department_tool returns None for direct
 - **WHEN** `get_department_tool("direct")` is called and `direct` has no `tool` field
