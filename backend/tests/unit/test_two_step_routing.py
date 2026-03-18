@@ -1,15 +1,14 @@
-"""Unit tests for two-step routing: Department.DIRECT parsing, specialist tools, coordinator delegation."""
+"""Unit tests for two-step routing: department parsing, specialist tools, coordinator delegation."""
 
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 from uuid import uuid4
 
 import pytest
 
 from src.routing.model_router import (
-    Department,
     ModelRouterAction,
     parse_function_call_action,
 )
@@ -20,6 +19,8 @@ from src.voice_runtime.specialist_tools import (
     specialist_sales,
     specialist_support,
 )
+
+VALID_DEPARTMENTS = {"direct", "sales", "billing", "support", "retention"}
 
 
 # ---------------------------------------------------------------------------
@@ -32,16 +33,18 @@ class TestParseFunctionCallDirect:
         result = parse_function_call_action(
             "route_to_specialist",
             '{"department": "direct", "summary": "greeting"}',
+            VALID_DEPARTMENTS,
         )
         assert result is not None
-        assert result.department == Department.DIRECT
+        assert result.department == "direct"
         assert result.summary == "greeting"
 
     def test_all_departments_parsed(self) -> None:
-        for dept in Department:
+        for dept in VALID_DEPARTMENTS:
             result = parse_function_call_action(
                 "route_to_specialist",
-                f'{{"department": "{dept.value}", "summary": "test"}}',
+                f'{{"department": "{dept}", "summary": "test"}}',
+                VALID_DEPARTMENTS,
             )
             assert result is not None
             assert result.department == dept
@@ -50,6 +53,7 @@ class TestParseFunctionCallDirect:
         result = parse_function_call_action(
             "some_other_function",
             '{"department": "direct", "summary": "test"}',
+            VALID_DEPARTMENTS,
         )
         assert result is None
 
@@ -57,6 +61,7 @@ class TestParseFunctionCallDirect:
         result = parse_function_call_action(
             "route_to_specialist",
             '{"department": ',
+            VALID_DEPARTMENTS,
         )
         assert result is None
 
@@ -64,6 +69,7 @@ class TestParseFunctionCallDirect:
         result = parse_function_call_action(
             "route_to_specialist",
             '{"department": "unknown", "summary": "test"}',
+            VALID_DEPARTMENTS,
         )
         assert result is None
 

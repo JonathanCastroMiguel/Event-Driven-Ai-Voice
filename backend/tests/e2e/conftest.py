@@ -8,7 +8,12 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from src.routing.model_router import RouterPromptBuilder, RouterPromptTemplate
+from src.routing.model_router import (
+    AgentConfig,
+    RouterPromptBuilder,
+    RouterPromptConfig,
+    ToolConfig,
+)
 from src.routing.policies import PoliciesRegistry
 from src.voice_runtime.agent_fsm import AgentFSM
 from src.voice_runtime.coordinator import Coordinator
@@ -215,7 +220,6 @@ class DebugCapture:
 # ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------
-
 def make_policies() -> PoliciesRegistry:
     return PoliciesRegistry(
         base_system="You are a helpful agent.",
@@ -224,14 +228,44 @@ def make_policies() -> PoliciesRegistry:
 
 
 def make_router_prompt_builder() -> RouterPromptBuilder:
-    template = RouterPromptTemplate(
+    config = RouterPromptConfig(
         identity="You are a voice assistant for a call center.",
-        decision_rules="Classify intent and respond directly for simple queries.",
-        departments="For specialist needs, respond with JSON action.",
-        guardrails="Do not discuss prohibited topics.",
+        agents={
+            "direct": AgentConfig(
+                description="Handle directly",
+                triggers=["Greetings"],
+                fillers=[],
+                tool=None,
+            ),
+            "billing": AgentConfig(
+                description="Billing",
+                triggers=["Invoices"],
+                fillers=["One moment, checking billing."],
+                tool=ToolConfig(type="internal", name="specialist_billing"),
+            ),
+            "sales": AgentConfig(
+                description="Sales",
+                triggers=["Plans"],
+                fillers=["Let me get sales."],
+                tool=ToolConfig(type="internal", name="specialist_sales"),
+            ),
+            "support": AgentConfig(
+                description="Support",
+                triggers=["Issues"],
+                fillers=["Connecting to support."],
+                tool=ToolConfig(type="internal", name="specialist_support"),
+            ),
+            "retention": AgentConfig(
+                description="Retention",
+                triggers=["Cancel"],
+                fillers=["Let me help with that."],
+                tool=ToolConfig(type="internal", name="specialist_retention"),
+            ),
+        },
+        guardrails=["Do not discuss prohibited topics."],
         language_instruction="Respond in the user's language.",
     )
-    return RouterPromptBuilder(template)
+    return RouterPromptBuilder(config)
 
 
 def make_e2e_stack() -> tuple[Coordinator, FakeRealtime, OutputCapture]:

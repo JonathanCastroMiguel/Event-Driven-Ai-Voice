@@ -62,8 +62,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # 5. Load model-as-router prompt template
     from src.routing.model_router import RouterPromptBuilder, load_router_prompt
 
-    router_prompt_template = load_router_prompt(settings.router_registry_path)
-    router_prompt_builder = RouterPromptBuilder(router_prompt_template)
+    router_prompt_config = load_router_prompt(settings.router_registry_path)
+    router_prompt_builder = RouterPromptBuilder(router_prompt_config)
     app.state.router_prompt_builder = router_prompt_builder
     logger.info("router_prompt_builder_loaded")
 
