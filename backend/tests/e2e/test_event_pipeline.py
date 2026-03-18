@@ -109,7 +109,7 @@ class TestTranscriptAsyncLogging:
 class TestModelRouterAction:
     @pytest.mark.asyncio
     async def test_specialist_action_emits_specialist_voice(self) -> None:
-        """model_router_action triggers specialist tool + specialist voice response."""
+        """model_router_action triggers filler + specialist tool + specialist voice response."""
         coord, fake, capture = make_e2e_stack()
         await fake.speech_started()
         await fake.audio_committed()
@@ -118,12 +118,14 @@ class TestModelRouterAction:
         await fake.model_router_action(department="billing", summary="invoice issue")
         events = capture.drain()
         voice_starts = [e for e in events if isinstance(e, RealtimeVoiceStart)]
-        assert len(voice_starts) >= 1
-        # Specialist prompt should reference billing
+        # Expect filler + specialist = at least 2 voice starts (billing has fillers configured)
+        assert len(voice_starts) >= 2
+        # First voice start is the per-department filler
+        filler = voice_starts[0]
+        assert isinstance(filler.prompt, str)
+        # Last voice start is the specialist response
         specialist = voice_starts[-1]
-        assert isinstance(specialist.prompt, list)
-        system_content = " ".join(m["content"] for m in specialist.prompt if m["role"] == "system")
-        assert "billing" in system_content
+        assert specialist.response_source == "specialist"
 
     @pytest.mark.asyncio
     async def test_specialist_action_transitions_fsm(self) -> None:

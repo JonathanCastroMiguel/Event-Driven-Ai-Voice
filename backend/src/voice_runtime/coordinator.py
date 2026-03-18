@@ -658,8 +658,11 @@ class Coordinator:
         # Debug: fill_silence (main flow — parallel to specialist sub-flow)
         await self._send_debug("fill_silence")
 
-        # Filler strategy
-        if self._should_emit_filler():
+        # Filler strategy — per-department filler from config
+        filler_msg: str | None = None
+        if self._router_prompt_builder is not None:
+            filler_msg = self._router_prompt_builder.get_department_filler(department)
+        if filler_msg is not None:
             FILLER_EMITTED_TOTAL.inc()
             filler_voice_id = uuid4()
             await self._emit_output(
@@ -667,7 +670,7 @@ class Coordinator:
                     call_id=self._call_id,
                     agent_generation_id=s.active_agent_generation_id,
                     voice_generation_id=filler_voice_id,
-                    prompt="Un momento, por favor.",
+                    prompt=filler_msg,
                     ts=envelope.ts,
                 )
             )
@@ -680,11 +683,18 @@ class Coordinator:
         # The tool returns a complete response.create payload.
         tool_request_id = uuid4()
         history = self._conversation_buffer.format_messages()
+        # Resolve specialist tool name from config
+        tool_name = f"specialist_{department}"  # fallback
+        if self._router_prompt_builder is not None:
+            tool_config = self._router_prompt_builder.get_department_tool(department)
+            if tool_config is not None and tool_config.name is not None:
+                tool_name = tool_config.name
+
         tool_result = await self._tool_executor.execute(
             call_id=self._call_id,
             agent_generation_id=s.active_agent_generation_id,
             tool_request_id=tool_request_id,
-            tool_name=f"specialist_{department}",
+            tool_name=tool_name,
             args={"summary": summary, "history": history},
             timeout_ms=5000,
         )

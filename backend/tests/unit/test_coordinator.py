@@ -7,7 +7,12 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from src.routing.model_router import RouterPromptBuilder, RouterPromptTemplate
+from src.routing.model_router import (
+    AgentConfig,
+    RouterPromptBuilder,
+    RouterPromptConfig,
+    ToolConfig,
+)
 from src.routing.policies import PoliciesRegistry
 from src.voice_runtime.agent_fsm import AgentFSM
 from src.voice_runtime.coordinator import Coordinator
@@ -44,14 +49,44 @@ def _make_policies() -> PoliciesRegistry:
 
 
 def _make_router_prompt_builder() -> RouterPromptBuilder:
-    template = RouterPromptTemplate(
+    config = RouterPromptConfig(
         identity="You are a call center agent.",
-        decision_rules="Decide how to help.",
-        departments="sales, billing, support, retention",
-        guardrails="Be polite.",
+        agents={
+            "direct": AgentConfig(
+                description="Handle directly",
+                triggers=["Greetings"],
+                fillers=[],
+                tool=None,
+            ),
+            "billing": AgentConfig(
+                description="Billing",
+                triggers=["Invoices"],
+                fillers=["One moment."],
+                tool=ToolConfig(type="internal", name="specialist_billing"),
+            ),
+            "sales": AgentConfig(
+                description="Sales",
+                triggers=["Plans"],
+                fillers=["Let me check."],
+                tool=ToolConfig(type="internal", name="specialist_sales"),
+            ),
+            "support": AgentConfig(
+                description="Support",
+                triggers=["Issues"],
+                fillers=["Connecting."],
+                tool=ToolConfig(type="internal", name="specialist_support"),
+            ),
+            "retention": AgentConfig(
+                description="Retention",
+                triggers=["Cancel"],
+                fillers=["Let me help."],
+                tool=ToolConfig(type="internal", name="specialist_retention"),
+            ),
+        },
+        guardrails=["Be polite."],
         language_instruction="Respond in the same language.",
     )
-    return RouterPromptBuilder(template)
+    return RouterPromptBuilder(config)
 
 
 def _make_coordinator(

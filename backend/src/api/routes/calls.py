@@ -19,7 +19,7 @@ from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 from src.config import settings
-from src.routing.model_router import ROUTE_TOOL_DEFINITION, RouterPromptBuilder
+from src.routing.model_router import RouterPromptBuilder
 from src.routing.policies import PoliciesRegistry
 from src.voice_runtime.agent_fsm import AgentFSM
 from src.voice_runtime.coordinator import Coordinator
@@ -145,7 +145,8 @@ async def create_call() -> CreateCallResponse:
         max_history_chars=settings.max_history_chars,
     )
 
-    bridge = OpenAIRealtimeEventBridge(call_id=call_id)
+    valid_depts = _shared_router_prompt_builder.config.valid_departments if _shared_router_prompt_builder else None
+    bridge = OpenAIRealtimeEventBridge(call_id=call_id, valid_departments=valid_depts)
 
     # Wire bridge events to coordinator (input: OpenAI → Coordinator)
     bridge.on_event(coordinator.handle_event)
@@ -319,7 +320,7 @@ async def events_ws(websocket: WebSocket, call_id: UUID) -> None:
                 "create_response": False,
                 "silence_duration_ms": settings.vad_silence_duration_ms,
             },
-            "tools": [ROUTE_TOOL_DEFINITION],
+            "tools": [_shared_router_prompt_builder.tool_definition] if _shared_router_prompt_builder else [],
             "tool_choice": "auto",
         },
     }

@@ -20,7 +20,7 @@ from uuid import UUID, uuid4
 import orjson
 import structlog
 
-from src.routing.model_router import Department, parse_function_call_action
+from src.routing.model_router import parse_function_call_action
 from src.voice_runtime.events import (
     EventEnvelope,
     RealtimeVoiceCancel,
@@ -41,8 +41,9 @@ class OpenAIRealtimeEventBridge:
     - close() → teardown
     """
 
-    def __init__(self, call_id: UUID) -> None:
+    def __init__(self, call_id: UUID, valid_departments: set[str] | None = None) -> None:
         self._call_id = call_id
+        self._valid_departments = valid_departments or {"direct", "sales", "billing", "support", "retention"}
         self._callback: Callable[[EventEnvelope], Coroutine[Any, Any, None]] | None = (
             None
         )
@@ -263,9 +264,9 @@ class OpenAIRealtimeEventBridge:
                 function_name=fn_name,
                 arguments=fn_args[:200],
             )
-            action = parse_function_call_action(fn_name, fn_args)
+            action = parse_function_call_action(fn_name, fn_args, self._valid_departments)
             if action is not None:
-                if action.department == Department.DIRECT:
+                if action.department == "direct":
                     # Direct response — tool_choice=required suppresses audio,
                     # so we flag for a second response.create (audio-only, no tools)
                     # that will be sent on response.done.
@@ -285,7 +286,7 @@ class OpenAIRealtimeEventBridge:
                         ts=_now_ms(),
                         type="model_router_action",
                         payload={
-                            "department": action.department.value,
+                            "department": action.department,
                             "summary": action.summary,
                             "filler_text": _clean_transcript(self._response_transcript_buffer),
                         },

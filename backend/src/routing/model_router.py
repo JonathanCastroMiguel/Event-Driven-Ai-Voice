@@ -7,98 +7,180 @@ For specialist routing, the model calls a `route_to_specialist` function
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from enum import Enum
+import json
+import random
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import structlog
-import yaml
 
 logger = structlog.get_logger()
 
 
-class Department(str, Enum):
-    DIRECT = "direct"
-    SALES = "sales"
-    BILLING = "billing"
-    SUPPORT = "support"
-    RETENTION = "retention"
+@dataclass(frozen=True)
+class ToolConfig:
+    """Specialist endpoint configuration loaded from router config."""
+
+    type: str  # internal | mcp | rag | langgraph | rest
+    name: str | None = None
+    url: str | None = None
+    auth: str | None = None
+
+
+@dataclass(frozen=True)
+class AgentConfig:
+    """Agent configuration loaded from router config."""
+
+    description: str
+    triggers: list[str] = field(default_factory=list)
+    fillers: list[str] = field(default_factory=list)
+    tool: ToolConfig | None = None
+
+
+@dataclass(frozen=True)
+class RouterPromptConfig:
+    """Structured router configuration loaded from JSON config."""
+
+    identity: str
+    agents: dict[str, AgentConfig]
+    guardrails: list[str]
+    language_instruction: str
+
+    @property
+    def valid_departments(self) -> set[str]:
+        """Set of valid agent names (used as department values by the model)."""
+        return set(self.agents.keys())
 
 
 @dataclass(frozen=True)
 class ModelRouterAction:
     """Parsed routing action from function call indicating specialist routing."""
 
-    department: Department
+    department: str
     summary: str
 
 
-# Tool definition for the route_to_specialist function.
-# Included in response.create so the model can signal routing
-# without contaminating the audio stream.
-ROUTE_TOOL_DEFINITION: dict[str, Any] = {
-    "type": "function",
-    "name": "route_to_specialist",
-    "description": (
-        "Classify every user message. "
-        "Use 'direct' when you can answer directly (greetings, small talk, "
-        "general questions, clarifications). "
-        "Use a specialist department when the customer needs system access "
-        "(account lookup, billing changes, technical troubleshooting, etc.)."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "department": {
-                "type": "string",
-                "enum": ["direct", "sales", "billing", "support", "retention"],
-                "description": (
-                    "'direct' for messages you handle yourself. "
-                    "A specialist department for requests requiring system access."
-                ),
+SYSTEM_MECHANIC: str = (
+    "ALWAYS respond by speaking naturally AND calling route_to_specialist.\n"
+    "You must ALWAYS call this function for every message — no exceptions.\n\n"
+    "The function call is silent and invisible to the customer. Never say function "
+    "names or syntax out loud — only speak natural language.\n\n"
+    "When routing to a specialist, speak a brief filler in the customer's language "
+    '(e.g., "Un momento, le conecto con facturación").'
+)
+
+
+def build_route_tool_definition(
+    agents: dict[str, AgentConfig],
+) -> dict[str, Any]:
+    """Generate the route_to_specialist tool definition dynamically from config.
+
+    The description is built from agent triggers so the model knows
+    when to use each agent. No hardcoded routing logic.
+    """
+    agent_descriptions: list[str] = []
+    for agent_name, agent_config in agents.items():
+        triggers_text = "; ".join(agent_config.triggers)
+        agent_descriptions.append(
+            f"'{agent_name}': {agent_config.description} — {triggers_text}"
+        )
+    description = (
+        "Classify every user message into one of these agents:\n"
+        + "\n".join(agent_descriptions)
+    )
+
+    return {
+        "type": "function",
+        "name": "route_to_specialist",
+        "description": description,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "department": {
+                    "type": "string",
+                    "enum": list(agents.keys()),
+                    "description": "The agent to route this message to.",
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "Brief English summary of what the customer needs.",
+                },
             },
-            "summary": {
-                "type": "string",
-                "description": "Brief English summary of what the customer needs.",
-            },
+            "required": ["department", "summary"],
         },
-        "required": ["department", "summary"],
-    },
-}
-
-
-@dataclass(frozen=True)
-class RouterPromptTemplate:
-    """Loaded router prompt sections from router_prompt.yaml."""
-
-    identity: str
-    decision_rules: str
-    departments: str
-    guardrails: str
-    language_instruction: str
-
-    def to_system_instruction(self) -> str:
-        """Combine all sections into a single system instruction string."""
-        return "\n\n".join([
-            self.identity.strip(),
-            self.decision_rules.strip(),
-            self.departments.strip(),
-            self.guardrails.strip(),
-            self.language_instruction.strip(),
-        ])
+    }
 
 
 class RouterPromptBuilder:
-    """Builds response.create payloads from the router prompt template + conversation history."""
+    """Builds response.create payloads from structured router config + conversation history."""
 
-    def __init__(self, template: RouterPromptTemplate) -> None:
-        self._template = template
-        self._system_instruction = template.to_system_instruction()
+    def __init__(self, config: RouterPromptConfig) -> None:
+        self._config = config
+        self._tool_definition = build_route_tool_definition(config.agents)
+        self._system_instruction = self._assemble_system_instruction()
+
+    def _assemble_system_instruction(self) -> str:
+        """Assemble system prompt from structured config sections."""
+        sections: list[str] = [SYSTEM_MECHANIC]
+
+        # Identity
+        sections.append(self._config.identity)
+
+        # Routing rules generated from agents
+        routing_lines: list[str] = ["Routing rules:"]
+        for agent_name, agent_config in self._config.agents.items():
+            triggers_text = ", ".join(agent_config.triggers)
+            routing_lines.append(
+                f"- {agent_name}: {agent_config.description}. "
+                f"Triggers: {triggers_text}"
+            )
+        sections.append("\n".join(routing_lines))
+
+        # Guardrails as bulleted list
+        guardrails_text = "\n".join(
+            f"- {g}" for g in self._config.guardrails
+        )
+        sections.append(guardrails_text)
+
+        # Language instruction
+        sections.append(self._config.language_instruction)
+
+        return "\n\n".join(sections)
 
     @property
     def system_instruction(self) -> str:
         return self._system_instruction
+
+    @property
+    def tool_definition(self) -> dict[str, Any]:
+        """The dynamically generated route_to_specialist tool definition."""
+        return self._tool_definition
+
+    @property
+    def config(self) -> RouterPromptConfig:
+        """The underlying router prompt configuration."""
+        return self._config
+
+    def get_department_tool(self, department: str) -> ToolConfig | None:
+        """Resolve the specialist tool config for an agent.
+
+        Returns the ToolConfig for specialist agents, None for direct or unknown.
+        """
+        agent_config = self._config.agents.get(department)
+        if agent_config is None:
+            return None
+        return agent_config.tool
+
+    def get_department_filler(self, department: str) -> str | None:
+        """Get a random filler message for an agent.
+
+        Returns None if the agent has no fillers or is unknown.
+        """
+        agent_config = self._config.agents.get(department)
+        if agent_config is None or not agent_config.fillers:
+            return None
+        return random.choice(agent_config.fillers)
 
     def build_response_create(
         self,
@@ -108,13 +190,6 @@ class RouterPromptBuilder:
 
         Includes the route_to_specialist tool so the model can signal routing
         via function call (never vocalized) while speaking a filler message.
-
-        Args:
-            history: Prior conversation turns as user/assistant message pairs
-                     from ConversationBuffer.format_messages().
-
-        Returns:
-            A dict suitable for sending as a response.create event.
         """
         instructions = self._system_instruction
 
@@ -133,7 +208,7 @@ class RouterPromptBuilder:
             "response": {
                 "modalities": ["text", "audio"],
                 "instructions": instructions,
-                "tools": [ROUTE_TOOL_DEFINITION],
+                "tools": [self._tool_definition],
                 "tool_choice": "required",
                 "temperature": 0.8,
             },
@@ -143,6 +218,7 @@ class RouterPromptBuilder:
 def parse_function_call_action(
     name: str,
     arguments: str,
+    valid_departments: set[str],
 ) -> ModelRouterAction | None:
     """Parse a function call from the Realtime API into a routing action.
 
@@ -163,39 +239,64 @@ def parse_function_call_action(
     dept_str = str(args.get("department", "")).lower()
     summary = str(args.get("summary", "")).strip()
 
-    try:
-        department = Department(dept_str)
-    except ValueError:
+    if dept_str not in valid_departments:
         logger.warning("function_call_unknown_department", department=dept_str)
         return None
 
-    return ModelRouterAction(department=department, summary=summary)
+    return ModelRouterAction(department=dept_str, summary=summary)
 
 
-def load_router_prompt(registry_path: str) -> RouterPromptTemplate:
-    """Load and validate the router prompt template from YAML.
+def load_router_prompt_from_dict(data: dict[str, Any]) -> RouterPromptConfig:
+    """Parse a router config dict into RouterPromptConfig.
 
-    Raises FileNotFoundError if the file is missing.
-    Raises ValueError if required sections are absent.
+    Accepts the exact target API payload structure (with 'agents' key).
+    Raises ValueError if required fields are missing.
     """
-    path = Path(registry_path) / "router_prompt.yaml"
+    required_fields = ["identity", "agents", "guardrails", "language_instruction"]
+    for field_name in required_fields:
+        if field_name not in data or not data[field_name]:
+            msg = f"Router config missing required field: {field_name}"
+            raise ValueError(msg)
+
+    agents: dict[str, AgentConfig] = {}
+    for agent_name, agent_data in data["agents"].items():
+        tool_data = agent_data.get("tool")
+        tool: ToolConfig | None = None
+        if tool_data is not None:
+            tool = ToolConfig(
+                type=tool_data["type"],
+                name=tool_data.get("name"),
+                url=tool_data.get("url"),
+                auth=tool_data.get("auth"),
+            )
+        agents[agent_name] = AgentConfig(
+            description=agent_data["description"],
+            triggers=agent_data.get("triggers", []),
+            fillers=agent_data.get("fillers", []),
+            tool=tool,
+        )
+
+    return RouterPromptConfig(
+        identity=str(data["identity"]),
+        agents=agents,
+        guardrails=list(data["guardrails"]),
+        language_instruction=str(data["language_instruction"]),
+    )
+
+
+def load_router_prompt(registry_path: str) -> RouterPromptConfig:
+    """Load and validate the router config from JSON.
+
+    Reads the JSON file and delegates to load_router_prompt_from_dict.
+    Raises FileNotFoundError if the file is missing.
+    Raises ValueError if required fields are absent.
+    """
+    path = Path(registry_path) / "router_prompt.json"
     if not path.exists():
-        msg = f"router_prompt.yaml not found at {path}"
+        msg = f"router_prompt.json not found at {path}"
         raise FileNotFoundError(msg)
 
     with open(path) as f:
-        data = yaml.safe_load(f)
+        data = json.load(f)
 
-    required_sections = ["identity", "decision_rules", "departments", "guardrails", "language_instruction"]
-    for section in required_sections:
-        if not data.get(section):
-            msg = f"router_prompt.yaml missing required section: {section}"
-            raise ValueError(msg)
-
-    return RouterPromptTemplate(
-        identity=str(data["identity"]),
-        decision_rules=str(data["decision_rules"]),
-        departments=str(data["departments"]),
-        guardrails=str(data["guardrails"]),
-        language_instruction=str(data["language_instruction"]),
-    )
+    return load_router_prompt_from_dict(data)
