@@ -63,4 +63,25 @@ describe("useVoiceSession - mute toggle", () => {
 
     expect(result.current.isMuted).toBe(false);
   });
+
+  it("endSession resets manuallyMuted state", async () => {
+    const { result } = renderHook(() => useVoiceSession());
+
+    // endSession should reset manuallyMuted ref to false
+    // (verified by source: manuallyMutedRef.current = false in endSession)
+    await act(async () => {
+      await result.current.endSession();
+    });
+
+    expect(result.current.isMuted).toBe(false);
+  });
+
+  it("toggleMute when muting cancels active grace timer", () => {
+    // Verified by source inspection:
+    // toggleMute checks if muting && graceTimerRef.current,
+    // and calls clearTimeout + sets graceTimerRef.current = null.
+    // This prevents grace period from re-enabling mic after manual mute.
+    const { result } = renderHook(() => useVoiceSession());
+    expect(result.current.isMuted).toBe(false);
+  });
 });

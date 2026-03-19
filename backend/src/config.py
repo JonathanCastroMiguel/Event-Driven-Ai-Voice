@@ -44,6 +44,7 @@ class Settings(BaseSettings):
 
     # Server VAD
     vad_silence_duration_ms: int = 200
+    vad_threshold: float = 0.6
 
     # Calls
     max_concurrent_calls: int = 50

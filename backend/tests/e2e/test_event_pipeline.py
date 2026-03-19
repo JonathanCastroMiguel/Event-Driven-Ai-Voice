@@ -37,7 +37,7 @@ class TestSimpleTurnLifecycle:
         assert voice_starts[0].prompt["type"] == "response.create"
 
     @pytest.mark.asyncio
-    async def test_voice_completed_cleans_up(self) -> None:
+    async def test_voice_completed_keeps_voice_id_until_playback_end(self) -> None:
         coord, fake, capture = make_e2e_stack()
         await fake.speech_started()
         await fake.audio_committed()
@@ -46,7 +46,9 @@ class TestSimpleTurnLifecycle:
         voice_start = [e for e in events if isinstance(e, RealtimeVoiceStart)][0]
 
         await fake.voice_completed(voice_start.voice_generation_id)
-        assert coord.state.active_voice_generation_id is None
+        # voice_generation_id stays set until audio_playback_end from frontend
+        # so barge-in detection works during browser audio playback.
+        assert coord.state.active_voice_generation_id is not None
 
     @pytest.mark.asyncio
     async def test_fsm_transitions_through_lifecycle(self) -> None:
@@ -316,7 +318,7 @@ class TestCallCleanup:
         voice_start = [e for e in events if isinstance(e, RealtimeVoiceStart)][0]
 
         await fake.voice_completed(voice_start.voice_generation_id)
-        assert coord.state.active_voice_generation_id is None
+        assert coord.state.active_voice_generation_id is not None
         assert coord._filler_task is None
 
     @pytest.mark.asyncio
@@ -446,4 +448,4 @@ class TestSpecialistTurnE2E:
         specialist_voice = [e for e in events if isinstance(e, RealtimeVoiceStart)][-1]
 
         await fake.voice_completed(specialist_voice.voice_generation_id)
-        assert coord.state.active_voice_generation_id is None
+        assert coord.state.active_voice_generation_id is not None

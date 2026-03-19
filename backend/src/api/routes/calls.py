@@ -232,6 +232,10 @@ async def handle_offer(call_id: UUID, body: SDPRequest) -> SDPResponse:
                 "turn_detection": {
                     "type": "server_vad",
                     "create_response": False,
+                    "threshold": settings.vad_threshold,
+                },
+                "input_audio_noise_reduction": {
+                    "type": "far_field",
                 },
             }),
         )
@@ -319,6 +323,10 @@ async def events_ws(websocket: WebSocket, call_id: UUID) -> None:
                 "type": "server_vad",
                 "create_response": False,
                 "silence_duration_ms": settings.vad_silence_duration_ms,
+                "threshold": settings.vad_threshold,
+            },
+            "input_audio_noise_reduction": {
+                "type": "far_field",
             },
             "tools": [_shared_router_prompt_builder.tool_definition] if _shared_router_prompt_builder else [],
             "tool_choice": "auto",

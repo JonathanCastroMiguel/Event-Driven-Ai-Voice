@@ -43,6 +43,11 @@ export function useVoiceSession(): UseVoiceSessionReturn {
   );
   const debugHandlerRef = useRef<((msg: unknown) => void) | null>(null);
   const callIdRef = useRef<string | null>(null);
+  const manuallyMutedRef = useRef<boolean>(false);
+  const graceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Echo loop detection: rolling window of speech_started timestamps
+  const speechStartedTimestamps = useRef<number[]>([]);
+  const echoLoopWarnedRef = useRef<boolean>(false);
 
   const cleanup = useCallback(async (id: string | null) => {
     if (pcRef.current) {
@@ -178,33 +183,56 @@ export function useVoiceSession(): UseVoiceSessionReturn {
           echoCancellation: true,
           noiseSuppression: true,
           autoGainControl: true,
-        },
+          // Prefer hardware/OS-level AEC when available; falls back to Chrome AEC3
+          echoCancellationType: { ideal: "system" },
+        } as MediaTrackConstraints,
       });
 
       const micTrack = micStream.getAudioTracks()[0];
+
+      // AEC runtime diagnostics — verify echo cancellation is active
+      const trackSettings = micTrack.getSettings();
+      if (trackSettings.echoCancellation === true) {
+        console.log("aec_verified", { echoCancellation: true, settings: trackSettings });
+      } else {
+        console.warn("aec_not_active", { settings: trackSettings });
+      }
+      if (typeof micTrack.getCapabilities === "function") {
+        const caps = micTrack.getCapabilities();
+        const echoCancellationType = (caps as Record<string, unknown>).echoCancellationType;
+        if (Array.isArray(echoCancellationType) && echoCancellationType.includes("system")) {
+          console.log("hardware_aec_available", { echoCancellationType });
+        }
+      }
+
       pc.addTrack(micTrack);
 
       // Mic gating with grace period: mute mic for the first 2s of assistant
       // playback (browser AEC needs time to converge), then unmute for barge-in.
       const GRACE_MS = 2000;
-      let graceTimer: ReturnType<typeof setTimeout> | null = null;
 
       const startGrace = () => {
+        // Skip grace period entirely if user has manually muted
+        if (manuallyMutedRef.current) return;
+
         // Mute mic immediately when assistant starts speaking
         const sender = pc.getSenders().find((s) => s.track?.kind === "audio");
         if (sender?.track) sender.track.enabled = false;
 
         // Unmute after grace period to allow barge-in
-        if (graceTimer) clearTimeout(graceTimer);
-        graceTimer = setTimeout(() => {
+        if (graceTimerRef.current) clearTimeout(graceTimerRef.current);
+        graceTimerRef.current = setTimeout(() => {
+          if (manuallyMutedRef.current) { graceTimerRef.current = null; return; }
           const s = pc.getSenders().find((s) => s.track?.kind === "audio");
           if (s?.track) s.track.enabled = true;
-          graceTimer = null;
+          graceTimerRef.current = null;
         }, GRACE_MS);
       };
 
       const endGrace = () => {
-        if (graceTimer) { clearTimeout(graceTimer); graceTimer = null; }
+        if (graceTimerRef.current) { clearTimeout(graceTimerRef.current); graceTimerRef.current = null; }
+        // Only re-enable mic if user hasn't manually muted
+        if (manuallyMutedRef.current) return;
         const sender = pc.getSenders().find((s) => s.track?.kind === "audio");
         if (sender?.track) sender.track.enabled = true;
       };
@@ -261,6 +289,29 @@ export function useVoiceSession(): UseVoiceSessionReturn {
                 turn_id: currentDebugTurnId,
                 ts: Date.now(),
               }));
+            }
+          }
+
+          // Echo loop detection: track speech_started in rolling 10s window
+          if (event.type === "input_audio_buffer.speech_started") {
+            const ECHO_WINDOW_MS = 10_000;
+            const ECHO_THRESHOLD = 5;
+            const now = Date.now();
+            const timestamps = speechStartedTimestamps.current;
+            timestamps.push(now);
+            // Prune events outside the window
+            const cutoff = now - ECHO_WINDOW_MS;
+            while (timestamps.length > 0 && timestamps[0] < cutoff) {
+              timestamps.shift();
+            }
+            if (timestamps.length >= ECHO_THRESHOLD && !echoLoopWarnedRef.current) {
+              console.warn("echo_loop_detected", {
+                count: timestamps.length,
+                window_ms: ECHO_WINDOW_MS,
+              });
+              echoLoopWarnedRef.current = true;
+              // Reset rate-limit after window elapses
+              setTimeout(() => { echoLoopWarnedRef.current = false; }, ECHO_WINDOW_MS);
             }
           }
 
@@ -339,6 +390,7 @@ export function useVoiceSession(): UseVoiceSessionReturn {
     setStatus("disconnected");
     setCallId(null);
     setIsMuted(false);
+    manuallyMutedRef.current = false;
     callIdRef.current = null;
     await cleanup(currentCallId);
   }, [cleanup]);
@@ -361,7 +413,14 @@ export function useVoiceSession(): UseVoiceSessionReturn {
     if (sender?.track) {
       const next = !sender.track.enabled;
       sender.track.enabled = next;
-      setIsMuted(!next);
+      const muting = !next;
+      manuallyMutedRef.current = muting;
+      // Cancel any active grace timer when user manually mutes
+      if (muting && graceTimerRef.current) {
+        clearTimeout(graceTimerRef.current);
+        graceTimerRef.current = null;
+      }
+      setIsMuted(muting);
     }
   }, []);
 
