@@ -78,7 +78,7 @@ alembic upgrade head
 The router registry lives at `backend/router_registry/v1/` and contains:
 - `config.yml` — thresholds, centroid definitions, lexicon rules
 - `policies.yml` — policy key to prompt template mapping
-- `router_prompt.yaml` — model-as-router system prompt template (identity, decision rules, departments, guardrails, language instruction). Uses always-classify pattern with `tool_choice: "required"` — every message triggers a `route_to_specialist` call with `department="direct"` or a specialist department.
+- `router_prompt.json` — model-as-router JSON config (identity, agents with triggers/fillers/tool bindings, guardrails, language instruction). Uses always-classify pattern with `tool_choice: "required"` — every message triggers a `route_to_specialist` call with `department="direct"` or a specialist department. The JSON structure matches the future API payload, enabling zero-change migration from local file to API-driven config.
 
 ### 6.1 Specialist Tools
 

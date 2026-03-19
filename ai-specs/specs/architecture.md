@@ -93,7 +93,7 @@ The Coordinator is the **single orchestrator** — it receives all events, deleg
 | Types/Enums | `backend/src/voice_runtime/types.py` |
 | Event Bus | `backend/src/voice_runtime/bus.py` |
 | Model Router | `backend/src/routing/model_router.py` |
-| Router Prompt | `backend/router_registry/v1/router_prompt.yaml` |
+| Router Prompt | `backend/router_registry/v1/router_prompt.json` |
 | Router (analytics) | `backend/src/routing/router.py` |
 | Policies | `backend/src/routing/policies.py` |
 | RealtimeEventBridge | `backend/src/voice_runtime/realtime_event_bridge.py` |
@@ -325,7 +325,7 @@ On the first turn the history is empty. On subsequent turns, history is formatte
 
 **Routing context** (`backend/src/routing/context.py`): The `format_history()` function delegates to `ConversationBuffer.format_messages()`. It formats conversation buffer entries into alternating user/assistant message pairs for inclusion in the router prompt.
 
-**Filler strategy**: Disabled by default (`_should_emit_filler()` returns `False`). When enabled, emits a brief filler voice ("Un momento, por favor.") before specialist responses, with a 1200ms auto-cancel timeout. In the model-as-router architecture, the model itself speaks a natural filler simultaneously with the function call, so this server-side filler is a secondary fallback.
+**Filler strategy**: Disabled by default (`_should_emit_filler()` returns `False`). When enabled, selects a contextual filler per department via `RouterPromptBuilder.get_department_filler(department)` (picks randomly from the department's `fillers` list in the JSON config). Departments with empty fillers (e.g., `direct`) skip filler emission. Emitted before specialist responses with a 1200ms auto-cancel timeout. In the model-as-router architecture, the model itself speaks a natural filler simultaneously with the function call, so this server-side filler is a secondary fallback.
 
 **Output events**: Accumulated in `_output_events` list, drained via `drain_output_events()`. Also supports a callback via `set_output_callback()` for real-time event forwarding.
 
@@ -444,7 +444,7 @@ The original architecture used a **multi-step embedding classification pipeline*
 | **Turn trigger** | `transcript_final` (waits for Whisper transcription) | `audio_committed` (server VAD, 300ms silence) — saves 200-500ms Whisper latency |
 | **Accuracy** | Cosine similarity against static centroids | LLM reasoning over full conversation context |
 | **Context** | Limited enrichment window for short texts | Full conversation history in every prompt |
-| **Maintenance** | Training examples, thresholds, centroid calibration | Single YAML prompt template |
+| **Maintenance** | Training examples, thresholds, centroid calibration | Single JSON config file (future: API-driven) |
 | **Ambiguity handling** | Confidence thresholds + `clarify_department` policy | Model asks clarification naturally in conversation |
 | **Code complexity** | 6 classification steps, 3 fallback layers | 1 prompt builder, 1 function call parser |
 
@@ -458,42 +458,43 @@ The Realtime voice model serves as the primary router. Instead of a multi-step e
 
 **File**: `backend/src/routing/model_router.py`
 
-`RouterPromptBuilder` constructs `response.create` payloads for the Realtime API. It combines:
-1. A `RouterPromptTemplate` (loaded from YAML) containing the system instructions for routing behavior
-2. Conversation history embedded as text within the `instructions` field (appended after the system prompt as a `Conversation history:` section)
+`RouterPromptBuilder` constructs `response.create` payloads for the Realtime API. It is initialized with a `RouterPromptConfig` (loaded from JSON) and assembles the system prompt at runtime from structured config sections: (1) system mechanics constant (mandatory tool calling rules), (2) identity, (3) routing rules generated dynamically from agent descriptions and triggers, (4) guardrails as a bulleted list, (5) language instruction. Conversation history is embedded as text within the `instructions` field (appended after the system prompt as a `Conversation history:` section).
 
 **Important**: History is embedded in `instructions` (not `response.input`) to preserve OpenAI's native conversation context, which includes the current turn's committed audio buffer. Using `response.input` would override the native context and cause the model to ignore the user's current speech.
 
-The resulting payload is sent as a `response.create` message to OpenAI, including the `route_to_specialist` function tool definition with `tool_choice: "required"`. The model reads the router prompt, classifies the user's intent, and **always** calls `route_to_specialist()` with one of two department types:
+The resulting payload is sent as a `response.create` message to OpenAI, including the dynamically generated `route_to_specialist` function tool definition with `tool_choice: "required"`. The tool definition's `department` enum and description are built from the JSON config agent keys and their triggers/descriptions. The model reads the router prompt, classifies the user's intent, and **always** calls `route_to_specialist()` with one of two department types:
 
 - **`department="direct"`** (~60-70% of turns): For simple intents (greetings, guardrails, general questions). Since `tool_choice: "required"` suppresses audio output, the Bridge handles a two-step flow: (1) acknowledge the function call via `conversation.item.create` with `function_call_output`, then (2) send a second `response.create` without tools to generate the spoken reply
 - **Specialist department** (`sales`, `billing`, `support`, `retention`): For specialist routing. The Bridge emits `model_router_action` to the Coordinator, which dispatches to the corresponding specialist tool via `ToolExecutor`. The tool returns a complete `response.create` payload that the Coordinator forwards unchanged
 
-### 5.2 RouterPromptTemplate
+**Additional methods:**
+- `get_department_tool(department: str) -> ToolConfig | None`: Resolves the specialist tool config for a given department. Returns `None` for `direct` or unknown departments. Used by the Coordinator to resolve specialist tool names instead of `f"specialist_{department}"`.
+- `get_department_filler(department: str) -> str | None`: Returns a randomly selected filler message from the department's `fillers` list. Returns `None` if the department has an empty fillers list or is unknown. Used by the Coordinator instead of the hardcoded filler string.
 
-**File**: `backend/router_registry/v1/router_prompt.yaml`
+### 5.2 RouterPromptConfig
 
-YAML-defined prompt template with 5 required sections (frozen dataclass):
+**File**: `backend/router_registry/v1/router_prompt.json`
 
-| Section | Purpose |
-|---|---|
-| `identity` | Agent identity and role definition |
-| `decision_rules` | When to speak directly vs. call `route_to_specialist()` |
-| `departments` | Available departments and their descriptions |
-| `guardrails` | Disallowed content, out-of-scope handling rules |
-| `language_instruction` | Dynamic language guidelines (respond in the customer's language) |
+JSON configuration file with the exact same structure that will arrive from the API in the future. The runtime consumes this shape identically regardless of source. Parsed into a `RouterPromptConfig` dataclass containing:
 
-`to_system_instruction()` concatenates all 5 sections (separated by `\n\n`) into a single string used as the `instructions` field in `response.create`.
+| Field | Type | Purpose |
+|---|---|---|
+| `identity` | `str` | Agent identity and role definition |
+| `agents` | `dict[str, AgentConfig]` | Available agents (direct, sales, billing, support, retention) with descriptions, triggers, fillers, and tool bindings |
+| `guardrails` | `list[str]` | Disallowed content, out-of-scope handling rules |
+| `language_instruction` | `str` | Dynamic language guidelines (respond in the customer's language) |
 
-Loaded at startup via `load_router_prompt(registry_path)` which validates all required sections exist. Injected into `RouterPromptBuilder`.
+Each `AgentConfig` contains `description` (str), `triggers` (list of str), `fillers` (list of str), and `tool` (`ToolConfig | None`). `ToolConfig` has `type` (internal/mcp/rag/langgraph/rest), optional `name`, optional `url`, and optional `auth` (secret reference).
+
+Loaded at startup via `load_router_prompt(registry_path)` which reads the JSON file and delegates to `load_router_prompt_from_dict(data)`. The dict-based loader enables future API-driven configuration with zero runtime changes. Both paths produce the same `RouterPromptConfig`.
 
 ### 5.3 Function Call Routing via `parse_function_call_action`
 
 **File**: `backend/src/routing/model_router.py`
 
-With `tool_choice: "required"`, the model **always** calls `route_to_specialist` (defined in `ROUTE_TOOL_DEFINITION`). The tool accepts two required parameters: `department` (enum: `direct`, `sales`, `billing`, `support`, `retention`) and `summary` (brief English description of the customer's need). These map to the `Department` enum and are parsed into a `ModelRouterAction(department, summary)` dataclass. `Department.DIRECT` indicates the model handles the message itself (greetings, guardrails, clarifications) — no specialist routing needed.
+With `tool_choice: "required"`, the model **always** calls `route_to_specialist` (defined by the dynamically generated tool definition from `build_route_tool_definition(agents)`). The tool accepts two required parameters: `department` (enum built from config agent keys) and `summary` (brief English description of the customer's need). Department names are validated against the `valid_departments` set loaded from config (replacing the former static `Department` enum) and parsed into a `ModelRouterAction(department, summary)` dataclass. `department="direct"` indicates the model handles the message itself (greetings, guardrails, clarifications) — no specialist routing needed.
 
-The OpenAI Realtime API emits a `response.function_call_arguments.done` event with the function name and JSON arguments. The bridge intercepts this event and calls `parse_function_call_action(name, arguments)` to validate the function name, parse the JSON, and resolve the department enum. For specialist departments, the bridge emits a `model_router_action` EventEnvelope to the Coordinator. For `Department.DIRECT`, the bridge sets `_pending_direct_audio = True` and handles the two-step follow-up flow internally (see section 6.5). Invalid function names or malformed arguments are logged and silently dropped.
+The OpenAI Realtime API emits a `response.function_call_arguments.done` event with the function name and JSON arguments. The bridge intercepts this event and calls `parse_function_call_action(name, arguments, valid_departments)` to validate the function name, parse the JSON, and validate the department against the config-driven set. For specialist departments, the bridge emits a `model_router_action` EventEnvelope to the Coordinator. For `department="direct"`, the bridge sets `_pending_direct_audio = True` and handles the two-step follow-up flow internally (see section 6.5). Invalid function names or malformed arguments are logged and silently dropped.
 
 Since `tool_choice: "required"` forces function-call-only output, there is no audio in the classification response. Audio is generated in the second step: either via the Bridge's direct follow-up `response.create` or via the specialist tool's `response.create` payload.
 
@@ -538,11 +539,11 @@ The following components remain unchanged but are no longer invoked by the Coord
 
 **File**: `backend/src/routing/registry.py`
 
-Versioned YAML configuration loaded from `backend/router_registry/v1/`:
+Versioned configuration loaded from `backend/router_registry/v1/`:
 
 ```
 router_registry/v1/
-  ├── router_prompt.yaml     # Model-as-router prompt template (NEW)
+  ├── router_prompt.json     # Model-as-router JSON config (identity, agents, guardrails, language)
   ├── thresholds.yaml        # Confidence thresholds (analytics/calibration)
   ├── policies.yaml          # Base system prompt + policy templates
   ├── route_a/
