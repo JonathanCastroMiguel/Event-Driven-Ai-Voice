@@ -204,6 +204,10 @@ class Coordinator:
         """
         if stage == "audio_playback_end":
             self._debug_audio_playback_end_received = True
+            # Audio finished playing in the browser — safe to clear voice ID.
+            # This allows barge-in detection during playback (between
+            # response.done and actual audio end).
+            self._state.active_voice_generation_id = None
         await self._send_debug(stage)
 
     # ------------------------------------------------------------------
@@ -858,7 +862,10 @@ class Coordinator:
                         )
                     )
                 )
-        self._state.active_voice_generation_id = None
+        # NOTE: Do NOT clear active_voice_generation_id here.
+        # The audio is still playing in the browser after response.done.
+        # It gets cleared when: (a) audio_playback_end arrives from frontend,
+        # or (b) cancel_active_voice() on barge-in.
 
     async def _on_voice_error(self, envelope: EventEnvelope) -> None:
         voice_id_str = str(envelope.payload.get("voice_generation_id", ""))

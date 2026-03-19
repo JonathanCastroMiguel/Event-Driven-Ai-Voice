@@ -223,6 +223,8 @@ class TestEventsWebSocket:
         session_update = orjson.loads(sent_messages[0])
         assert session_update["type"] == "session.update"
         assert session_update["session"]["turn_detection"]["create_response"] is False
+        assert session_update["session"]["turn_detection"]["threshold"] == 0.6
+        assert session_update["session"]["input_audio_noise_reduction"]["type"] == "far_field"
         assert session_update["session"]["input_audio_transcription"]["model"] == "whisper-1"
 
     def test_ws_forwards_event_to_bridge(self, client: TestClient) -> None:

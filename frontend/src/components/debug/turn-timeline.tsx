@@ -32,10 +32,8 @@ function stageLabel(stage: DebugStage): string {
   return STAGE_LABELS[stage.stage] ?? stage.stage;
 }
 
-function deltaColor(delta_ms: number): string {
-  if (delta_ms < 550) return "border-green-500 bg-green-500/10";
-  if (delta_ms < 1000) return "border-yellow-500 bg-yellow-500/10";
-  return "border-red-500 bg-red-500/10";
+function deltaColor(_delta_ms: number): string {
+  return "border-green-500 bg-green-500/10";
 }
 
 function bridgeTimingLabel(stage: DebugStage): string | null {
@@ -84,10 +82,8 @@ function computeSilenceMs(stages: DebugStage[]): number | null {
   return audioStart.ts - speechStop.ts;
 }
 
-function silenceColor(ms: number): string {
-  if (ms < 550) return "text-green-600";
-  if (ms < 1000) return "text-yellow-600";
-  return "text-red-600";
+function silenceColor(_ms: number): string {
+  return "text-green-600";
 }
 
 function SilenceBanner({ stages }: { stages: DebugStage[] }) {
