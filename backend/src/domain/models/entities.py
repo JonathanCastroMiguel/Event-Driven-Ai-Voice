@@ -19,6 +19,7 @@ class CallSessionContext(msgspec.Struct, frozen=True):
     call_id: UUID
     started_at: int
     status: CallStatus
+    client_type: str = "browser_webrtc"  # Default for backward compatibility
     provider_call_id: str | None = None
     ended_at: int | None = None
     locale_hint: str | None = None

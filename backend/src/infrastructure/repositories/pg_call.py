@@ -16,8 +16,8 @@ class PgCallRepository:
         await self._pool.execute(
             """
             INSERT INTO call_sessions
-                (call_id, provider_call_id, started_at, ended_at, status, locale_hint, customer_context)
-            VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+                (call_id, provider_call_id, started_at, ended_at, status, locale_hint, customer_context, client_type)
+            VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)
             """,
             session.call_id,
             session.provider_call_id,
@@ -26,6 +26,7 @@ class PgCallRepository:
             session.status.value,
             session.locale_hint,
             _json_or_none(session.customer_context),
+            session.client_type,
         )
 
     async def update_status(
@@ -63,6 +64,7 @@ def _row_to_call_session(row: asyncpg.Record) -> CallSessionContext:
         call_id=row["call_id"],
         started_at=row["started_at"],
         status=CallStatus(row["status"]),
+        client_type=row.get("client_type", "browser_webrtc"),  # Default for backward compatibility
         provider_call_id=row["provider_call_id"],
         ended_at=row["ended_at"],
         locale_hint=row["locale_hint"],

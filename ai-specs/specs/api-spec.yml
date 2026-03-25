@@ -73,7 +73,18 @@ paths:
       description: >
         Creates a new voice call session. Returns a call_id used for
         subsequent SDP exchange. Enforces max_concurrent_calls limit.
+        
+        Supports multiple ingress types via the optional client_type parameter.
+        Current supported types: browser_webrtc (default).
+        Future types (VoIP/Asterisk, SIP providers) will be added as they are implemented.
       tags: [webrtc]
+      requestBody:
+        required: false
+        description: Optional configuration for the call session
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateCallRequest"
       responses:
         "201":
           description: Call session created
@@ -81,6 +92,16 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CreateCallResponse"
+        "400":
+          description: Invalid or unsupported client_type
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  detail:
+                    type: string
+                    example: "Unsupported client_type: voip_asterisk. Supported types: browser_webrtc"
         "503":
           description: Max concurrent calls exceeded
 
@@ -300,6 +321,33 @@ components:
           type: integer
 
     # ---- WebRTC Signaling schemas ----
+
+    CreateCallRequest:
+      type: object
+      properties:
+        client_type:
+          type: string
+          description: >
+            Voice client ingress type. Determines the transport mechanism for audio and events.
+            Each type has a corresponding VoiceClient implementation in the runtime.
+          enum:
+            - browser_webrtc
+            - voip_asterisk
+          default: browser_webrtc
+          example: browser_webrtc
+      description: >
+        Optional request body for creating a call session.
+        If omitted or if client_type is not provided, defaults to browser_webrtc for backward compatibility.
+        
+        **Supported client types:**
+        - `browser_webrtc`: Browser-based WebRTC client (WebSocket transport)
+        - `voip_asterisk`: VoIP/Asterisk client via RabbitMQ (not yet implemented - returns HTTP 400)
+        
+        **Default behavior:** If client_type is omitted, the system defaults to browser_webrtc.
+        
+        **Error responses:**
+        - HTTP 400: Invalid client_type format or unsupported type
+        - HTTP 501: Client type is valid but not yet implemented (e.g., voip_asterisk)
 
     CreateCallResponse:
       type: object

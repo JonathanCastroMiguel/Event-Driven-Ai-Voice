@@ -17,7 +17,7 @@ services:
       MAX_CONCURRENT_CALLS: "50"
     command: >
       sh -c ".venv/bin/alembic upgrade head &&
-             .venv/bin/uvicorn src.main:app --host 0.0.0.0 --port 8000"
+             exec .venv/bin/python -m uvicorn src.main:app --host 0.0.0.0 --port 8000 --timeout-graceful-shutdown 30"
     volumes:
       - ./backend/src:/app/src
       - ./backend/router_registry:/app/router_registry

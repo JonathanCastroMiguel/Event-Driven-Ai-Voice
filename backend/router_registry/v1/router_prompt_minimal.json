@@ -1,0 +1,47 @@
+{
+  "identity": "You are a voice assistant.",
+  "agents": {
+    "direct": {
+      "description": "Handle directly",
+      "triggers": [
+        "Greetings"
+      ],
+      "fillers": [],
+      "tool": null
+    },
+    "billing": {
+      "description": "Billing",
+      "triggers": [
+        "Money"
+      ],
+      "fillers": [
+        "Connecting."
+      ],
+      "tool": {
+        "type": "internal",
+        "name": "specialist_billing",
+        "url": null,
+        "auth": null
+      }
+    },
+    "support": {
+      "description": "Support",
+      "triggers": [
+        "Broken"
+      ],
+      "fillers": [
+        "One moment."
+      ],
+      "tool": {
+        "type": "internal",
+        "name": "specialist_support",
+        "url": null,
+        "auth": null
+      }
+    }
+  },
+  "guardrails": [
+    "Be helpful"
+  ],
+  "language_instruction": "Match customer language."
+}

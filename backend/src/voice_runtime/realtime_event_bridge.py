@@ -27,6 +27,7 @@ from src.voice_runtime.events import (
     RealtimeVoiceStart,
 )
 from src.voice_runtime.types import EventSource
+from src.voice_runtime.voice_client import VoiceClient, VoiceClientInfo, VoiceClientType
 
 logger = structlog.get_logger()
 
@@ -34,16 +35,33 @@ logger = structlog.get_logger()
 class OpenAIRealtimeEventBridge:
     """Bridge between browser-forwarded OpenAI events and Coordinator.
 
-    Implements the RealtimeClient protocol:
+    Implements the VoiceClient protocol for Browser WebRTC ingress type.
+    
+    VoiceClient Protocol:
+    - client_type → BROWSER_WEBRTC
+    - client_info → metadata including client_id, connected_at, user-agent
     - on_event() → registers callback for translated EventEnvelopes
     - send_voice_start() → response.create (sent to frontend)
     - send_voice_cancel() → response.cancel (sent to frontend)
     - close() → teardown
     """
 
-    def __init__(self, call_id: UUID, valid_departments: set[str] | None = None) -> None:
+    def __init__(
+        self, 
+        call_id: UUID, 
+        valid_departments: set[str] | None = None,
+        user_agent: str | None = None
+    ) -> None:
         self._call_id = call_id
         self._valid_departments = valid_departments or {"direct", "sales", "billing", "support", "retention"}
+        
+        # VoiceClient protocol: stable client ID and metadata
+        self._client_id: UUID = uuid4()
+        self._connected_at: int = _now_ms()
+        self._metadata: dict[str, Any] = {}
+        if user_agent:
+            self._metadata["user_agent"] = user_agent
+        
         self._callback: Callable[[EventEnvelope], Coroutine[Any, Any, None]] | None = (
             None
         )
@@ -59,6 +77,25 @@ class OpenAIRealtimeEventBridge:
         self._last_instructions: str = ""
         self._pending_fn_call_id: str = ""
         self._pending_fn_item_id: str = ""
+    
+    # ------------------------------------------------------------------
+    # VoiceClient protocol: type awareness
+    # ------------------------------------------------------------------
+    
+    @property
+    def client_type(self) -> VoiceClientType:
+        """Return the type of this voice client (Browser WebRTC)."""
+        return VoiceClientType.BROWSER_WEBRTC
+    
+    @property
+    def client_info(self) -> VoiceClientInfo:
+        """Return full metadata for this client instance."""
+        return VoiceClientInfo(
+            client_id=self._client_id,
+            client_type=VoiceClientType.BROWSER_WEBRTC,
+            connected_at=self._connected_at,
+            metadata=self._metadata.copy()  # Return a copy for immutability
+        )
 
     # ------------------------------------------------------------------
     # RealtimeClient protocol: on_event

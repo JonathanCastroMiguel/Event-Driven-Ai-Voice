@@ -15,10 +15,11 @@ from uuid import UUID, uuid4
 import httpx
 import orjson
 import structlog
-from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 from src.config import settings
+from src.infrastructure.session_models import ConcurrencyLimitExceeded
 from src.routing.model_router import RouterPromptBuilder
 from src.routing.policies import PoliciesRegistry
 from src.voice_runtime.agent_fsm import AgentFSM
@@ -32,6 +33,12 @@ from src.voice_runtime.realtime_event_bridge import OpenAIRealtimeEventBridge
 from src.voice_runtime.specialist_tools import register_specialist_tools
 from src.voice_runtime.tool_executor import ToolExecutor
 from src.voice_runtime.turn_manager import TurnManager
+from src.voice_runtime.voice_client import VoiceClientType
+from src.voice_runtime.voice_client_factory import (
+    UnsupportedClientTypeError,
+    create_voice_client,
+    get_supported_types,
+)
 
 logger = structlog.get_logger()
 
@@ -102,7 +109,28 @@ class CallSessionEntry:
 _sessions: dict[UUID, CallSessionEntry] = {}
 
 
+def get_session_from_repository(request: Request, call_id: UUID) -> CallSessionEntry:
+    """Retrieve session from SessionRepository.
+    
+    Args:
+        request: FastAPI request object (contains app.state with repository)
+        call_id: The call identifier
+        
+    Returns:
+        CallSessionEntry if found
+        
+    Raises:
+        HTTPException (404) if session not found
+    """
+    repository = request.app.state.session_repository
+    entry = repository.get_session(call_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Call not found")
+    return entry
+
+
 def get_session(call_id: UUID) -> CallSessionEntry:
+    """Legacy function for backward compatibility - use get_session_from_repository in new code."""
     entry = _sessions.get(call_id)
     if entry is None:
         raise HTTPException(status_code=404, detail="Call not found")
@@ -114,16 +142,50 @@ def get_session(call_id: UUID) -> CallSessionEntry:
 # ---------------------------------------------------------------------------
 
 
+class CreateCallRequest(BaseModel):
+    """Request body for creating a new call session."""
+    client_type: str | None = None  # Optional, defaults to "browser_webrtc"
+
+
 class CreateCallResponse(BaseModel):
     call_id: str
     status: str
 
 
 @router.post("", status_code=201, response_model=CreateCallResponse)
-async def create_call() -> CreateCallResponse:
+async def create_call(request: Request, req_body: CreateCallRequest | None = None) -> CreateCallResponse:
     """Create a new voice call session with runtime actors."""
-    if len(_sessions) >= settings.max_concurrent_calls:
-        raise HTTPException(status_code=503, detail="max_calls_exceeded")
+    # Handle optional request body (backward compatibility)
+    if req_body is None:
+        req_body = CreateCallRequest()
+    
+    # Validate and normalize client_type
+    client_type_str = req_body.client_type if req_body.client_type is not None else "browser_webrtc"
+    
+    # Reject empty strings
+    if client_type_str == "":
+        supported = [t.value for t in get_supported_types()]
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid client_type: empty string. Supported types: {', '.join(supported)}"
+        )
+    
+    try:
+        client_type = VoiceClientType(client_type_str)
+    except ValueError:
+        supported = [t.value for t in get_supported_types()]
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid client_type: {client_type_str}. Supported types: {', '.join(supported)}"
+        )
+    
+    # Check if client type is implemented
+    if client_type not in get_supported_types():
+        supported = [t.value for t in get_supported_types()]
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported client_type: {client_type_str}. Supported types: {', '.join(supported)}"
+        )
 
     call_id = uuid4()
 
@@ -146,7 +208,20 @@ async def create_call() -> CreateCallResponse:
     )
 
     valid_depts = _shared_router_prompt_builder.config.valid_departments if _shared_router_prompt_builder else None
-    bridge = OpenAIRealtimeEventBridge(call_id=call_id, valid_departments=valid_depts)
+    
+    # Use factory to create voice client based on client_type
+    try:
+        bridge = create_voice_client(
+            client_type=client_type,
+            call_id=call_id,
+            valid_departments=valid_depts
+        )
+    except NotImplementedError as e:
+        # Client type is valid but not yet implemented
+        raise HTTPException(status_code=501, detail=str(e))
+    except UnsupportedClientTypeError as e:
+        # Should not reach here due to earlier validation, but handle gracefully
+        raise HTTPException(status_code=400, detail=str(e))
 
     # Wire bridge events to coordinator (input: OpenAI → Coordinator)
     bridge.on_event(coordinator.handle_event)
@@ -177,9 +252,28 @@ async def create_call() -> CreateCallResponse:
         tool_executor=tool_executor,
         bridge=bridge,
     )
+    
+    # Also keep in _sessions dict for backward compatibility
     _sessions[call_id] = entry
+    
+    # Try to register with SessionRepository (if available)
+    try:
+        repository = getattr(request.app.state, "session_repository", None)
+        if repository:
+            try:
+                await repository.create_session(call_id, client_type_str, entry)
+            except ConcurrencyLimitExceeded as e:
+                logger.warning("concurrency_limit_exceeded_on_create", call_id=str(call_id))
+                raise HTTPException(
+                    status_code=503,
+                    detail="Service unavailable: max concurrent calls exceeded",
+                    headers={"Retry-After": str(settings.graceful_shutdown_timeout)},
+                )
+    except Exception as e:
+        logger.warning("session_repository_registration_failed", error=str(e))
+        # Continue with _sessions as fallback
 
-    logger.info("call_created", call_id=str(call_id))
+    logger.info("call_created", call_id=str(call_id), client_type=client_type_str)
     return CreateCallResponse(call_id=str(call_id), status="created")
 
 
@@ -199,7 +293,7 @@ class SDPResponse(BaseModel):
 
 
 @router.post("/{call_id}/offer", response_model=SDPResponse)
-async def handle_offer(call_id: UUID, body: SDPRequest) -> SDPResponse:
+async def handle_offer(request: Request, call_id: UUID, body: SDPRequest) -> SDPResponse:
     """Two-step SDP exchange with OpenAI Realtime WebRTC API.
 
     Step 1: POST /v1/realtime/sessions — create session with config
@@ -209,7 +303,20 @@ async def handle_offer(call_id: UUID, body: SDPRequest) -> SDPResponse:
     The browser establishes a direct WebRTC connection with OpenAI for audio.
     Events are forwarded to the backend via a separate WebSocket (see events_ws).
     """
-    get_session(call_id)
+    # Try to get from repository first, then fallback to _sessions
+    session = None
+    try:
+        repository = getattr(request.app.state, "session_repository", None)
+        if repository:
+            session = repository.get_session(call_id)
+    except Exception:
+        pass
+    
+    if not session:
+        session = _sessions.get(call_id)
+    
+    if not session:
+        raise HTTPException(status_code=404, detail="Call not found")
 
     model = settings.openai_realtime_model
 
@@ -300,9 +407,15 @@ async def events_ws(websocket: WebSocket, call_id: UUID) -> None:
     Input:  Browser forwards OpenAI data channel events → Bridge → Coordinator
     Output: Coordinator commands → Bridge → Browser → OpenAI data channel
     """
-    entry = _sessions.get(call_id)
-    if entry is None:
-        await websocket.close(code=4004, reason="Call not found")
+    # Try to get session from repository
+    try:
+        # We don't have access to request in websocket handler, so use the fallback
+        entry = _sessions.get(call_id)
+        if entry is None:
+            await websocket.close(code=4004, reason="Call not found")
+            return
+    except Exception:
+        await websocket.close(code=4500, reason="Internal server error")
         return
 
     await websocket.accept()
@@ -374,15 +487,33 @@ async def events_ws(websocket: WebSocket, call_id: UUID) -> None:
 
 
 @router.delete("/{call_id}", status_code=204)
-async def delete_call(call_id: UUID) -> None:
+async def delete_call(request: Request, call_id: UUID) -> None:
     """End a call, tear down runtime actors, close bridge."""
-    get_session(call_id)
-    session = _sessions.pop(call_id, None)
+    session = None
+    
+    # Try to remove from SessionRepository first (if available)
+    try:
+        repository = getattr(request.app.state, "session_repository", None)
+        if repository:
+            session = repository.get_session(call_id)
+            if session:
+                await repository.remove_session(call_id)
+    except Exception as e:
+        logger.warning("session_repository_cleanup_failed", call_id=str(call_id), error=str(e))
+    
+    # Fallback to _sessions dict
+    if not session:
+        session = _sessions.pop(call_id, None)
+        if session is None:
+            raise HTTPException(status_code=404, detail="Call not found")
+    else:
+        # Also remove from _sessions for backward compatibility
+        _sessions.pop(call_id, None)
 
-    if session is not None:
-        try:
-            await session.bridge.close()
-        except Exception:
-            logger.warning("bridge_close_error", call_id=str(call_id), exc_info=True)
+    # Close the bridge
+    try:
+        await session.bridge.close()
+    except Exception:
+        logger.warning("bridge_close_error", call_id=str(call_id), exc_info=True)
 
     logger.info("call_ended", call_id=str(call_id))

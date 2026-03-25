@@ -554,3 +554,77 @@ class TestResponseSourceAndTiming:
 
         assert bridge._response_created_ms == 0
         assert bridge._current_response_source == "router"
+
+
+# ---------------------------------------------------------------------------
+# VoiceClient protocol compliance
+# ---------------------------------------------------------------------------
+
+
+class TestVoiceClientProtocol:
+    """Tests for VoiceClient protocol implementation."""
+    
+    def test_bridge_implements_client_type_property_correctly(self, bridge):
+        """Test bridge implements client_type property returning BROWSER_WEBRTC."""
+        from src.voice_runtime.voice_client import VoiceClientType
+        
+        assert hasattr(bridge, 'client_type')
+        assert bridge.client_type == VoiceClientType.BROWSER_WEBRTC
+    
+    def test_bridge_implements_client_info_property_with_all_fields(self, bridge):
+        """Test bridge implements client_info property with all required fields."""
+        from src.voice_runtime.voice_client import VoiceClientInfo, VoiceClientType
+        
+        assert hasattr(bridge, 'client_info')
+        
+        client_info = bridge.client_info
+        assert isinstance(client_info, VoiceClientInfo)
+        assert client_info.client_id is not None
+        assert client_info.client_type == VoiceClientType.BROWSER_WEBRTC
+        assert client_info.connected_at > 0
+        assert isinstance(client_info.metadata, dict)
+    
+    def test_client_id_remains_stable_across_multiple_accesses(self, bridge):
+        """Test client_id remains stable for the lifetime of the bridge instance."""
+        client_id_1 = bridge.client_info.client_id
+        client_id_2 = bridge.client_info.client_id
+        client_id_3 = bridge.client_info.client_id
+        
+        assert client_id_1 == client_id_2 == client_id_3
+    
+    def test_different_bridge_instances_have_different_client_ids(self, call_id):
+        """Test different bridge instances have unique client_ids."""
+        bridge1 = OpenAIRealtimeEventBridge(call_id=call_id)
+        bridge2 = OpenAIRealtimeEventBridge(call_id=call_id)
+        
+        assert bridge1.client_info.client_id != bridge2.client_info.client_id
+    
+    def test_bridge_populates_user_agent_metadata_when_provided(self, call_id):
+        """Test bridge populates metadata with user-agent when provided."""
+        user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
+        bridge = OpenAIRealtimeEventBridge(call_id=call_id, user_agent=user_agent)
+        
+        client_info = bridge.client_info
+        assert "user_agent" in client_info.metadata
+        assert client_info.metadata["user_agent"] == user_agent
+    
+    def test_bridge_metadata_is_empty_when_no_user_agent(self, bridge):
+        """Test metadata is empty dict when no user-agent provided."""
+        client_info = bridge.client_info
+        assert client_info.metadata == {}
+    
+    def test_bridge_preserves_existing_methods(self, bridge):
+        """Test bridge preserves all existing methods (zero behavior change)."""
+        # Verify all required methods exist
+        assert hasattr(bridge, 'on_event')
+        assert hasattr(bridge, 'send_voice_start')
+        assert hasattr(bridge, 'send_voice_cancel')
+        assert hasattr(bridge, 'close')
+        assert hasattr(bridge, 'set_frontend_ws')
+        assert hasattr(bridge, 'handle_frontend_event')
+        
+        # Verify they're callable
+        assert callable(bridge.on_event)
+        assert callable(bridge.send_voice_start)
+        assert callable(bridge.send_voice_cancel)
+        assert callable(bridge.close)

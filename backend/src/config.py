@@ -48,6 +48,7 @@ class Settings(BaseSettings):
 
     # Calls
     max_concurrent_calls: int = 50
+    graceful_shutdown_timeout: int = 10  # seconds
 
     # Router registry
     router_registry_path: str = "router_registry/v1"

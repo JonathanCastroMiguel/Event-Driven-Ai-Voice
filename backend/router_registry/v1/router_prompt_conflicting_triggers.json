@@ -1,0 +1,73 @@
+{
+  "identity": "You are a call center voice assistant for a telecommunications company.",
+  "agents": {
+    "direct": {
+      "description": "Handle directly without specialist",
+      "triggers": [
+        "Greetings and small talk",
+        "Questions about billing charges",
+        "Technical support requests",
+        "Plan upgrade inquiries"
+      ],
+      "fillers": [],
+      "tool": null
+    },
+    "billing": {
+      "description": "Billing specialist",
+      "triggers": [
+        "Questions about billing charges",
+        "Payment issues",
+        "Invoice disputes",
+        "Plan upgrade inquiries related to pricing"
+      ],
+      "fillers": [
+        "Let me connect you with billing."
+      ],
+      "tool": {
+        "type": "internal",
+        "name": "specialist_billing",
+        "url": null,
+        "auth": null
+      }
+    },
+    "sales": {
+      "description": "Sales specialist",
+      "triggers": [
+        "Plan upgrade inquiries",
+        "New service questions",
+        "Questions about billing charges for new plans"
+      ],
+      "fillers": [
+        "Let me connect you with sales."
+      ],
+      "tool": {
+        "type": "internal",
+        "name": "specialist_sales",
+        "url": null,
+        "auth": null
+      }
+    },
+    "support": {
+      "description": "Technical support specialist",
+      "triggers": [
+        "Technical support requests",
+        "Internet speed issues",
+        "Plan upgrade inquiries for better speed"
+      ],
+      "fillers": [
+        "Let me connect you with support."
+      ],
+      "tool": {
+        "type": "internal",
+        "name": "specialist_support",
+        "url": null,
+        "auth": null
+      }
+    }
+  },
+  "guardrails": [
+    "When triggers conflict between agents, choose the most specific match",
+    "If still ambiguous, ask user to clarify their primary concern"
+  ],
+  "language_instruction": "Respond in the same language the customer is speaking."
+}

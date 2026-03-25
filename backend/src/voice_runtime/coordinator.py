@@ -98,6 +98,9 @@ class Coordinator:
             [RealtimeVoiceStart | RealtimeVoiceCancel | CancelAgentGeneration],
             Coroutine[Any, Any, None],
         ] | None = None
+        
+        # call_id isolation observability counter
+        self._call_id_mismatch_count: int = 0
 
     @property
     def state(self) -> CoordinatorRuntimeState:
@@ -245,6 +248,16 @@ class Coordinator:
 
     async def handle_event(self, envelope: EventEnvelope) -> None:
         """Main entry point: dispatch event by type."""
+        # call_id isolation guard: validate envelope call_id matches coordinator call_id
+        if envelope.call_id != self._call_id:
+            logger.warning(
+                "call_id_mismatch",
+                expected_call_id=str(self._call_id),
+                envelope_call_id=str(envelope.call_id),
+            )
+            self._call_id_mismatch_count += 1
+            return  # Drop event: mismatched call_id
+        
         logger.info(
             "coordinator_handle_event",
             call_id=str(self._call_id),
@@ -937,3 +950,32 @@ class Coordinator:
         if self._filler_task is not None and not self._filler_task.done():
             self._filler_task.cancel()
             self._filler_task = None
+
+    # ------------------------------------------------------------------
+    # call_id Isolation & Observability
+    # ------------------------------------------------------------------
+
+    def get_call_id_mismatch_count(self) -> int:
+        """Return the number of events dropped due to call_id mismatch."""
+        return self._call_id_mismatch_count
+
+    # ------------------------------------------------------------------
+    # Graceful Shutdown
+    # ------------------------------------------------------------------
+
+    async def on_shutdown(self) -> None:
+        """Handle graceful shutdown: finalize any in-flight operations.
+        
+        Called by SessionRepository during graceful shutdown.
+        This allows the Coordinator to finalize events, close resources, etc.
+        """
+        logger.info("coordinator_shutdown_requested", call_id=str(self._call_id))
+        
+        # Cancel any active filler operations
+        self._cancel_filler()
+        
+        # Optionally send a debug event indicating shutdown
+        if self._debug_enabled:
+            await self._send_debug("coordinator_shutting_down")
+        
+        logger.info("coordinator_shutdown_complete", call_id=str(self._call_id))
