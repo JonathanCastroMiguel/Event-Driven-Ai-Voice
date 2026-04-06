@@ -82,9 +82,9 @@ The router registry lives at `backend/router_registry/v1/` and contains:
 
 ### 6.1 Specialist Tools
 
-Mock specialist tools live at `backend/src/voice_runtime/specialist_tools.py`. Four tools (`specialist_sales`, `specialist_billing`, `specialist_support`, `specialist_retention`) are registered in `ToolExecutor` at call creation via `register_specialist_tools()`. Each tool has its own prompt builder with department-specific triage examples (sales: plan/features/budget, billing: invoice/charge/amount, support: device/error/timing, retention: reason/tenure/retention). Shared `_TRIAGE_FRAMEWORK` enforces mandatory clarifying questions before transfer and dynamic language matching from conversation history. These simulate future LangGraph/LangChain sub-agents.
+Specialist tools live at `backend/src/voice_runtime/specialist_tools.py`. A shared `httpx.AsyncClient` is configured at startup via `configure(api_key, model, timeout_s)` for calling the OpenAI Chat Completions API. Each department has its own system prompt (`_SALES_SYSTEM_PROMPT`, `_BILLING_SYSTEM_PROMPT`, etc.) with department-specific triage examples. The core `_call_text_model(system_prompt, user_message) -> str | None` function calls `gpt-4o` (configurable via `specialist_model` setting) to generate triage responses. The shared `_TRIAGE_FRAMEWORK` enforces mandatory clarifying questions before transfer and dynamic language matching. On text model failure, tools fall back to returning a `response.create` dict for the Realtime model to interpret. The Coordinator wraps successful text responses in a "say exactly" directive to prevent the Realtime model from paraphrasing. Config: `specialist_model` (default `gpt-4o`), `specialist_timeout_s` (default 5.0s).
 
-Tests: `backend/tests/unit/test_specialist_tools.py` (9 tests: prompt differentiation, no hardcoded Spanish, department-specific keywords, history embedding) + `backend/tests/unit/test_two_step_routing.py` (13 tests: function call parsing, tool registration, payload structure).
+Tests: `backend/tests/unit/test_specialist_tools.py` (13 tests: text model success/failure/not-configured, fallback behavior, history embedding) + `backend/tests/e2e/test_event_pipeline.py` (str vs dict payload coordinator tests).
 
 ### 7. Run the Server
 
