@@ -1,14 +1,91 @@
-"""Mock specialist tools for demo routing.
+"""Specialist tools for triage routing.
 
-Each tool simulates a specialist sub-agent (future: LangGraph/LangChain).
-The tool receives the customer summary and conversation history, and returns
-a complete response.create payload that the Coordinator forwards to the
-voice agent without modification.
+Each tool generates a triage response by calling a text model (gpt-4o) with
+the department prompt and conversation history. The text model follows
+structured triage instructions reliably. If the text model call fails,
+the tool falls back to returning a response.create dict for the Realtime
+model to interpret (legacy behavior).
 """
 
 from __future__ import annotations
 
 from typing import Any
+
+import httpx
+import structlog
+
+logger = structlog.get_logger()
+
+# ---------------------------------------------------------------------------
+# Module-level client (configured at startup)
+# ---------------------------------------------------------------------------
+
+_client: httpx.AsyncClient | None = None
+_model: str = "gpt-4o"
+_timeout_s: float = 5.0
+
+
+def configure(api_key: str, model: str, timeout_s: float) -> None:
+    """Initialize the shared httpx client for text model calls."""
+    global _client, _model, _timeout_s
+    _model = model
+    _timeout_s = timeout_s
+    _client = httpx.AsyncClient(
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=httpx.Timeout(timeout_s),
+    )
+
+
+async def close() -> None:
+    """Shut down the shared httpx client gracefully."""
+    global _client
+    if _client is not None:
+        await _client.aclose()
+        _client = None
+
+
+# ---------------------------------------------------------------------------
+# Text model call
+# ---------------------------------------------------------------------------
+
+async def _call_text_model(system_prompt: str, user_message: str) -> str | None:
+    """Call the text model and return the response text, or None on failure."""
+    if _client is None:
+        logger.warning("specialist_text_model_not_configured")
+        return None
+
+    try:
+        resp = await _client.post(
+            "https://api.openai.com/v1/chat/completions",
+            json={
+                "model": _model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_message},
+                ],
+                "max_tokens": 200,
+                "temperature": 0.8,
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"]
+        if not content or not content.strip():
+            logger.warning("specialist_text_model_empty_response")
+            return None
+        return content.strip()
+    except httpx.TimeoutException:
+        logger.warning("specialist_text_model_timeout", timeout_s=_timeout_s)
+        return None
+    except httpx.HTTPStatusError as exc:
+        logger.warning(
+            "specialist_text_model_http_error",
+            status_code=exc.response.status_code,
+        )
+        return None
+    except Exception:
+        logger.warning("specialist_text_model_error", exc_info=True)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -78,100 +155,92 @@ _TRIAGE_FRAMEWORK = (
 
 
 # ---------------------------------------------------------------------------
-# Per-department prompt builders
+# Per-department system prompts
 # ---------------------------------------------------------------------------
 
-def _build_sales_prompt(
-    summary: str, history: list[dict[str, Any]],
-) -> dict[str, Any]:
-    """Build sales specialist prompt with sales-specific triage examples."""
+_SALES_SYSTEM_PROMPT = (
+    "You are a specialist in the sales department of a "
+    "telecommunications call center. Your job is to gather key details "
+    "about the customer's sales inquiry before transferring them to a "
+    "human sales agent.\n\n"
+    "Examples of clarifying questions you might ask (adapt to the "
+    "actual request):\n"
+    "- What plan or service are you currently on?\n"
+    "- What features or upgrades are you interested in?\n"
+    "- Do you have a budget range in mind?\n\n"
+    f"{_TRIAGE_FRAMEWORK}"
+)
+
+_BILLING_SYSTEM_PROMPT = (
+    "You are a specialist in the billing department of a "
+    "telecommunications call center. Your job is to gather key details "
+    "about the customer's billing concern before transferring them to a "
+    "human billing agent.\n\n"
+    "Examples of clarifying questions you might ask (adapt to the "
+    "actual request):\n"
+    "- Could you provide your invoice or account number?\n"
+    "- What is the approximate date and amount of the charge in "
+    "question?\n"
+    "- Is this about a recent bill or a recurring charge?\n\n"
+    f"{_TRIAGE_FRAMEWORK}"
+)
+
+_SUPPORT_SYSTEM_PROMPT = (
+    "You are a specialist in the technical support department of a "
+    "telecommunications call center. Your job is to gather key details "
+    "about the customer's technical issue before transferring them to a "
+    "human support agent.\n\n"
+    "Examples of clarifying questions you might ask (adapt to the "
+    "actual request):\n"
+    "- Which device or service is affected?\n"
+    "- Are you seeing any error messages? If so, what do they say?\n"
+    "- When did the issue start, and does it happen consistently?\n\n"
+    f"{_TRIAGE_FRAMEWORK}"
+)
+
+_RETENTION_SYSTEM_PROMPT = (
+    "You are a specialist in the retention department of a "
+    "telecommunications call center. Your job is to understand why the "
+    "customer wants to leave and gather key details before transferring "
+    "them to a human retention agent.\n\n"
+    "Examples of clarifying questions you might ask (adapt to the "
+    "actual request):\n"
+    "- Could you share what is making you consider cancelling?\n"
+    "- How long have you been with us?\n"
+    "- Is there anything specific that would change your mind?\n\n"
+    f"{_TRIAGE_FRAMEWORK}"
+)
+
+_DEPARTMENT_SYSTEM_PROMPTS: dict[str, str] = {
+    "sales": _SALES_SYSTEM_PROMPT,
+    "billing": _BILLING_SYSTEM_PROMPT,
+    "support": _SUPPORT_SYSTEM_PROMPT,
+    "retention": _RETENTION_SYSTEM_PROMPT,
+}
+
+
+# ---------------------------------------------------------------------------
+# Specialist call (text model with fallback)
+# ---------------------------------------------------------------------------
+
+async def _run_specialist(
+    department: str,
+    summary: str,
+    history: list[dict[str, Any]],
+) -> str | dict[str, Any]:
+    """Call text model for triage response; fall back to response.create dict."""
+    system_prompt = _DEPARTMENT_SYSTEM_PROMPTS[department]
     history_block = _format_history_block(history)
+    user_message = f"{history_block}\n\nCustomer request: {summary}"
 
-    instructions = (
-        "You are a specialist in the sales department of a "
-        "telecommunications call center. Your job is to gather key details "
-        "about the customer's sales inquiry before transferring them to a "
-        "human sales agent.\n\n"
-        "Examples of clarifying questions you might ask (adapt to the "
-        "actual request):\n"
-        "- What plan or service are you currently on?\n"
-        "- What features or upgrades are you interested in?\n"
-        "- Do you have a budget range in mind?\n\n"
-        f"{_TRIAGE_FRAMEWORK}"
-        f"{history_block}\n\n"
-        f"Customer request: {summary}"
-    )
-    return _wrap_response_create(instructions)
+    text = await _call_text_model(system_prompt, user_message)
+    if text is not None:
+        return text
 
-
-def _build_billing_prompt(
-    summary: str, history: list[dict[str, Any]],
-) -> dict[str, Any]:
-    """Build billing specialist prompt with billing-specific triage examples."""
-    history_block = _format_history_block(history)
-
-    instructions = (
-        "You are a specialist in the billing department of a "
-        "telecommunications call center. Your job is to gather key details "
-        "about the customer's billing concern before transferring them to a "
-        "human billing agent.\n\n"
-        "Examples of clarifying questions you might ask (adapt to the "
-        "actual request):\n"
-        "- Could you provide your invoice or account number?\n"
-        "- What is the approximate date and amount of the charge in "
-        "question?\n"
-        "- Is this about a recent bill or a recurring charge?\n\n"
-        f"{_TRIAGE_FRAMEWORK}"
-        f"{history_block}\n\n"
-        f"Customer request: {summary}"
-    )
-    return _wrap_response_create(instructions)
-
-
-def _build_support_prompt(
-    summary: str, history: list[dict[str, Any]],
-) -> dict[str, Any]:
-    """Build support specialist prompt with support-specific triage examples."""
-    history_block = _format_history_block(history)
-
-    instructions = (
-        "You are a specialist in the technical support department of a "
-        "telecommunications call center. Your job is to gather key details "
-        "about the customer's technical issue before transferring them to a "
-        "human support agent.\n\n"
-        "Examples of clarifying questions you might ask (adapt to the "
-        "actual request):\n"
-        "- Which device or service is affected?\n"
-        "- Are you seeing any error messages? If so, what do they say?\n"
-        "- When did the issue start, and does it happen consistently?\n\n"
-        f"{_TRIAGE_FRAMEWORK}"
-        f"{history_block}\n\n"
-        f"Customer request: {summary}"
-    )
-    return _wrap_response_create(instructions)
-
-
-def _build_retention_prompt(
-    summary: str, history: list[dict[str, Any]],
-) -> dict[str, Any]:
-    """Build retention specialist prompt with retention-specific triage examples."""
-    history_block = _format_history_block(history)
-
-    instructions = (
-        "You are a specialist in the retention department of a "
-        "telecommunications call center. Your job is to understand why the "
-        "customer wants to leave and gather key details before transferring "
-        "them to a human retention agent.\n\n"
-        "Examples of clarifying questions you might ask (adapt to the "
-        "actual request):\n"
-        "- Could you share what is making you consider cancelling?\n"
-        "- How long have you been with us?\n"
-        "- Is there anything specific that would change your mind?\n\n"
-        f"{_TRIAGE_FRAMEWORK}"
-        f"{history_block}\n\n"
-        f"Customer request: {summary}"
-    )
-    return _wrap_response_create(instructions)
+    # Fallback: build full instructions for Realtime model to interpret
+    logger.warning("specialist_fallback_to_realtime", department=department)
+    full_instructions = f"{system_prompt}{history_block}\n\nCustomer request: {summary}"
+    return _wrap_response_create(full_instructions)
 
 
 # ---------------------------------------------------------------------------
@@ -180,30 +249,30 @@ def _build_retention_prompt(
 
 async def specialist_sales(
     summary: str, history: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    """Mock sales specialist tool."""
-    return _build_sales_prompt(summary, history or [])
+) -> str | dict[str, Any]:
+    """Sales specialist triage tool."""
+    return await _run_specialist("sales", summary, history or [])
 
 
 async def specialist_billing(
     summary: str, history: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    """Mock billing specialist tool."""
-    return _build_billing_prompt(summary, history or [])
+) -> str | dict[str, Any]:
+    """Billing specialist triage tool."""
+    return await _run_specialist("billing", summary, history or [])
 
 
 async def specialist_support(
     summary: str, history: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    """Mock support specialist tool."""
-    return _build_support_prompt(summary, history or [])
+) -> str | dict[str, Any]:
+    """Support specialist triage tool."""
+    return await _run_specialist("support", summary, history or [])
 
 
 async def specialist_retention(
     summary: str, history: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    """Mock retention specialist tool."""
-    return _build_retention_prompt(summary, history or [])
+) -> str | dict[str, Any]:
+    """Retention specialist triage tool."""
+    return await _run_specialist("retention", summary, history or [])
 
 
 def register_specialist_tools(tool_executor: Any) -> None:

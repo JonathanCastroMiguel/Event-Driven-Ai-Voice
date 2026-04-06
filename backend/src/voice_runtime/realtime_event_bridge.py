@@ -129,11 +129,16 @@ class OpenAIRealtimeEventBridge:
             )
             await self.send_to_frontend(event.prompt)
         else:
+            text = event.prompt if isinstance(event.prompt, str) else ""
             response_create: dict[str, Any] = {
                 "type": "response.create",
                 "response": {
                     "modalities": ["text", "audio"],
-                    "instructions": event.prompt if isinstance(event.prompt, str) else "",
+                    "instructions": (
+                        f"Say the following to the customer in the same language "
+                        f"they have been speaking (check the conversation history). "
+                        f"Translate if needed but keep the same meaning:\n\n{text}"
+                    ),
                 },
             }
             await self.send_to_frontend(response_create)

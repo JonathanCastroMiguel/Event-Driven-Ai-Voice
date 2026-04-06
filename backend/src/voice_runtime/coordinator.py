@@ -726,9 +726,27 @@ class Coordinator:
         voice_gen_id = uuid4()
         s.active_voice_generation_id = voice_gen_id
 
-        # Use tool result payload directly as the prompt, or fallback on failure
+        # Use tool result payload as the prompt, or fallback on failure.
+        # Text model success returns str; fallback returns dict (response.create).
         if tool_result.ok:
-            specialist_prompt = tool_result.payload
+            payload = tool_result.payload
+            if isinstance(payload, str):
+                # Text model generated a literal response — wrap in directive
+                specialist_prompt = {
+                    "type": "response.create",
+                    "response": {
+                        "modalities": ["text", "audio"],
+                        "instructions": (
+                            "Say exactly the following to the customer, without "
+                            "adding or changing anything:\n\n"
+                            f"{payload}"
+                        ),
+                        "temperature": 0.6,
+                    },
+                }
+            else:
+                # Fallback dict from specialist tool (legacy path)
+                specialist_prompt = payload
         else:
             logger.warning(
                 "specialist_tool_failed",
