@@ -46,6 +46,10 @@ class Settings(BaseSettings):
     vad_silence_duration_ms: int = 200
     vad_threshold: float = 0.6
 
+    # Specialist text model
+    specialist_model: str = "gpt-4o"
+    specialist_timeout_s: float = 5.0
+
     # Calls
     max_concurrent_calls: int = 50
 

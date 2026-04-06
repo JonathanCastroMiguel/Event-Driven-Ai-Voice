@@ -86,12 +86,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.agent_gen_repo = PgAgentGenerationRepository(db_pool)
     app.state.voice_gen_repo = PgVoiceGenerationRepository(db_pool)
 
+    # 7. Configure specialist text model client
+    from src.voice_runtime.specialist_tools import configure as configure_specialist
+    from src.voice_runtime.specialist_tools import close as close_specialist
+
+    configure_specialist(
+        api_key=settings.openai_api_key,
+        model=settings.specialist_model,
+        timeout_s=settings.specialist_timeout_s,
+    )
+    logger.info("specialist_tools_configured", model=settings.specialist_model)
+
     logger.info("startup_complete")
 
     yield
 
     # --- Shutdown ---
     logger.info("shutdown_begin")
+    await close_specialist()
     await db_pool.close()
     await redis.aclose()
     logger.info("shutdown_complete")

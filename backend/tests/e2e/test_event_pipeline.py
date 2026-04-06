@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
@@ -140,6 +141,71 @@ class TestModelRouterAction:
         await fake.model_router_action(department="support", summary="help needed")
         # After specialist: routing → waiting_tools → speaking (tool completes inline)
         assert coord._agent_fsm.state == AgentState.SPEAKING
+
+    @pytest.mark.asyncio
+    async def test_str_payload_wrapped_in_directive(self) -> None:
+        """When specialist tool returns str, coordinator wraps in 'say exactly' directive."""
+        from src.voice_runtime.events import ToolResult
+
+        coord, fake, capture = make_e2e_stack()
+        # Configure mock to return str payload (text model success)
+        coord._tool_executor.execute = AsyncMock(
+            return_value=ToolResult(
+                call_id=coord._call_id,
+                agent_generation_id=uuid4(),
+                tool_request_id=uuid4(),
+                ok=True,
+                payload="Entiendo. ¿Podrías darme tu número de factura?",
+                ts=3000,
+            )
+        )
+        await fake.speech_started()
+        await fake.audio_committed()
+        capture.drain()
+
+        await fake.model_router_action(department="billing", summary="refund")
+        events = capture.drain()
+        voice_starts = [e for e in events if isinstance(e, RealtimeVoiceStart)]
+        specialist = [v for v in voice_starts if v.response_source == "specialist"][0]
+        assert isinstance(specialist.prompt, dict)
+        assert specialist.prompt["type"] == "response.create"
+        instructions = specialist.prompt["response"]["instructions"]
+        assert "Say exactly" in instructions
+        assert "Entiendo. ¿Podrías darme tu número de factura?" in instructions
+
+    @pytest.mark.asyncio
+    async def test_dict_payload_forwarded_directly(self) -> None:
+        """When specialist tool returns dict (fallback), coordinator forwards it directly."""
+        from src.voice_runtime.events import ToolResult
+
+        coord, fake, capture = make_e2e_stack()
+        fallback_dict = {
+            "type": "response.create",
+            "response": {
+                "modalities": ["text", "audio"],
+                "instructions": "You are a billing specialist...",
+                "temperature": 0.8,
+            },
+        }
+        coord._tool_executor.execute = AsyncMock(
+            return_value=ToolResult(
+                call_id=coord._call_id,
+                agent_generation_id=uuid4(),
+                tool_request_id=uuid4(),
+                ok=True,
+                payload=fallback_dict,
+                ts=3000,
+            )
+        )
+        await fake.speech_started()
+        await fake.audio_committed()
+        capture.drain()
+
+        await fake.model_router_action(department="billing", summary="refund")
+        events = capture.drain()
+        voice_starts = [e for e in events if isinstance(e, RealtimeVoiceStart)]
+        specialist = [v for v in voice_starts if v.response_source == "specialist"][0]
+        assert specialist.prompt == fallback_dict
 
 
 # ---------------------------------------------------------------------------
