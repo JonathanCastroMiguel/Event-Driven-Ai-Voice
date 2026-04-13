@@ -10,6 +10,8 @@ import structlog
 import uvicorn
 
 from src.config import settings
+from src.infrastructure.rabbitmq_consumer import RabbitMQConsumer
+from src.infrastructure.rabbitmq_publisher import RabbitMQPublisher
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -98,6 +100,47 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("specialist_tools_configured", model=settings.specialist_model)
 
     logger.info("startup_complete")
+
+    # Initialize RabbitMQ
+    consumer_task: asyncio.Task | None = None
+ 
+    if settings.RABBITMQ_ENABLED:
+        logger.info(
+            "rabbitmq_starting",
+            queue=settings.RABBITMQ_CONSUME_QUEUE_NAME,
+        )
+
+        # Initialize RabbitMQ publisher
+        publisher = RabbitMQPublisher(
+            rabbitmq_url=settings.RABBITMQ_URL,  # type: ignore[arg-type]
+            queue_name=settings.RABBITMQ_PUBLISH_QUEUE_NAME,  # type: ignore[arg-type]
+        )
+        await publisher.connect()
+        app.state.rabbitmq_publisher = publisher
+
+        # Initialize RabbitMQ consumer
+        rabbitmq_consumer = RabbitMQConsumer(
+            rabbitmq_url=settings.RABBITMQ_URL,  # type: ignore[arg-type]
+            queue_name=settings.RABBITMQ_CONSUME_QUEUE_NAME,  # type: ignore[arg-type]
+            prefetch_count=settings.RABBITMQ_PREFETCH_COUNT
+        )
+ 
+        consumer_task = asyncio.create_task(
+            rabbitmq_consumer.start(),
+            name="rabbitmq_consumer",
+        )
+ 
+        def _on_consumer_task_done(task: asyncio.Task) -> None:
+            if not task.cancelled() and task.exception() is not None:
+                logger.error(
+                    "rabbitmq_consumer_task_failed",
+                    error=str(task.exception()),
+                )
+ 
+        consumer_task.add_done_callback(_on_consumer_task_done)
+        app.state.rabbitmq_consumer = rabbitmq_consumer
+ 
+    logger.info("Transcription service started successfully")
 
     yield
 

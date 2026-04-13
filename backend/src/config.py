@@ -57,6 +57,14 @@ class Settings(BaseSettings):
     router_registry_path: str = "router_registry/v1"
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    RABBITMQ_URL: str
+    RABBITMQ_CONSUME_QUEUE_NAME: str
+    RABBITMQ_PUBLISH_QUEUE_NAME: str
+    RABBITMQ_PREFETCH_COUNT: int
+    RABBITMQ_ENABLED: bool
+    RABBITMQ_TIMEOUT_SECONDS: float = 30.0
 
+    RABBITMQ_EXCHANGE_NAME: str
+    
 
 settings = Settings()

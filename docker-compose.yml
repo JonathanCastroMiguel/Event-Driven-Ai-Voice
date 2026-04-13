@@ -2,7 +2,7 @@ services:
   voice-runtime:
     build: ./backend
     ports:
-      - "8000:8000"
+      - "8003:8000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -15,6 +15,12 @@ services:
       REDIS_URL: redis://redis:6379/0
       STUN_SERVERS: stun:stun.l.google.com:19302
       MAX_CONCURRENT_CALLS: "50"
+      RABBITMQ_URL: ${RABBITMQ_URL}
+      RABBITMQ_CONSUME_QUEUE_NAME: ${RABBITMQ_CONSUME_QUEUE_NAME}
+      RABBITMQ_PUBLISH_QUEUE_NAME: ${RABBITMQ_PUBLISH_QUEUE_NAME}
+      RABBITMQ_PREFETCH_COUNT: ${RABBITMQ_PREFETCH_COUNT:-10}
+      RABBITMQ_ENABLED: ${RABBITMQ_ENABLED}
+      RABBITMQ_EXCHANGE_NAME: ${RABBITMQ_EXCHANGE_NAME}
     command: >
       sh -c ".venv/bin/alembic upgrade head &&
              .venv/bin/uvicorn src.main:app --host 0.0.0.0 --port 8000"
@@ -26,7 +32,7 @@ services:
     build:
       context: ./frontend
       args:
-        NEXT_PUBLIC_API_URL: http://localhost:8000
+        NEXT_PUBLIC_API_URL: http://localhost:8003
     ports:
       - "3000:3000"
     depends_on:

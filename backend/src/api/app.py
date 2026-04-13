@@ -57,9 +57,11 @@ def create_app() -> FastAPI:
     from src.api.routes.health import router as health_router
     from src.api.routes.admin import router as admin_router
     from src.api.routes.calls import router as calls_router
+    from src.api.routes.rabbintmq_publish import router as rabbitmq_publish_router
 
     app.include_router(health_router)
     app.include_router(admin_router, prefix="/api/v1")
     app.include_router(calls_router, prefix="/api/v1")
+    app.include_router(rabbitmq_publish_router, prefix="/api/v1")
 
     return app
