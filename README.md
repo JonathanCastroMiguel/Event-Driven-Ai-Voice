@@ -1,5 +1,7 @@
 # 🚀 OpenSpecs SDD System
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 ### Spec-Driven Development + AI Governance Layer
 
 This repository implements a customized OpenSpecs workflow enhanced with
@@ -205,3 +207,13 @@ Code second.
 
 This repository is a controlled development environment, not just a
 project scaffold.
+
+------------------------------------------------------------------------
+
+# 📝 License
+
+This project is distributed under the **MIT License**.
+
+See the [LICENSE](LICENSE) file for the full text.
+
+Copyright (c) 2026 Jonathan Castro Miguel
