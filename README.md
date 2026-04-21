@@ -172,6 +172,46 @@ the full contribution process.
 
 ---
 
+## AI-Assisted Development & SDD Scaffolding
+
+Part of this codebase was produced with AI assistance (Claude Code) under a
+**custom Spec-Driven Development (SDD) framework**. The specs, change
+proposals, tasks, and governance commands used during development are kept
+in the repository **intentionally** — as a traceability record of how AI was
+used to design and implement the system.
+
+These artifacts are **not required to run the application**. They document
+*how* the project evolved (proposals, deltas, spec versions, task lists) and
+*how* AI was governed to produce the code.
+
+### Folders and files dedicated to SDD / AI governance
+
+| Path | Purpose |
+|---|---|
+| [`ai-specs/`](ai-specs/) | Authoritative project specifications, standards, and templates (source of truth for SDD) |
+| [`openspec/`](openspec/) | OpenSpec workflow state: change proposals, deltas, archived changes, task lists |
+| [`.claude/commands/opsx/`](.claude/commands/opsx/) | OpenSpec lifecycle slash-commands (`/opsx:new`, `/opsx:apply`, `/opsx:archive`, …) |
+| [`.claude/commands/ai-specs/`](.claude/commands/ai-specs/) | AI governance slash-commands (standards init, docs update, ticket planning, …) |
+| [`.claude/skills/`](.claude/skills/) | Claude Code skills backing the OpenSpec commands |
+| [`CLAUDE.md`](CLAUDE.md) | Project-level instructions loaded into every Claude Code session |
+| [`BOOTSTRAP.md`](BOOTSTRAP.md) | Guide for reusing this repo's SDD scaffolding as a template |
+
+### Why keep them?
+
+- **Traceability** — any reviewer can inspect *how* a feature was proposed,
+  specified, implemented, and archived.
+- **Reproducibility** — specs describe the system's intended behavior
+  independently of the code; regressions can be caught by comparing code to
+  spec.
+- **Transparency** — explicit record of where AI assisted the development
+  process.
+
+If you fork this repository and do not want the SDD scaffolding, the folders
+above can be safely removed without affecting the runtime application
+(`backend/` and `frontend/`).
+
+---
+
 ## Contributing
 
 Contributions are welcome. Please read:
