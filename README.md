@@ -1,216 +1,187 @@
-# 🚀 OpenSpecs SDD System
+# Event-Driven AI Voice
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/)
+[![Next.js 15](https://img.shields.io/badge/Next.js-15-black.svg)](https://nextjs.org/)
 
-### Spec-Driven Development + AI Governance Layer
+**Event-Driven Voice Runtime for real-time call center AI automation.**
 
-This repository implements a customized OpenSpecs workflow enhanced with
-an AI governance layer.
+Real-time voice agent built on the OpenAI Realtime API with WebRTC, featuring
+model-as-router dispatch, multi-specialist agents, and an event-driven backend
+optimized for stability and latency.
 
-It enforces:
+---
 
--   Explicit technical standards
--   Deterministic documentation structure
--   Controlled change lifecycle
--   Spec‑Driven Development (SDD)
--   AI‑governed architectural discipline
+## What It Is
 
-------------------------------------------------------------------------
+A production-oriented voice AI runtime that powers conversational agents for
+call center scenarios (sales, billing, support, retention). The system
+combines:
 
-# 🧠 What Is This?
+- **Browser ↔ OpenAI Realtime API** over WebRTC for low-latency voice.
+- **Event-driven Python backend** that orchestrates turn management, routing,
+  tool execution, and persistence.
+- **Model-as-router** dispatch: one always-call tool classifies intent and
+  delegates to specialist agents.
+- **Next.js admin/monitoring frontend** with real-time call visibility.
 
-This is not just an OpenSpecs setup.
+MVP focus: **stability and latency**.
 
-It is a governed development environment composed of:
+---
 
--   OpenSpecs (workflow orchestration)
--   Custom Claude commands
--   Explicit backend & frontend standards
--   Documentation enforcement rules
--   Structured templates
--   Blocking policies for incomplete work
+## Architecture Overview
 
-The goal is to eliminate architectural drift and documentation entropy.
+```
+Browser (WebRTC)
+    ↕ Opus audio  (direct to OpenAI via WebRTC)
+    ↕ oai-events  (data channel for UI: transcription, VAD, audio state)
+    ↕ HTTP        (SDP signaling via backend proxy)
 
-------------------------------------------------------------------------
+Backend
+    → SDP Proxy              POST /v1/realtime/calls
+    → RealtimeEventBridge    WSS /v1/realtime  (OpenAI events ↔ EventEnvelopes)
 
-# 📐 Development Model: Spec‑Driven Development (SDD)
+Coordinator (CallSession)
+    ↔ TurnManager            turn detection via audio_committed
+    ↔ Agent FSM              IDLE → ROUTING → SPEAKING → ...
+    ↔ ToolExecutor           tool execution
+    ↔ RouterPromptBuilder    response.create payloads for model-as-router
+```
 
-Specifications are the source of truth.\
-Code is an implementation artifact.
+The **Coordinator** is the single orchestrator: it receives all events,
+delegates to actors, manages cancellation and idempotency, and emits voice
+output commands.
 
-The order of operations:
+Full architecture reference: [`ai-specs/specs/architecture.md`](ai-specs/specs/architecture.md)
 
-1.  Define or update specs
-2.  Apply change
-3.  Verify artifacts & tasks
-4.  Update documentation
-5.  Archive change
+---
 
-No direct coding outside this flow.
+## Tech Stack
 
-------------------------------------------------------------------------
+### Backend
+- **Python 3.12** + asyncio + uvloop
+- **FastAPI** (admin/health/webhooks); voice runtime is pure asyncio
+- **asyncpg** (hot path) + **SQLAlchemy 2.0 async** (admin CRUD)
+- **PostgreSQL 16** + **Redis 7** (caches, rate limiting, session registry)
+- **msgspec** + **orjson**
+- **sentence-transformers / onnxruntime** + **hnswlib** (routing analytics)
+- **OpenTelemetry** + **Prometheus** + **Sentry**
+- **pytest** + **pytest-asyncio**
+- **ruff** + **mypy** (strict)
+- **uv** (package manager)
 
-# 🏗 Project Architecture
+### Frontend
+- **Next.js 15** (App Router, React Server Components)
+- **TypeScript 5** (strict)
+- **Tailwind CSS 4** + **shadcn/ui**
+- **TanStack Query**
+- **pnpm**
+- **Vitest** + **Playwright**
 
-- `.claude/commands/opsx/` → OpenSpecs workflow commands
-- `.claude/commands/ai-specs/` → Governance & standards commands
-- `ai-specs/` → Specs, templates, standards, docs
-- `openspec/` → OpenSpecs CLI workflow
+### Infrastructure
+- **Docker Compose** (MVP deployment)
 
-openspec/ → OpenSpecs CLI workflow
+---
 
-------------------------------------------------------------------------
+## Quick Start
 
-# 🔄 Command Domains
+### Prerequisites
 
-Commands are organized by namespace.
+- Python 3.12+
+- Node.js 20+ and pnpm
+- Docker + Docker Compose
+- [`uv`](https://docs.astral.sh/uv/) package manager
 
-## 🔄 /opsx:\* --- OpenSpecs Workflow
+### 1. Clone & configure
 
-Lifecycle management commands:
+```bash
+git clone https://github.com/JonathanCastroMiguel/Event-Driven-Ai-Voice.git
+cd Event-Driven-Ai-Voice
+cp .env.example .env   # fill in OPENAI_API_KEY and other secrets
+```
 
--   /opsx:new --- Start a new change
--   /opsx:ff --- Fast‑forward creation of artifacts
--   /opsx:apply --- Implement change artifacts
--   /opsx:verify --- Verify implementation vs artifacts
--   /opsx:sync --- Sync delta specs into main specs
--   /opsx:continue --- Continue experimental workflow
--   /opsx:archive --- Archive completed change
--   /opsx:bulk-archive --- Archive multiple changes
--   /opsx:explore --- Investigation mode (no implementation)
--   /opsx:onboard --- Guided onboarding through workflow
+### 2. Start infrastructure
 
-These commands manage the change lifecycle only.
+```bash
+docker compose up -d
+```
 
-------------------------------------------------------------------------
+### 3. Backend
 
-## 🧠 /ai-specs:\* --- Governance & Execution Layer
+```bash
+cd backend
+uv sync
+uv run alembic upgrade head
+uv run uvicorn src.main:app --host 0.0.0.0 --port 8000 --loop uvloop
+```
 
-These commands manage standards, documentation, planning, and execution.
+### 4. Frontend
 
--   /ai-specs:init-standards\
-    Generate backend and frontend standards from templates using your
-    tech stack.
+```bash
+cd frontend
+pnpm install
+pnpm dev
+```
 
--   /ai-specs:update-docs\
-    Enforce documentation-standards.mdc (update API spec, data model,
-    development guide).
+Open `http://localhost:3000`.
 
--   /ai-specs:new-us\  
-    Create a new structured user story aligned with SDD standards.
+Full setup instructions (env vars, router registry, migrations, tests):
+[`ai-specs/specs/development_guide.md`](ai-specs/specs/development_guide.md)
 
--   /ai-specs:enrich-us\
-    Improve and refine user stories/tickets for clarity and
-    completeness.
+---
 
--   /ai-specs:handoff-us\
-    Prepare a validated user story for implementation (technical-ready state).
+## Testing
 
--   /ai-specs:plan-backend-ticket\
-    Generate an implementation plan for backend tickets.
+```bash
+# Backend
+cd backend && uv run pytest
 
--   /ai-specs:plan-frontend-ticket\
-    Generate an implementation plan for frontend tickets.
+# Frontend unit tests
+cd frontend && pnpm test
 
--   /ai-specs:commit\  
-    Structured commit (and optional PR) workflow with governance checks.
+# Frontend E2E
+cd frontend && pnpm test:e2e
+```
 
--   /ai-specs:explain\
-    Deep conceptual explanation mode.
+---
 
--   /ai-specs:meta-prompt\
-    Improve and structure prompts for better AI execution.
+## Documentation
 
-------------------------------------------------------------------------
+All authoritative documentation lives under [`ai-specs/specs/`](ai-specs/specs/):
 
-# 📘 Standards
+| Document | Purpose |
+|---|---|
+| [`architecture.md`](ai-specs/specs/architecture.md) | End-to-end system reference |
+| [`api-spec.yml`](ai-specs/specs/api-spec.yml) | OpenAPI specification |
+| [`data-model.md`](ai-specs/specs/data-model.md) | Database schema |
+| [`development_guide.md`](ai-specs/specs/development_guide.md) | Setup & workflows |
+| [`backend-standards.mdc`](ai-specs/specs/backend-standards.mdc) | Backend conventions |
+| [`frontend-standards.mdc`](ai-specs/specs/frontend-standards.mdc) | Frontend conventions |
 
-All authoritative standards live under:
+---
 
-ai-specs/specs/
+## Development Workflow
 
-Standards may initially be empty in greenfield setups.
+This project follows **Spec-Driven Development (SDD)** through a customized
+OpenSpec workflow. Specs are the source of truth; code is an implementation
+artifact.
 
-If backend-standards.mdc or frontend-standards.mdc do not exist, run:
+Lifecycle commands live under `.claude/commands/opsx/` and
+`.claude/commands/ai-specs/`. See [CONTRIBUTING.md](CONTRIBUTING.md) for
+the full contribution process.
 
-/ai-specs:init-standards
+---
 
-This generates deterministic, stack‑specific standards from templates.
+## Contributing
 
-------------------------------------------------------------------------
+Contributions are welcome. Please read:
 
-# 📄 Templates
+- [CONTRIBUTING.md](CONTRIBUTING.md) — workflow, setup, commit style
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) — community standards
 
-Templates live under:
+---
 
-ai-specs/specs/templates/
-
-Templates define structure only (headings and section order).\
-They are never copied verbatim.
-
-Templates prevent:
-
--   Documentation drift
--   Structural inconsistency
--   AI output randomness
-
-------------------------------------------------------------------------
-
-# ⚡ QuickStart (Greenfield Setup)
-
-1.  Clone the repository
-
-    git clone `<repo>`{=html} cd `<repo>`{=html}
-
-2.  Initialize standards
-
-    /ai-specs:init-standards
-
-    Provide:
-
-    -   Backend stack
-    -   Database & ORM
-    -   API style
-    -   Testing stack
-    -   Frontend stack
-    -   Tooling & CI
-
-3.  Start a change
-
-    /opsx:new
-
-Follow the lifecycle strictly.
-
-------------------------------------------------------------------------
-
-# 🔁 Enhanced Archive Flow
-
-Archive includes:
-
-1.  Artifact verification
-2.  Task verification
-3.  Spec sync validation
-4.  Documentation update
-5.  API blocking rule
-6.  Archive execution
-
-This ensures no undocumented API changes and no architectural drift.
-
-------------------------------------------------------------------------
-
-# 🎯 Final Principle
-
-Standards first.\
-Specs first.\
-Code second.
-
-This repository is a controlled development environment, not just a
-project scaffold.
-
-------------------------------------------------------------------------
-
-# 📝 License
+## License
 
 This project is distributed under the **MIT License**.
 
