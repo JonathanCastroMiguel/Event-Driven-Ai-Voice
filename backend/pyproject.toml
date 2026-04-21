@@ -4,6 +4,11 @@ version = "0.1.0"
 description = "Event-Driven Voice Runtime for call center AI"
 readme = "README.md"
 requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Jonathan Castro Miguel" },
+]
 dependencies = [
     "alembic>=1.18.4",
     "asyncpg>=0.31.0",
