@@ -175,10 +175,11 @@ the full contribution process.
 ## AI-Assisted Development & SDD Scaffolding
 
 Part of this codebase was produced with AI assistance (Claude Code) under a
-**custom Spec-Driven Development (SDD) framework**. The specs, change
-proposals, tasks, and governance commands used during development are kept
-in the repository **intentionally** — as a traceability record of how AI was
-used to design and implement the system.
+**custom Spec-Driven Development (SDD) framework** based on the
+[SDD-BoilerPlate](https://github.com/JonathanCastroMiguel/SDD-BoilerPlate)
+template. The specs, change proposals, tasks, and governance commands used
+during development are kept in the repository **intentionally** — as a
+traceability record of how AI was used to design and implement the system.
 
 These artifacts are **not required to run the application**. They document
 *how* the project evolved (proposals, deltas, spec versions, task lists) and
