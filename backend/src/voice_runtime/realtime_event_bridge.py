@@ -14,13 +14,18 @@ from __future__ import annotations
 
 import re
 import time
-from typing import Any, Callable, Coroutine
+from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
 import orjson
 import structlog
 
 from src.routing.model_router import parse_function_call_action
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Coroutine
+
+    from fastapi import WebSocket
 from src.voice_runtime.events import (
     EventEnvelope,
     RealtimeVoiceCancel,
@@ -43,11 +48,13 @@ class OpenAIRealtimeEventBridge:
 
     def __init__(self, call_id: UUID, valid_departments: set[str] | None = None) -> None:
         self._call_id = call_id
-        self._valid_departments = valid_departments or {"direct", "sales", "billing", "support", "retention"}
+        self._valid_departments = valid_departments or {
+            "direct", "sales", "billing", "support", "retention",
+        }
         self._callback: Callable[[EventEnvelope], Coroutine[Any, Any, None]] | None = (
             None
         )
-        self._frontend_ws: Any | None = None  # FastAPI WebSocket
+        self._frontend_ws: WebSocket | None = None
         self._closed = False
         self._active_voice_generation_id: UUID | None = None
         self._response_transcript_buffer: str = ""
@@ -75,7 +82,7 @@ class OpenAIRealtimeEventBridge:
     # Frontend WebSocket management
     # ------------------------------------------------------------------
 
-    def set_frontend_ws(self, ws: Any | None) -> None:
+    def set_frontend_ws(self, ws: WebSocket | None) -> None:
         """Set or clear the frontend WebSocket connection."""
         self._frontend_ws = ws
         if ws is not None:
@@ -229,7 +236,11 @@ class OpenAIRealtimeEventBridge:
             self._response_transcript_buffer = ""
             self._response_created_ms = _now_ms()
             self._function_call_received = False
-            send_to_created_ms = self._response_created_ms - self._response_create_sent_ms if self._response_create_sent_ms else 0
+            send_to_created_ms = (
+                self._response_created_ms - self._response_create_sent_ms
+                if self._response_create_sent_ms
+                else 0
+            )
             logger.info(
                 "bridge_response_created",
                 call_id=str(self._call_id),
@@ -293,7 +304,6 @@ class OpenAIRealtimeEventBridge:
                         payload={
                             "department": action.department,
                             "summary": action.summary,
-                            "filler_text": _clean_transcript(self._response_transcript_buffer),
                         },
                         source=EventSource.REALTIME,
                     )
@@ -313,8 +323,12 @@ class OpenAIRealtimeEventBridge:
 
         elif event_type == "response.done":
             now = _now_ms()
-            created_to_done_ms = now - self._response_created_ms if self._response_created_ms else 0
-            total_response_ms = now - self._response_create_sent_ms if self._response_create_sent_ms else 0
+            created_to_done_ms = (
+                now - self._response_created_ms if self._response_created_ms else 0
+            )
+            total_response_ms = (
+                now - self._response_create_sent_ms if self._response_create_sent_ms else 0
+            )
             response_obj = data.get("response", {})
             response_status = response_obj.get("status", "completed")
             status_details = response_obj.get("status_details")
@@ -388,7 +402,7 @@ class OpenAIRealtimeEventBridge:
                 pass
             elif voice_id is not None:
                 # Normal direct response (no function call).
-                vgc_payload = {
+                vgc_payload: dict[str, Any] = {
                     "voice_generation_id": str(voice_id),
                     "transcript": transcript,
                     "response_source": self._current_response_source,
@@ -491,5 +505,9 @@ def _clean_transcript(text: str) -> str:
     """
     cleaned = _LEAKED_FUNC_RE.sub("", text).strip()
     if cleaned != text.strip():
-        logger.warning("transcript_function_leak_cleaned", original_len=len(text), cleaned_len=len(cleaned))
+        logger.warning(
+            "transcript_function_leak_cleaned",
+            original_len=len(text),
+            cleaned_len=len(cleaned),
+        )
     return cleaned

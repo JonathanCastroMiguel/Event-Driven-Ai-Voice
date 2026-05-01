@@ -228,7 +228,7 @@ class TestRouterPromptBuilder:
     def test_instructions_contain_all_sections(self, builder: RouterPromptBuilder) -> None:
         instructions = builder.system_instruction
         # System mechanic
-        assert "ALWAYS" in instructions
+        assert "MUST" in instructions
         assert "route_to_specialist" in instructions
         # Identity
         assert "You are a test assistant." in instructions

@@ -240,7 +240,9 @@ class TestOutputEventTranslation:
         assert mock_ws.send_text.call_count == 1
         msg = orjson.loads(mock_ws.send_text.call_args_list[0][0][0])
         assert msg["type"] == "response.create"
-        assert msg["response"]["instructions"] == "Un momento, por favor."
+        instructions = msg["response"]["instructions"]
+        assert "Un momento, por favor." in instructions
+        assert "same language" in instructions
 
     async def test_send_voice_cancel(self, bridge, call_id):
         mock_ws = _make_mock_ws()

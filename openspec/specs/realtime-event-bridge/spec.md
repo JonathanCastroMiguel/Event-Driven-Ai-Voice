@@ -9,7 +9,9 @@ The Bridge SHALL translate `input_audio_buffer.committed` events from OpenAI int
 The Bridge SHALL handle `response.function_call_arguments.done` events from the OpenAI Realtime API. When the model calls `route_to_specialist()`, the Bridge SHALL differentiate between `department="direct"` and specialist departments:
 
 - **Direct**: Set `_pending_direct_audio = True` and store OpenAI's `call_id` and `item_id` for later acknowledgment. Do NOT emit `model_router_action`.
-- **Specialist**: Set `_function_call_received = True`, emit `model_router_action` EventEnvelope with department, summary, and filler_text.
+- **Specialist**: Set `_function_call_received = True`, emit `model_router_action` EventEnvelope with department and summary.
+
+Because the router prompt is sent with `tool_choice="required"`, the model produces only the function call in this response — no audio is generated. Spoken output is produced by separate follow-up responses (handled by the bridge for direct, by the coordinator for specialist).
 
 #### Scenario: Model calls route_to_specialist with direct department
 - **WHEN** a `response.function_call_arguments.done` event arrives with `department="direct"`
@@ -17,18 +19,20 @@ The Bridge SHALL handle `response.function_call_arguments.done` events from the 
 
 #### Scenario: Model calls route_to_specialist with specialist department
 - **WHEN** a `response.function_call_arguments.done` event arrives with `department="billing"`
-- **THEN** the Bridge SHALL set `_function_call_received = True`, emit `model_router_action` with `payload={"department": "billing", "summary": "...", "filler_text": "..."}`, and clear `_active_voice_generation_id`
+- **THEN** the Bridge SHALL set `_function_call_received = True`, emit `model_router_action` with `payload={"department": "billing", "summary": "..."}`, and clear `_active_voice_generation_id`
 
 #### Scenario: Invalid function call name
 - **WHEN** a `response.function_call_arguments.done` event arrives with an unexpected function name
 - **THEN** the Bridge SHALL log a warning and not emit any routing event
 
-### Requirement: Transcript accumulation for action detection
-The Bridge SHALL maintain a `_response_transcript_buffer` (string) that accumulates text from `response.audio_transcript.delta` events. The buffer SHALL be reset on each new `response.created` event.
+### Requirement: Response transcript accumulation
+The Bridge SHALL maintain a `_response_transcript_buffer` (string) that accumulates text from `response.audio_transcript.delta` events. The buffer SHALL be reset on each new `response.created` event. The accumulated transcript is included in the `voice_generation_completed` envelope payload so that the conversation buffer can store the agent's spoken response.
 
-#### Scenario: Transcript accumulated across deltas
-- **WHEN** three `response.audio_transcript.delta` events arrive with text "{ ", "\"action\":", " \"specialist\"}"
-- **THEN** the Bridge SHALL accumulate the full text `{"action": "specialist"}` in the buffer
+The buffer is empty for the initial classification response (because `tool_choice="required"` suppresses audio) and populated for the audio-bearing follow-up responses (direct two-step audio and specialist "say exactly" responses).
+
+#### Scenario: Transcript accumulated across deltas during a spoken response
+- **WHEN** multiple `response.audio_transcript.delta` events arrive during a spoken response with text "Buenos ", "días, ", "¿en qué puedo ayudarle?"
+- **THEN** the Bridge SHALL accumulate the full text `Buenos días, ¿en qué puedo ayudarle?` in the buffer
 
 #### Scenario: Buffer reset on new response
 - **WHEN** a new `response.created` event arrives
@@ -47,7 +51,7 @@ The bridge SHALL translate incoming OpenAI Realtime events into Coordinator Even
 
 #### Scenario: Function call with specialist triggers routing event
 - **WHEN** `response.function_call_arguments.done` arrives with `department="billing"`
-- **THEN** the Bridge SHALL emit `model_router_action` with department, summary, and filler_text
+- **THEN** the Bridge SHALL emit `model_router_action` with department and summary
 
 #### Scenario: Response done after specialist classification
 - **WHEN** `response.done` fires and `_function_call_received` is True

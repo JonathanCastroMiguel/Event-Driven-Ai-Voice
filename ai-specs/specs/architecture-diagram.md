@@ -57,7 +57,8 @@ Visual reference for the event-driven voice runtime. See `architecture.md` for d
 │  │  OpenAI events ──→ EventEnvelopes (input translation)               │  │
 │  │  Coordinator cmds ──→ response.create / response.cancel (output)    │  │
 │  │  Function call detection (route_to_specialist)                      │  │
-│  │  Transcript accumulation (filler text + agent response)            │  │
+│  │  Two-step direct flow (audio follow-up after function call)        │  │
+│  │  Transcript accumulation (agent spoken response)                    │  │
 │  │  Response source tracking (router vs specialist)                    │  │
 │  │  Timing metrics (send_to_created_ms, created_to_done_ms)           │  │
 │  └──────────────────────────┬───────────────────────────────────────────┘  │
@@ -240,89 +241,61 @@ Visual reference for the event-driven voice runtime. See `architecture.md` for d
                     input_audio_buffer.committed
                                  │
                                  ▼
-                    ┌────────────────────────┐
-                    │ RouterPromptBuilder    │
-                    │                        │
-                    │ RouterPromptTemplate   │
-                    │ + conversation history │
-                    │ + route_to_specialist  │
-                    │   tool definition      │
-                    │ + tool_choice: "auto"  │
-                    └───────────┬────────────┘
+                    ┌────────────────────────────┐
+                    │ RouterPromptBuilder        │
+                    │                            │
+                    │ RouterPromptTemplate       │
+                    │ + conversation history     │
+                    │ + route_to_specialist tool │
+                    │ + tool_choice: "required"  │
+                    └───────────┬────────────────┘
                                 │
-                         response.create
+                         response.create  (1st)
                                 │
                                 ▼
-                    ┌────────────────────────┐
-                    │ OpenAI Realtime Model  │
-                    │                        │
-                    │ Single inference:      │
-                    │ classify + respond     │
-                    └───────────┬────────────┘
+                    ┌────────────────────────────┐
+                    │ OpenAI Realtime Model      │
+                    │                            │
+                    │ tool_choice="required"     │
+                    │ → emits ONLY a function    │
+                    │   call, no audio           │
+                    └───────────┬────────────────┘
                                 │
-                 ┌──────────────┴──────────────┐
-                 │                             │
-          Direct Response              Function Call Routing
-          (~60-70% of turns)           (specialist needed)
-                 │                             │
-                 ▼                             ▼
-        ┌────────────────┐        ┌──────────────────────────┐
-        │ Model speaks   │        │ TWO simultaneous outputs │
-        │ directly       │        │                          │
-        │ (greeting,     │        │ output[0]: Audio filler  │
-        │  clarification,│        │ "Un momento, déjame      │
-        │  guardrail)    │        │  conectarte con..."      │
-        │                │        │                          │
-        │ response.done  │        │ output[1]: Function call │
-        │  → voice_gen   │        │ route_to_specialist(     │
-        │    _completed  │        │   dept="billing",        │
-        └────────────────┘        │   summary="..."          │
-                                  │ )                        │
-                                  │ (NEVER vocalized)        │
-                                  └────────────┬─────────────┘
-                                               │
-                                  response.function_call_
-                                  arguments.done
-                                               │
-                                               ▼
-                                  ┌────────────────────────┐
-                                  │ parse_function_call    │
-                                  │ _action()              │
-                                  │ → model_router_action  │
-                                  │   event                │
-                                  └────────────┬───────────┘
-                                               │
-                                               ▼
-                                  ┌────────────────────────┐
-                                  │ ToolExecutor           │
-                                  │ → specialist tool      │
-                                  │ → tool_result          │
-                                  └────────────┬───────────┘
-                                               │
-                                               ▼
-                                  ┌────────────────────────┐
-                                  │ Specialist prompt      │
-                                  │ (response.create)      │
-                                  │                        │
-                                  │ instructions:          │
-                                  │  base_system +         │
-                                  │  dept context +        │
-                                  │  tool result +         │
-                                  │  language instruction + │
-                                  │  conversation history  │
-                                  └────────────┬───────────┘
-                                               │
-                                    FIFO audio queue:
-                                    filler plays first,
-                                    specialist plays after
-                                               │
-                                               ▼
-                                  ┌────────────────────────┐
-                                  │ Specialist speaks in   │
-                                  │ customer's language    │
-                                  │ → voice_generation     │
-                                  │   _completed           │
-                                  └────────────────────────┘
+                  response.function_call_arguments.done
+                                │
+                ┌───────────────┴───────────────┐
+                │                               │
+        department="direct"           department="<specialist>"
+        (~60-70% of turns)            (sales/billing/support/retention)
+                │                               │
+                ▼                               ▼
+   ┌────────────────────────┐    ┌────────────────────────────┐
+   │ Bridge — direct path   │    │ Bridge emits envelope       │
+   │ (no Coordinator hop)   │    │ model_router_action         │
+   │                        │    └─────────────┬───────────────┘
+   │ ack function call      │                  │
+   │ (function_call_output) │                  ▼
+   │                        │    ┌────────────────────────────┐
+   │ response.create (2nd)  │    │ Coordinator                 │
+   │  · same instructions   │    │  · launches CONFIG filler   │
+   │  · NO tools            │    │    via 2nd response.create  │
+   └───────────┬────────────┘    │    (Realtime model speaks   │
+               │                 │     a configured one-liner) │
+               ▼                 │  · in parallel, calls       │
+   ┌────────────────────────┐    │    specialist text model    │
+   │ Realtime model now     │    │    (gpt-4o, ~1-3s)          │
+   │ speaks the smalltalk   │    │  · wraps result in          │
+   │ reply (inferred from   │    │    "say exactly: …"         │
+   │ instructions+history)  │    │  · sends 3rd response.create│
+   │                        │    └─────────────┬───────────────┘
+   │ → voice_generation     │                  │
+   │   _completed           │                  ▼
+   └────────────────────────┘    ┌────────────────────────────┐
+                                 │ Realtime model speaks the   │
+                                 │ exact text from gpt-4o      │
+                                 │ → voice_generation          │
+                                 │   _completed                │
+                                 └─────────────────────────────┘
 ```
 
 ---
