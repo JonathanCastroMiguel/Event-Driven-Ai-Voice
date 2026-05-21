@@ -71,3 +71,9 @@ frontend/test-results/
 # OpenSpec temp artifacts (future-proof)
 # =========================
 .openspec-cache/
+
+# =========================
+# Local docker compose overrides (personal port remaps, etc.)
+# =========================
+docker-compose.override.yml
+docker-compose.override.yaml
