@@ -334,7 +334,10 @@ export function useVoiceSession(): UseVoiceSessionReturn {
                 speaker: "human",
               });
             }
-          } else if (event.type === "response.audio_transcript.done") {
+          } else if (
+            event.type === "response.output_audio_transcript.done" || // GA
+            event.type === "response.audio_transcript.done" // legacy Beta
+          ) {
             const text = ((event.transcript as string) ?? "").trim();
             if (text) {
               controlHandlerRef.current?.({

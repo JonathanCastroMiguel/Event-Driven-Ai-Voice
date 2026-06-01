@@ -140,7 +140,7 @@ class OpenAIRealtimeEventBridge:
             response_create: dict[str, Any] = {
                 "type": "response.create",
                 "response": {
-                    "modalities": ["text", "audio"],
+                    "output_modalities": ["audio"],
                     "instructions": (
                         f"Say the following to the customer in the same language "
                         f"they have been speaking (check the conversation history). "
@@ -261,7 +261,10 @@ class OpenAIRealtimeEventBridge:
                 source=EventSource.REALTIME,
             )
 
-        elif event_type == "response.audio_transcript.delta":
+        elif event_type in (
+            "response.output_audio_transcript.delta",  # GA event name
+            "response.audio_transcript.delta",  # legacy Beta name (kept for compat)
+        ):
             delta = str(data.get("delta", ""))
             self._response_transcript_buffer += delta
 
@@ -377,9 +380,8 @@ class OpenAIRealtimeEventBridge:
                 second_response: dict[str, Any] = {
                     "type": "response.create",
                     "response": {
-                        "modalities": ["text", "audio"],
+                        "output_modalities": ["audio"],
                         "instructions": self._last_instructions,
-                        "temperature": 0.8,
                     },
                 }
                 logger.info(

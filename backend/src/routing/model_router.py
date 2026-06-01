@@ -211,11 +211,10 @@ class RouterPromptBuilder:
         return {
             "type": "response.create",
             "response": {
-                "modalities": ["text", "audio"],
+                "output_modalities": ["audio"],
                 "instructions": instructions,
                 "tools": [self._tool_definition],
                 "tool_choice": "required",
-                "temperature": 0.8,
             },
         }
 

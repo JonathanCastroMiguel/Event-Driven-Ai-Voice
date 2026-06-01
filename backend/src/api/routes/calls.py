@@ -200,14 +200,17 @@ class SDPResponse(BaseModel):
 
 @router.post("/{call_id}/offer", response_model=SDPResponse)
 async def handle_offer(call_id: UUID, body: SDPRequest) -> SDPResponse:
-    """Two-step SDP exchange with OpenAI Realtime WebRTC API.
+    """SDP exchange with OpenAI Realtime WebRTC GA API.
 
-    Step 1: POST /v1/realtime/sessions — create session with config
-            (transcription, turn_detection) → ephemeral key.
-    Step 2: POST /v1/realtime — SDP exchange using ephemeral key.
+    Single-step SDP exchange against POST /v1/realtime/calls?model=X using the
+    standard API key. Session configuration (transcription, turn_detection,
+    noise reduction, tools) is applied post-connection via session.update over
+    the data channel — see events_ws.
 
-    The browser establishes a direct WebRTC connection with OpenAI for audio.
-    Events are forwarded to the backend via a separate WebSocket (see events_ws).
+    Previously this used the deprecated two-step Beta flow (POST
+    /v1/realtime/sessions to mint an ephemeral key, then SDP exchange on
+    /v1/realtime). The Beta shape is no longer supported by OpenAI
+    (error: beta_api_shape_disabled).
     """
     get_session(call_id)
 
@@ -216,55 +219,10 @@ async def handle_offer(call_id: UUID, body: SDPRequest) -> SDPResponse:
     logger.info("proxying_sdp_to_openai", call_id=str(call_id), model=model)
 
     async with httpx.AsyncClient(timeout=30.0) as client:
-        # Step 1: Create session with configuration → ephemeral key
-        session_resp = await client.post(
-            "https://api.openai.com/v1/realtime/sessions",
+        sdp_resp = await client.post(
+            f"https://api.openai.com/v1/realtime/calls?model={model}",
             headers={
                 "Authorization": f"Bearer {settings.openai_api_key}",
-                "Content-Type": "application/json",
-            },
-            content=orjson.dumps({
-                "model": model,
-                "modalities": ["audio", "text"],
-                "input_audio_transcription": {
-                    "model": "whisper-1",
-                },
-                "turn_detection": {
-                    "type": "server_vad",
-                    "create_response": False,
-                    "threshold": settings.vad_threshold,
-                },
-                "input_audio_noise_reduction": {
-                    "type": "far_field",
-                },
-            }),
-        )
-
-        if session_resp.status_code not in (200, 201):
-            logger.error(
-                "openai_session_create_error",
-                status=session_resp.status_code,
-                body=session_resp.text[:500],
-                call_id=str(call_id),
-            )
-            raise HTTPException(
-                status_code=502,
-                detail=f"OpenAI session creation error: {session_resp.status_code}",
-            )
-
-        session_data = session_resp.json()
-        ephemeral_key = session_data["client_secret"]["value"]
-        logger.info(
-            "openai_session_created",
-            call_id=str(call_id),
-            session_id=session_data.get("id"),
-        )
-
-        # Step 2: SDP exchange using ephemeral key
-        sdp_resp = await client.post(
-            f"https://api.openai.com/v1/realtime?model={model}",
-            headers={
-                "Authorization": f"Bearer {ephemeral_key}",
                 "Content-Type": "application/sdp",
             },
             content=body.sdp,
@@ -309,24 +267,31 @@ async def events_ws(websocket: WebSocket, call_id: UUID) -> None:
     entry.bridge.set_frontend_ws(websocket)
     logger.info("events_ws_connected", call_id=str(call_id))
 
-    # One-time session.update to configure transcription and disable auto-response.
-    # The /v1/realtime/sessions endpoint doesn't reliably apply these settings,
-    # so we send session.update once at connection start. The frontend buffers
-    # this until the data channel opens, so there's no timing issue.
+    # One-time session.update to configure transcription, VAD, noise reduction,
+    # tools and tool_choice. The GA POST /v1/realtime/calls handshake only
+    # negotiates SDP — all runtime config is applied here over the data channel.
+    # The frontend buffers this until the data channel opens, so there's no
+    # timing issue.
+    #
+    # NOTE: GA schema moved input/output audio config under `audio.input` and
+    # `audio.output`. Beta-shape fields at session root (`input_audio_*`) are
+    # silently ignored by the server.
     session_update = {
         "type": "session.update",
         "session": {
-            "input_audio_transcription": {
-                "model": "whisper-1",
-            },
-            "turn_detection": {
-                "type": "server_vad",
-                "create_response": False,
-                "silence_duration_ms": settings.vad_silence_duration_ms,
-                "threshold": settings.vad_threshold,
-            },
-            "input_audio_noise_reduction": {
-                "type": "far_field",
+            "type": "realtime",  # GA requires this field inside session
+            "audio": {
+                "input": {
+                    "transcription": {"model": "whisper-1"},
+                    "noise_reduction": {"type": "far_field"},
+                    "turn_detection": {
+                        "type": "server_vad",
+                        "create_response": False,
+                        "interrupt_response": False,
+                        "silence_duration_ms": settings.vad_silence_duration_ms,
+                        "threshold": settings.vad_threshold,
+                    },
+                },
             },
             "tools": [_shared_router_prompt_builder.tool_definition] if _shared_router_prompt_builder else [],
             "tool_choice": "auto",

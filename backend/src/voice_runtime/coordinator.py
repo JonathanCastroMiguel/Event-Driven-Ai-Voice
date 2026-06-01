@@ -483,7 +483,7 @@ class Coordinator:
                     payload = {
                         "type": "response.create",
                         "response": {
-                            "modalities": ["text", "audio"],
+                            "output_modalities": ["audio"],
                             "instructions": fallback_instructions,
                         },
                     }
@@ -735,13 +735,12 @@ class Coordinator:
                 specialist_prompt = {
                     "type": "response.create",
                     "response": {
-                        "modalities": ["text", "audio"],
+                        "output_modalities": ["audio"],
                         "instructions": (
                             "Say exactly the following to the customer, without "
                             "adding or changing anything:\n\n"
                             f"{payload}"
                         ),
-                        "temperature": 0.6,
                     },
                 }
             else:
@@ -757,14 +756,13 @@ class Coordinator:
             specialist_prompt = {
                 "type": "response.create",
                 "response": {
-                    "modalities": ["text", "audio"],
+                    "output_modalities": ["audio"],
                     "instructions": (
                         "Apologize to the customer briefly. Tell them you are having "
                         "a temporary issue connecting to the specialist and ask them "
                         "to try again in a moment. Respond in the same language the "
                         "customer used."
                     ),
-                    "temperature": 0.8,
                 },
             }
 

@@ -87,22 +87,12 @@ class TestCreateCall:
 
 
 # ---------------------------------------------------------------------------
-# POST /api/v1/calls/{call_id}/offer — two-step SDP proxy
+# POST /api/v1/calls/{call_id}/offer — single-step SDP proxy (GA API)
 # ---------------------------------------------------------------------------
 
 
-def _mock_two_step_sdp(
-    session_status: int = 200,
-    sdp_status: int = 200,
-) -> MagicMock:
-    """Create an httpx.AsyncClient mock for the two-step SDP flow."""
-    session_response = httpx.Response(
-        status_code=session_status,
-        json={
-            "id": "sess_test123",
-            "client_secret": {"value": "ek_test_ephemeral_key"},
-        },
-    )
+def _mock_sdp(sdp_status: int = 200) -> MagicMock:
+    """Create an httpx.AsyncClient mock for the GA SDP exchange."""
     sdp_response = httpx.Response(
         status_code=sdp_status,
         text="v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\n",
@@ -111,9 +101,7 @@ def _mock_two_step_sdp(
     mock_client = AsyncMock()
 
     async def _post(url: str, **kwargs: object) -> httpx.Response:
-        if "/v1/realtime/sessions" in url:
-            return session_response
-        if "/v1/realtime" in url:
+        if "/v1/realtime/calls" in url:
             return sdp_response
         msg = f"Unexpected URL: {url}"
         raise ValueError(msg)
@@ -141,10 +129,10 @@ class TestHandleOffer:
         assert resp.status_code == 422
 
     @patch("src.api.routes.calls.httpx.AsyncClient")
-    def test_successful_two_step_sdp_exchange(
+    def test_successful_sdp_exchange(
         self, mock_async_client_cls: MagicMock, client: TestClient
     ) -> None:
-        mock_async_client_cls.return_value = _mock_two_step_sdp()
+        mock_async_client_cls.return_value = _mock_sdp()
 
         create_resp = client.post("/api/v1/calls")
         call_id = create_resp.json()["call_id"]
@@ -159,26 +147,10 @@ class TestHandleOffer:
         assert "v=0" in data["sdp"]
 
     @patch("src.api.routes.calls.httpx.AsyncClient")
-    def test_session_creation_failure_returns_502(
-        self, mock_async_client_cls: MagicMock, client: TestClient
-    ) -> None:
-        mock_async_client_cls.return_value = _mock_two_step_sdp(session_status=500)
-
-        create_resp = client.post("/api/v1/calls")
-        call_id = create_resp.json()["call_id"]
-
-        resp = client.post(
-            f"/api/v1/calls/{call_id}/offer",
-            json={"sdp": "v=0\r\n", "type": "offer"},
-        )
-        assert resp.status_code == 502
-        assert "session creation error" in resp.json()["detail"]
-
-    @patch("src.api.routes.calls.httpx.AsyncClient")
     def test_sdp_exchange_failure_returns_502(
         self, mock_async_client_cls: MagicMock, client: TestClient
     ) -> None:
-        mock_async_client_cls.return_value = _mock_two_step_sdp(sdp_status=500)
+        mock_async_client_cls.return_value = _mock_sdp(sdp_status=500)
 
         create_resp = client.post("/api/v1/calls")
         call_id = create_resp.json()["call_id"]
@@ -222,10 +194,11 @@ class TestEventsWebSocket:
         assert len(sent_messages) >= 1
         session_update = orjson.loads(sent_messages[0])
         assert session_update["type"] == "session.update"
-        assert session_update["session"]["turn_detection"]["create_response"] is False
-        assert session_update["session"]["turn_detection"]["threshold"] == 0.6
-        assert session_update["session"]["input_audio_noise_reduction"]["type"] == "far_field"
-        assert session_update["session"]["input_audio_transcription"]["model"] == "whisper-1"
+        audio_in = session_update["session"]["audio"]["input"]
+        assert audio_in["turn_detection"]["create_response"] is False
+        assert audio_in["turn_detection"]["threshold"] == 0.6
+        assert audio_in["noise_reduction"]["type"] == "far_field"
+        assert audio_in["transcription"]["model"] == "whisper-1"
 
     def test_ws_forwards_event_to_bridge(self, client: TestClient) -> None:
         create_resp = client.post("/api/v1/calls")

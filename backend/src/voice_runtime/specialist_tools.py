@@ -110,9 +110,8 @@ def _wrap_response_create(instructions: str) -> dict[str, Any]:
     return {
         "type": "response.create",
         "response": {
-            "modalities": ["text", "audio"],
+            "output_modalities": ["audio"],
             "instructions": instructions,
-            "temperature": 0.8,
         },
     }
 
