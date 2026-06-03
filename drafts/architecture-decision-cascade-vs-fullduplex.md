@@ -469,7 +469,70 @@ for peak spikes:
 - Active-active across both 8-GPU clusters at the LB level provides
   failover and headroom.
 
-### 7.8 Comparison summary — half-cascade vs alternatives
+### 7.8 Variant — audio-multimodal LLM (skipping discrete ASR)
+
+A cascade variant worth flagging explicitly: models like **Qwen2-Audio**
+([huggingface.co/Qwen/Qwen2-Audio-7B-Instruct](https://huggingface.co/Qwen/Qwen2-Audio-7B-Instruct),
+Apache 2.0) and the newer **Qwen2.5-Omni** family take **raw audio as
+input** and emit text directly. They are not speech-to-text models —
+they are LLMs with native audio understanding. In a cascade, they can
+collapse two stages into one:
+
+```
+Standard half-cascade:           VAD → ASR (Whisper) → LLM (Qwen3) → TTS
+Audio-aware variant:             VAD → AudioLLM (Qwen2-Audio) → TTS
+```
+
+**What this preserves vs strict cascade**:
+- **Prosody and emotion survive the routing decision**. The model
+  "hears" tone, urgency, anger, hesitation. Routing and content can
+  be informed by **how** the user spoke, not only **what** they said.
+  In strict cascade, all of this dies at the ASR boundary.
+- **Code-switching is handled natively** — the model sees the actual
+  audio rather than depending on Whisper to correctly tokenize
+  language switches mid-utterance.
+- **Fewer modules to operate**: one less box on the hot path.
+
+**Why we are not selecting this for v1**:
+- **Latency profile is unclear**. Qwen2-Audio at 7B params processes
+  audio in chunks; first-token latency on H200 needs benchmarking.
+  Streaming Whisper Turbo + a small router LLM gives us a known
+  latency floor. Audio-multimodal LLMs are harder to optimize for
+  TTFT today.
+- **Arabic Gulf coverage**. Qwen2-Audio handles multilingual but
+  Gulf-dialect quality at our bar is unverified. Same MOS-grade
+  benchmark needed.
+- **Tool-calling reliability is less tested** than text-only Qwen3
+  for structured `route_to_specialist` enforcement. The same risk
+  concern from §5.2 applies, with less data.
+- **TTS is still separate** in the cascade. Prosody continuity from
+  input to output is lost at the TTS handoff (unless the TTS also
+  receives audio context, which complicates the pipeline). So the
+  prosody win is partial — felt in routing/content decisions, not
+  in delivery.
+- **Throughput per GPU at scale is unknown**. Whisper Turbo +
+  Qwen3-32B on H200 has rough capacity estimates we can refine in
+  the POC. Qwen2-Audio at 2000 concurrent is research territory.
+
+**Where this sits in our roadmap**:
+This is a **strong candidate for simplifying the half-cascade in v2**,
+not for replacing it in v1. Recommendation:
+1. POC v1 uses the canonical Whisper + Qwen3 stack (known properties).
+2. Run a **parallel benchmark track**: Qwen2-Audio / Qwen2.5-Omni
+   against the same Arabic Gulf test set used for the Whisper +
+   Qwen3 baseline. Measure first-token latency, tool-calling
+   reliability, throughput per H200.
+3. If the audio-LLM matches or beats the cascade on latency,
+   tool-calling, and Arabic quality, **collapse the two stages in
+   v2** and drop the discrete ASR module.
+
+Other audio-multimodal LLMs to track:
+- **Phi-4-Multimodal-Instruct** (Microsoft, MIT) — includes audio.
+- **Qwen2.5-Omni** (Alibaba) — newer, multimodal end-to-end.
+- **GPT-4o native audio** (OpenAI, cloud) — quality reference but
+  off-limits for on-premise.
+
+### 7.9 Comparison summary — half-cascade vs alternatives
 
 | Dimension | Cascade (selected) | Full-duplex strict | Option B hybrid (future) |
 |---|---|---|---|
